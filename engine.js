@@ -1,0 +1,375 @@
+// ============================================
+// THE TIPSTER — Automated Tip Engine
+// Deploy this to Render.com as a Node.js app
+// ============================================
+
+const { createClient } = require('@supabase/supabase-js');
+const fetch = (...args) => import('node-fetch').then(({default: f}) => f(...args));
+
+// ─── CREDENTIALS ────────────────────────────
+const SUPABASE_URL = 'https://eyhlzzaaxrwisrtwyoyh.supabase.co';
+const SUPABASE_SERVICE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImV5aGx6emFheHJ3aXNydHd5b3loIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3MzM3OTI3NywiZXhwIjoyMDg4OTU1Mjc3fQ.9Lry94K4qWWYzh0yd4zcgEaGvb8myeAzxrSHtcBSQus';
+const ODDS_API_KEY = '8a0d4da4da83840716db786d5e98d0dc';
+const ODDS_BASE = 'https://api.the-odds-api.com/v4';
+
+const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
+
+// ─── SPORTS TO COVER ────────────────────────
+const SPORTS = [
+  { key: 'soccer_epl',              name: 'Football',       league: 'Premier League' },
+  { key: 'soccer_spain_la_liga',    name: 'Football',       league: 'La Liga' },
+  { key: 'soccer_germany_bundesliga',name: 'Football',      league: 'Bundesliga' },
+  { key: 'soccer_italy_serie_a',    name: 'Football',       league: 'Serie A' },
+  { key: 'soccer_france_ligue_one', name: 'Football',       league: 'Ligue 1' },
+  { key: 'soccer_uefa_champs_league',name: 'Football',      league: 'Champions League' },
+  { key: 'basketball_nba',          name: 'Basketball',     league: 'NBA' },
+  { key: 'americanfootball_nfl',    name: 'NFL',            league: 'NFL' },
+  { key: 'tennis_atp_french_open',  name: 'Tennis',         league: 'ATP Tour' },
+  { key: 'baseball_mlb',            name: 'Baseball',       league: 'MLB' },
+  { key: 'icehockey_nhl',           name: 'Ice Hockey',     league: 'NHL' },
+  { key: 'rugbyunion_premiership',  name: 'Rugby',          league: 'Premiership' },
+];
+
+// ─── FETCH ODDS FROM API ─────────────────────
+async function fetchOdds(sportKey) {
+  try {
+    const url = `${ODDS_BASE}/sports/${sportKey}/odds/?apiKey=${ODDS_API_KEY}&regions=uk&markets=h2h,totals,spreads&oddsFormat=decimal&dateFormat=iso`;
+    const res = await fetch(url);
+    if (!res.ok) {
+      console.log(`No data for ${sportKey}: ${res.status}`);
+      return [];
+    }
+    const data = await res.json();
+    return data || [];
+  } catch (err) {
+    console.error(`Error fetching ${sportKey}:`, err.message);
+    return [];
+  }
+}
+
+// ─── TIP GENERATION ENGINE ───────────────────
+// Analyses odds across bookmakers to find value
+function generateTips(events, sport) {
+  const tips = [];
+
+  for (const event of events) {
+    if (!event.bookmakers || event.bookmakers.length < 2) continue;
+
+    const eventTime = new Date(event.commence_time);
+    const now = new Date();
+
+    // Only tip events in the next 48 hours
+    const hoursUntil = (eventTime - now) / 3600000;
+    if (hoursUntil < 0 || hoursUntil > 48) continue;
+
+    // ── Analyse h2h market ──
+    const h2hBooks = event.bookmakers
+      .map(b => b.markets.find(m => m.key === 'h2h'))
+      .filter(Boolean);
+
+    if (h2hBooks.length >= 2) {
+      const h2hTip = analyseH2H(event, h2hBooks, sport);
+      if (h2hTip) tips.push(h2hTip);
+    }
+
+    // ── Analyse totals market ──
+    const totalsBooks = event.bookmakers
+      .map(b => b.markets.find(m => m.key === 'totals'))
+      .filter(Boolean);
+
+    if (totalsBooks.length >= 2) {
+      const totalsTip = analyseTotals(event, totalsBooks, sport);
+      if (totalsTip) tips.push(totalsTip);
+    }
+  }
+
+  return tips;
+}
+
+// Analyse head-to-head odds for value
+function analyseH2H(event, books, sport) {
+  try {
+    // Collect all odds for each outcome
+    const oddsMap = {};
+    for (const book of books) {
+      for (const outcome of book.outcomes) {
+        if (!oddsMap[outcome.name]) oddsMap[outcome.name] = [];
+        oddsMap[outcome.name].push(outcome.price);
+      }
+    }
+
+    // Find best odds and implied probability
+    let bestPick = null;
+    let bestValue = 0;
+
+    for (const [team, oddsList] of Object.entries(oddsMap)) {
+      const maxOdds = Math.max(...oddsList);
+      const avgOdds = oddsList.reduce((a,b) => a+b, 0) / oddsList.length;
+      const impliedProb = 1 / avgOdds;
+
+      // Value = when best odds imply better chance than market average
+      const value = (1/avgOdds) - (1/maxOdds);
+      const marketConsensus = impliedProb;
+
+      // Only tip if there's reasonable consensus (>45% implied prob)
+      // and odds are attractive (>1.40)
+      if (marketConsensus > 0.45 && maxOdds >= 1.40 && maxOdds <= 5.00) {
+        const valueScore = marketConsensus * 100;
+        if (valueScore > bestValue) {
+          bestValue = valueScore;
+          bestPick = {
+            selection: team === event.home_team ? `${team} Win` :
+                       team === event.away_team ? `${team} Win` : 'Draw',
+            odds: maxOdds,
+            confidence: Math.min(95, Math.round(50 + (marketConsensus * 50))),
+            market: 'h2h'
+          };
+        }
+      }
+    }
+
+    if (!bestPick) return null;
+
+    // Assign tier based on confidence
+    const tier = bestPick.confidence >= 78 ? 'free' : 'pro';
+    const stake = bestPick.confidence >= 85 ? 2.0 : 1.0;
+
+    return {
+      sport: sport.name,
+      league: sport.league,
+      home_team: event.home_team,
+      away_team: event.away_team,
+      event_time: event.commence_time,
+      selection: bestPick.selection,
+      market: 'h2h',
+      odds: parseFloat(bestPick.odds.toFixed(2)),
+      stake,
+      confidence: bestPick.confidence,
+      tier,
+      status: 'pending',
+      bookmaker: event.bookmakers[0]?.title || 'Multiple',
+      notes: `Consensus from ${event.bookmakers.length} bookmakers`
+    };
+  } catch(e) {
+    return null;
+  }
+}
+
+// Analyse totals (over/under) for value
+function analyseTotals(event, books, sport) {
+  try {
+    const overOdds = [], underOdds = [];
+    let point = null;
+
+    for (const book of books) {
+      for (const outcome of book.outcomes) {
+        if (outcome.name === 'Over') { overOdds.push(outcome.price); point = outcome.point; }
+        if (outcome.name === 'Under') underOdds.push(outcome.price);
+      }
+    }
+
+    if (!overOdds.length || !underOdds.length || !point) return null;
+
+    const avgOver = overOdds.reduce((a,b)=>a+b,0)/overOdds.length;
+    const avgUnder = underOdds.reduce((a,b)=>a+b,0)/underOdds.length;
+
+    // Pick the side with better consensus value
+    const overProb = 1/avgOver;
+    const underProb = 1/avgUnder;
+
+    // Only tip totals as pro picks
+    if (Math.max(overProb, underProb) < 0.52) return null;
+
+    const pickOver = overProb >= underProb;
+    const bestOdds = pickOver ? Math.max(...overOdds) : Math.max(...underOdds);
+    const confidence = Math.min(85, Math.round(48 + (Math.max(overProb,underProb) * 40)));
+
+    if (bestOdds < 1.60 || bestOdds > 2.20) return null;
+
+    return {
+      sport: sport.name,
+      league: sport.league,
+      home_team: event.home_team,
+      away_team: event.away_team,
+      event_time: event.commence_time,
+      selection: `${pickOver ? 'Over' : 'Under'} ${point}`,
+      market: 'totals',
+      odds: parseFloat(bestOdds.toFixed(2)),
+      stake: 1.0,
+      confidence,
+      tier: 'pro',
+      status: 'pending',
+      bookmaker: event.bookmakers[0]?.title || 'Multiple',
+      notes: `Totals analysis — ${event.bookmakers.length} books checked`
+    };
+  } catch(e) {
+    return null;
+  }
+}
+
+// ─── SAVE TIPS TO DATABASE ───────────────────
+async function saveTips(tips) {
+  if (!tips.length) return;
+
+  let saved = 0, skipped = 0;
+
+  for (const tip of tips) {
+    // Check if we already have this tip (avoid duplicates)
+    const { data: existing } = await supabase
+      .from('tips')
+      .select('id')
+      .eq('home_team', tip.home_team)
+      .eq('away_team', tip.away_team)
+      .eq('selection', tip.selection)
+      .eq('status', 'pending')
+      .single();
+
+    if (existing) { skipped++; continue; }
+
+    const { error } = await supabase.from('tips').insert(tip);
+    if (error) {
+      console.error('Insert error:', error.message);
+    } else {
+      saved++;
+    }
+  }
+
+  console.log(`✅ Saved ${saved} new tips, skipped ${skipped} duplicates`);
+}
+
+// ─── AUTO-SETTLE RESULTS ─────────────────────
+// Checks completed events and marks tips as won/lost
+async function settleResults() {
+  const { data: pending, error } = await supabase
+    .from('tips')
+    .select('*')
+    .eq('status', 'pending')
+    .lt('event_time', new Date().toISOString());
+
+  if (error || !pending?.length) return;
+  console.log(`🔍 Checking ${pending.length} pending tips for results...`);
+
+  for (const tip of pending) {
+    try {
+      // Find the sport config
+      const sportConfig = SPORTS.find(s => s.name === tip.sport && s.league === tip.league);
+      if (!sportConfig) continue;
+
+      // Fetch scores from Odds API
+      const url = `${ODDS_BASE}/sports/${sportConfig.key}/scores/?apiKey=${ODDS_API_KEY}&daysFrom=3`;
+      const res = await fetch(url);
+      if (!res.ok) continue;
+
+      const scores = await res.json();
+      const match = scores.find(s =>
+        s.home_team === tip.home_team &&
+        s.away_team === tip.away_team &&
+        s.completed === true
+      );
+
+      if (!match || !match.scores) continue;
+
+      const homeScore = parseFloat(match.scores.find(s => s.name === match.home_team)?.score || 0);
+      const awayScore = parseFloat(match.scores.find(s => s.name === match.away_team)?.score || 0);
+
+      // Determine result
+      let won = false;
+      const sel = tip.selection.toLowerCase();
+
+      if (sel.includes('win')) {
+        const teamName = tip.selection.replace(' Win', '');
+        if (teamName === tip.home_team) won = homeScore > awayScore;
+        else won = awayScore > homeScore;
+      } else if (sel.startsWith('over')) {
+        const line = parseFloat(sel.replace('over ', ''));
+        won = (homeScore + awayScore) > line;
+      } else if (sel.startsWith('under')) {
+        const line = parseFloat(sel.replace('under ', ''));
+        won = (homeScore + awayScore) < line;
+      } else if (sel.includes('btts') || sel.includes('both teams')) {
+        won = homeScore > 0 && awayScore > 0;
+      }
+
+      const pl = won
+        ? parseFloat(((tip.odds - 1) * tip.stake).toFixed(2))
+        : parseFloat((-tip.stake).toFixed(2));
+
+      // Update tip
+      await supabase.from('tips').update({
+        status: won ? 'won' : 'lost',
+        profit_loss: pl,
+        result_updated_at: new Date().toISOString()
+      }).eq('id', tip.id);
+
+      // Add to results history
+      const { data: lastResult } = await supabase
+        .from('results_history')
+        .select('running_pl')
+        .order('settled_at', { ascending: false })
+        .limit(1)
+        .single();
+
+      const previousPL = lastResult?.running_pl || 0;
+
+      await supabase.from('results_history').insert({
+        tip_id: tip.id,
+        sport: tip.sport,
+        event: `${tip.home_team} vs ${tip.away_team}`,
+        selection: tip.selection,
+        odds: tip.odds,
+        stake: tip.stake,
+        result: won ? 'WON' : 'LOST',
+        profit_loss: pl,
+        running_pl: parseFloat((previousPL + pl).toFixed(2))
+      });
+
+      console.log(`${won ? '✅ WON' : '❌ LOST'}: ${tip.home_team} vs ${tip.away_team} — ${tip.selection} (${pl > 0 ? '+' : ''}${pl}u)`);
+
+    } catch(e) {
+      console.error(`Error settling ${tip.id}:`, e.message);
+    }
+  }
+}
+
+// ─── MAIN ENGINE LOOP ────────────────────────
+async function runEngine() {
+  console.log(`\n🚀 Engine running — ${new Date().toLocaleString()}`);
+  console.log('═'.repeat(50));
+
+  let allTips = [];
+
+  for (const sport of SPORTS) {
+    console.log(`📡 Fetching ${sport.league}...`);
+    const events = await fetchOdds(sport.key);
+    if (events.length) {
+      const tips = generateTips(events, sport);
+      console.log(`   → ${events.length} events, ${tips.length} tips generated`);
+      allTips = allTips.concat(tips);
+    }
+    // Small delay to be kind to the API
+    await new Promise(r => setTimeout(r, 500));
+  }
+
+  console.log(`\n💾 Saving ${allTips.length} tips to database...`);
+  await saveTips(allTips);
+
+  console.log('\n🏁 Checking results for completed events...');
+  await settleResults();
+
+  console.log('\n✅ Engine cycle complete.');
+  console.log('═'.repeat(50));
+}
+
+// ─── SCHEDULER ───────────────────────────────
+// Run immediately on start, then every 30 minutes
+runEngine();
+setInterval(runEngine, 30 * 60 * 1000);
+
+// Keep process alive on Render
+const http = require('http');
+http.createServer((req, res) => {
+  res.writeHead(200);
+  res.end('The Tipster Engine — Running ✅');
+}).listen(process.env.PORT || 3000, () => {
+  console.log('💚 Health check server running');
+});
