@@ -387,6 +387,7 @@ async function settleResults() {
         selection: tip.selection,
         odds: tip.odds,
         stake: tip.stake,
+        tier: tip.tier || 'free',
         result: won ? 'WON' : 'LOST',
         profit_loss: pl,
         running_pl: parseFloat((previousPL + pl).toFixed(2))
