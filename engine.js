@@ -28,6 +28,9 @@ const SPORTS = [
   { key: 'baseball_mlb',            name: 'Baseball',       league: 'MLB' },
   { key: 'icehockey_nhl',           name: 'Ice Hockey',     league: 'NHL' },
   { key: 'rugbyunion_premiership',  name: 'Rugby',          league: 'Premiership' },
+  // ── Horse Racing ──
+  { key: 'horse_racing_gb',         name: 'Horse Racing',   league: 'GB Racing',        isRacing: true },
+  { key: 'horse_racing_ire',        name: 'Horse Racing',   league: 'Irish Racing',     isRacing: true },
 ];
 
 // ─── FETCH ODDS FROM API ─────────────────────
@@ -45,6 +48,72 @@ async function fetchOdds(sportKey) {
     console.error(`Error fetching ${sportKey}:`, err.message);
     return [];
   }
+}
+
+// ─── FETCH HORSE RACING ODDS ─────────────────
+async function fetchRacingOdds(sportKey) {
+  try {
+    const url = `${ODDS_BASE}/sports/${sportKey}/odds/?apiKey=${ODDS_API_KEY}&regions=uk&markets=h2h&oddsFormat=decimal&dateFormat=iso`;
+    const res = await fetch(url);
+    if (!res.ok) { console.log(`No racing data for ${sportKey}: ${res.status}`); return []; }
+    return await res.json() || [];
+  } catch (err) { console.error(`Racing fetch error:`, err.message); return []; }
+}
+
+// ─── ANALYSE HORSE RACING ────────────────────
+function generateRacingTips(events, sport) {
+  const tips = [];
+  for (const event of events) {
+    if (!event.bookmakers || event.bookmakers.length < 2) continue;
+    const eventTime = new Date(event.commence_time);
+    const now = new Date();
+    const hoursUntil = (eventTime - now) / 3600000;
+    if (hoursUntil < 0 || hoursUntil > 24) continue;
+
+    // Collect all runners and odds across bookmakers
+    const runnerOdds = {};
+    for (const book of event.bookmakers) {
+      const market = book.markets.find(m => m.key === 'h2h');
+      if (!market) continue;
+      for (const outcome of market.outcomes) {
+        if (!runnerOdds[outcome.name]) runnerOdds[outcome.name] = [];
+        runnerOdds[outcome.name].push(outcome.price);
+      }
+    }
+    if (Object.keys(runnerOdds).length < 3) continue;
+
+    // Find best value runner — sweet spot odds 2.0-12.0 with good book consensus
+    let bestRunner = null, bestScore = 0;
+    for (const [runner, oddsList] of Object.entries(runnerOdds)) {
+      const avgOdds = oddsList.reduce((a,b) => a+b,0) / oddsList.length;
+      const bestOdds = Math.max(...oddsList);
+      const impliedProb = 1 / avgOdds;
+      if (bestOdds < 2.0 || bestOdds > 12.0 || oddsList.length < 2) continue;
+      const valueScore = impliedProb * oddsList.length * (bestOdds <= 6.0 ? 1.2 : 1.0);
+      if (valueScore > bestScore) { bestScore = valueScore; bestRunner = { name: runner, odds: bestOdds, impliedProb, bookCount: oddsList.length }; }
+    }
+    if (!bestRunner) continue;
+
+    const confidence = Math.min(82, Math.round(40 + (bestRunner.impliedProb * 60) + (bestRunner.bookCount * 2)));
+    const isEachWay = bestRunner.odds >= 5.0;
+    const stake = isEachWay ? 0.5 : 1.0;
+
+    tips.push({
+      sport: sport.name, league: sport.league,
+      home_team: event.home_team || event.sport_title || 'Race',
+      away_team: `${Object.keys(runnerOdds).length} runners`,
+      event_time: event.commence_time,
+      selection: isEachWay ? `${bestRunner.name} (Each Way)` : `${bestRunner.name} Win`,
+      market: 'h2h',
+      odds: parseFloat(bestRunner.odds.toFixed(2)),
+      stake, confidence,
+      tier: confidence >= 72 ? 'free' : 'pro',
+      status: 'pending',
+      bookmaker: event.bookmakers[0]?.title || 'Multiple',
+      notes: `${bestRunner.bookCount} books — ${isEachWay ? 'Each Way' : 'Win'}`
+    });
+  }
+  return tips;
 }
 
 // ─── TIP GENERATION ENGINE ───────────────────
@@ -339,14 +408,22 @@ async function runEngine() {
   let allTips = [];
 
   for (const sport of SPORTS) {
-    console.log(`📡 Fetching ${sport.league}...`);
-    const events = await fetchOdds(sport.key);
-    if (events.length) {
-      const tips = generateTips(events, sport);
-      console.log(`   → ${events.length} events, ${tips.length} tips generated`);
-      allTips = allTips.concat(tips);
+    console.log('Fetching ' + sport.league + '...');
+    if (sport.isRacing) {
+      const events = await fetchRacingOdds(sport.key);
+      if (events.length) {
+        const tips = generateRacingTips(events, sport);
+        console.log('   -> ' + events.length + ' races, ' + tips.length + ' tips generated (racing)');
+        allTips = allTips.concat(tips);
+      }
+    } else {
+      const events = await fetchOdds(sport.key);
+      if (events.length) {
+        const tips = generateTips(events, sport);
+        console.log('   -> ' + events.length + ' events, ' + tips.length + ' tips generated');
+        allTips = allTips.concat(tips);
+      }
     }
-    // Small delay to be kind to the API
     await new Promise(r => setTimeout(r, 500));
   }
 
