@@ -1,0 +1,16 @@
+{
+  "name": "tipster-engine",
+  "version": "1.0.0",
+  "description": "The Tipster — Automated tip generation engine",
+  "main": "engine.js",
+  "scripts": {
+    "start": "node engine.js"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.39.0",
+    "node-fetch": "^3.3.2"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
