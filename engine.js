@@ -917,6 +917,59 @@ async function sendTestEmail(toEmail, type) {
   }
 }
 
+
+// ── ADMIN JOB QUEUE PROCESSOR ────────────────────────────
+// Polls admin_jobs table every 30 seconds.
+// Admin dashboard writes jobs here; engine executes them.
+// Avoids direct browser->engine calls which Render blocks.
+async function processAdminJobs() {
+  try {
+    const { data: jobs } = await supabase
+      .from('admin_jobs')
+      .select('*')
+      .eq('status', 'pending')
+      .order('created_at', { ascending: true })
+      .limit(10);
+
+    if (!jobs || !jobs.length) return;
+
+    for (const job of jobs) {
+      // Mark as processing immediately to prevent double-execution
+      await supabase.from('admin_jobs').update({ status: 'processing' }).eq('id', job.id);
+
+      try {
+        const payload = JSON.parse(job.payload || '{}');
+        console.log('Processing job: ' + job.job_type, payload);
+
+        if (job.job_type === 'test_email') {
+          const result = await sendTestEmail(payload.to, payload.type || 'daily');
+          await supabase.from('admin_jobs').update({
+            status: result.success ? 'done' : 'failed',
+            result: JSON.stringify(result)
+          }).eq('id', job.id);
+
+        } else if (job.job_type === 'send_daily') {
+          await sendDailyEmails();
+          await supabase.from('admin_jobs').update({ status: 'done' }).eq('id', job.id);
+
+        } else if (job.job_type === 'send_saturday') {
+          await sendSaturdayEmails();
+          await supabase.from('admin_jobs').update({ status: 'done' }).eq('id', job.id);
+
+        } else {
+          await supabase.from('admin_jobs').update({ status: 'unknown_type' }).eq('id', job.id);
+        }
+
+      } catch(e) {
+        console.error('Job failed:', job.job_type, e.message);
+        await supabase.from('admin_jobs').update({ status: 'failed', result: e.message }).eq('id', job.id);
+      }
+    }
+  } catch(e) {
+    console.error('Job processor error:', e.message);
+  }
+}
+
 // ─── MAIN ENGINE LOOP ────────────────────────
 async function runEngine() {
   console.log(`\n🚀 Engine running — ${new Date().toLocaleString()}`);
@@ -958,6 +1011,10 @@ async function runEngine() {
 runEngine();
 setInterval(runEngine, 15 * 60 * 1000);
 startEmailScheduler();
+
+// Poll for admin jobs every 30 seconds
+setInterval(processAdminJobs, 30 * 1000);
+processAdminJobs(); // Run immediately on start
 
 // ─── HTTP SERVER ──────────────────────────────
 // Health check + admin email trigger endpoints
