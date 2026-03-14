@@ -965,9 +965,23 @@ const http = require('http');
 http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://localhost');
 
+  // CORS headers — allow admin dashboard to call engine
+  const corsHeaders = {
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Methods': 'GET, OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type',
+  };
+
+  // Handle preflight
+  if (req.method === 'OPTIONS') {
+    res.writeHead(204, corsHeaders);
+    res.end();
+    return;
+  }
+
   // Health check
   if (url.pathname === '/') {
-    res.writeHead(200, { 'Content-Type': 'text/plain' });
+    res.writeHead(200, { ...corsHeaders, 'Content-Type': 'text/plain' });
     res.end('The Tipster Engine Running');
     return;
   }
@@ -983,7 +997,7 @@ http.createServer(async (req, res) => {
     const type = url.searchParams.get('type') || 'daily';
     if (!to) { res.writeHead(400); res.end('Missing to param'); return; }
     const result = await sendTestEmail(to, type);
-    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.writeHead(200, { ...corsHeaders, 'Content-Type': 'application/json' });
     res.end(JSON.stringify(result));
     return;
   }
@@ -996,7 +1010,7 @@ http.createServer(async (req, res) => {
       res.writeHead(403); res.end('Forbidden'); return;
     }
     sendDailyEmails(); // fire and forget
-    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.writeHead(200, { ...corsHeaders, 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ started: true }));
     return;
   }
@@ -1008,7 +1022,7 @@ http.createServer(async (req, res) => {
       res.writeHead(403); res.end('Forbidden'); return;
     }
     sendSaturdayEmails();
-    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.writeHead(200, { ...corsHeaders, 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ started: true }));
     return;
   }
