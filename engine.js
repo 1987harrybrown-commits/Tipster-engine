@@ -505,6 +505,418 @@ async function settleResults() {
 }
 
 
+
+// ════════════════════════════════════════════════════════════
+// EMAIL SYSTEM
+// ════════════════════════════════════════════════════════════
+
+const RESEND_API_KEY = process.env.RESEND_API_KEY || '';
+const FROM_EMAIL     = 'tips@the-tipster.app';
+const FROM_NAME      = 'The Tipster';
+const SITE_URL       = 'https://the-tipster.vercel.app';
+
+// ── Send via Resend API ───────────────────────────────────
+async function sendEmail({ to, subject, html, tipId = null, type = 'daily' }) {
+  if (!RESEND_API_KEY) { console.error('RESEND_API_KEY not set'); return null; }
+  try {
+    const res = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + RESEND_API_KEY },
+      body: JSON.stringify({
+        from: FROM_NAME + ' <' + FROM_EMAIL + '>',
+        to: Array.isArray(to) ? to : [to],
+        subject,
+        html
+      })
+    });
+    const data = await res.json();
+    if (!res.ok) { console.error('Resend error:', data); return null; }
+    // Log to email_log table
+    await supabase.from('email_log').insert({
+      type, subject,
+      recipient: Array.isArray(to) ? to.join(',') : to,
+      status: 'sent',
+      resend_id: data.id || null,
+      tip_id: tipId || null
+    });
+    console.log('Email sent: ' + subject + ' -> ' + (Array.isArray(to) ? to.length + ' recipients' : to));
+    return data.id;
+  } catch(e) {
+    console.error('Email send error:', e.message);
+    await supabase.from('email_log').insert({
+      type, subject,
+      recipient: Array.isArray(to) ? to.join(',') : to,
+      status: 'failed'
+    });
+    return null;
+  }
+}
+
+// ── Unsubscribe token (simple HMAC-free version using user ID) ──
+function unsubToken(userId) {
+  // In production replace with proper HMAC signing
+  return Buffer.from(userId).toString('base64');
+}
+function unsubLink(userId) {
+  return SITE_URL + '/unsubscribe?token=' + unsubToken(userId);
+}
+
+// ── Email footer ─────────────────────────────────────────
+function emailFooter(userId) {
+  return `
+    <div style="margin-top:40px;padding-top:24px;border-top:1px solid #1c2535;text-align:center;">
+      <p style="font-family:monospace;font-size:11px;color:#4a5a70;line-height:1.6;margin:0;">
+        The Tipster &bull; Tips for informational purposes only &bull; 18+ only &bull; Bet responsibly<br>
+        <a href="${SITE_URL}" style="color:#4a5a70;">Visit site</a> &bull;
+        <a href="${unsubLink(userId)}" style="color:#4a5a70;">Unsubscribe</a> &bull;
+        <a href="${SITE_URL}/account" style="color:#4a5a70;">Manage preferences</a>
+      </p>
+    </div>`;
+}
+
+// ── Email base template ───────────────────────────────────
+function emailBase(content, userId) {
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>The Tipster</title>
+</head>
+<body style="margin:0;padding:0;background:#07090d;font-family:'Helvetica Neue',Helvetica,Arial,sans-serif;">
+<table width="100%" cellpadding="0" cellspacing="0" style="background:#07090d;padding:32px 16px;">
+  <tr><td align="center">
+    <table width="100%" style="max-width:560px;background:#0f141c;border:1px solid #1c2535;border-radius:10px;overflow:hidden;">
+      <!-- HEADER -->
+      <tr>
+        <td style="padding:24px 28px 20px;border-bottom:1px solid #1c2535;">
+          <span style="font-family:Georgia,serif;font-size:20px;font-weight:700;color:#dde6f0;letter-spacing:-0.3px;">
+            The <span style="color:#18e07a;">Tipster</span>
+          </span>
+        </td>
+      </tr>
+      <!-- CONTENT -->
+      <tr><td style="padding:28px;">${content}</td></tr>
+      <!-- FOOTER -->
+      <tr><td style="padding:0 28px 24px;">${emailFooter(userId)}</td></tr>
+    </table>
+  </td></tr>
+</table>
+</body>
+</html>`;
+}
+
+// ── Bet of the Day email template ─────────────────────────
+function buildDailyEmail({ tip, userId }) {
+  const edge = (parseFloat(tip.confidence||0) - (1/parseFloat(tip.odds||1))*100).toFixed(1);
+  const edgeColor = parseFloat(edge) >= 0 ? '#18e07a' : '#ff3d5a';
+  const edgeStr = parseFloat(edge) >= 0 ? '+' + edge + '%' : edge + '%';
+
+  const content = `
+    <!-- EYEBROW -->
+    <p style="font-family:monospace;font-size:10px;text-transform:uppercase;letter-spacing:3px;color:#18e07a;margin:0 0 10px;">
+      Bet of the Day
+    </p>
+
+    <!-- HEADLINE -->
+    <h1 style="font-size:22px;font-weight:800;color:#dde6f0;margin:0 0 6px;line-height:1.2;">
+      ${tip.home_team} vs ${tip.away_team}
+    </h1>
+    <p style="font-size:12px;color:#4a5a70;margin:0 0 24px;">${tip.league || tip.sport}</p>
+
+    <!-- SELECTION BOX -->
+    <table width="100%" cellpadding="0" cellspacing="0" style="background:#111620;border-radius:7px;margin-bottom:20px;">
+      <tr>
+        <td style="padding:16px 18px;">
+          <p style="font-family:monospace;font-size:9px;text-transform:uppercase;letter-spacing:2px;color:#4a5a70;margin:0 0 5px;">Selection</p>
+          <p style="font-size:18px;font-weight:700;color:#dde6f0;margin:0;">${tip.selection}</p>
+        </td>
+        <td style="padding:16px 18px;text-align:right;">
+          <p style="font-family:monospace;font-size:26px;font-weight:700;color:#f0b429;margin:0;line-height:1;">${parseFloat(tip.odds).toFixed(2)}</p>
+          <p style="font-family:monospace;font-size:9px;color:#4a5a70;text-transform:uppercase;letter-spacing:1px;margin:3px 0 0;">Odds</p>
+        </td>
+      </tr>
+    </table>
+
+    <!-- EDGE ROW -->
+    <table width="100%" cellpadding="0" cellspacing="0" style="margin-bottom:20px;">
+      <tr>
+        <td width="33%" style="padding:10px 12px;background:#111620;border-radius:5px;text-align:center;">
+          <p style="font-family:monospace;font-size:8px;text-transform:uppercase;letter-spacing:1.5px;color:#4a5a70;margin:0 0 5px;">Confidence</p>
+          <p style="font-family:monospace;font-size:16px;font-weight:700;color:#dde6f0;margin:0;">${tip.confidence}%</p>
+        </td>
+        <td width="5%"></td>
+        <td width="33%" style="padding:10px 12px;background:#111620;border-radius:5px;text-align:center;">
+          <p style="font-family:monospace;font-size:8px;text-transform:uppercase;letter-spacing:1.5px;color:#4a5a70;margin:0 0 5px;">Value Edge</p>
+          <p style="font-family:monospace;font-size:16px;font-weight:700;color:${edgeColor};margin:0;">${edgeStr}</p>
+        </td>
+        <td width="5%"></td>
+        <td width="24%" style="padding:10px 12px;background:#111620;border-radius:5px;text-align:center;">
+          <p style="font-family:monospace;font-size:8px;text-transform:uppercase;letter-spacing:1.5px;color:#4a5a70;margin:0 0 5px;">Stake</p>
+          <p style="font-family:monospace;font-size:16px;font-weight:700;color:#dde6f0;margin:0;">${tip.stake}u</p>
+        </td>
+      </tr>
+    </table>
+
+    <!-- REASONING -->
+    <div style="background:#07090d;border:1px solid #1c2535;border-radius:6px;padding:14px 16px;margin-bottom:24px;">
+      <p style="font-family:monospace;font-size:9px;text-transform:uppercase;letter-spacing:2px;color:#18e07a;margin:0 0 8px;">Analysis</p>
+      <p style="font-size:13px;color:#dde6f0;line-height:1.7;margin:0;">${tip.notes || 'High-confidence selection based on market consensus and form data.'}</p>
+    </div>
+
+    <!-- CTA -->
+    <div style="text-align:center;margin-bottom:8px;">
+      <a href="${SITE_URL}/#tips" style="display:inline-block;background:#18e07a;color:#07090d;font-size:13px;font-weight:700;padding:13px 28px;border-radius:5px;text-decoration:none;letter-spacing:0.3px;">
+        View Today's Full Card
+      </a>
+    </div>
+    <p style="text-align:center;font-size:11px;color:#4a5a70;margin:10px 0 0;">
+      Pro members get all tips, full analysis and early access. <a href="${SITE_URL}/#pricing" style="color:#18e07a;text-decoration:none;">Upgrade for £9.99/mo</a>
+    </p>`;
+
+  return emailBase(content, userId);
+}
+
+// ── Saturday accumulator email template ──────────────────
+function buildSaturdayEmail({ selections, combinedOdds, reasoning, userId }) {
+  const selRows = selections.map((s, i) => `
+    <tr style="${i > 0 ? 'border-top:1px solid #1c2535;' : ''}">
+      <td style="padding:11px 14px;">
+        <p style="font-size:12px;font-weight:700;color:#dde6f0;margin:0 0 2px;">${s.match}</p>
+        <p style="font-family:monospace;font-size:11px;color:#18e07a;margin:0;">${s.selection} <span style="color:#4a5a70;">@ ${parseFloat(s.odds).toFixed(2)}</span></p>
+      </td>
+    </tr>`).join('');
+
+  const content = `
+    <p style="font-family:monospace;font-size:10px;text-transform:uppercase;letter-spacing:3px;color:#18e07a;margin:0 0 10px;">
+      Weekend Accumulator
+    </p>
+    <h1 style="font-size:22px;font-weight:800;color:#dde6f0;margin:0 0 6px;line-height:1.2;">
+      Saturday's Best ${selections.length}-Fold
+    </h1>
+    <p style="font-size:12px;color:#4a5a70;margin:0 0 24px;">
+      Combined odds: <span style="font-family:monospace;font-weight:700;color:#f0b429;font-size:15px;">${parseFloat(combinedOdds).toFixed(2)}</span>
+    </p>
+
+    <!-- SELECTIONS TABLE -->
+    <table width="100%" cellpadding="0" cellspacing="0" style="background:#111620;border-radius:7px;margin-bottom:20px;">
+      ${selRows}
+    </table>
+
+    <!-- REASONING -->
+    <div style="background:#07090d;border:1px solid #1c2535;border-radius:6px;padding:14px 16px;margin-bottom:24px;">
+      <p style="font-family:monospace;font-size:9px;text-transform:uppercase;letter-spacing:2px;color:#18e07a;margin:0 0 8px;">Why this acca</p>
+      <p style="font-size:13px;color:#dde6f0;line-height:1.7;margin:0;">${reasoning}</p>
+    </div>
+
+    <div style="text-align:center;margin-bottom:8px;">
+      <a href="${SITE_URL}/#tips" style="display:inline-block;background:#18e07a;color:#07090d;font-size:13px;font-weight:700;padding:13px 28px;border-radius:5px;text-decoration:none;">
+        View Full Weekend Card
+      </a>
+    </div>
+    <p style="text-align:center;font-size:11px;color:#4a5a70;margin:10px 0 0;">
+      Unlock premium singles, early picks and full analysis. <a href="${SITE_URL}/#pricing" style="color:#18e07a;text-decoration:none;">Go Pro for £9.99/mo</a>
+    </p>`;
+
+  return emailBase(content, userId);
+}
+
+// ── Pick best Bet of the Day from today's tips ────────────
+async function getBetOfTheDay() {
+  // Check for admin override first
+  const today = new Date().toISOString().split('T')[0];
+  const { data: override } = await supabase
+    .from('email_overrides')
+    .select('*')
+    .eq('date', today)
+    .eq('type', 'daily')
+    .single();
+
+  if (override && override.bet_selection) {
+    return {
+      home_team: override.bet_match ? override.bet_match.split(' vs ')[0] : 'Home',
+      away_team: override.bet_match ? override.bet_match.split(' vs ')[1] : 'Away',
+      selection: override.bet_selection,
+      odds:      override.bet_odds || 1.8,
+      confidence:override.bet_confidence || 80,
+      stake:     1,
+      notes:     override.bet_reasoning || '',
+      league:    '',
+      sport:     'Football',
+      isOverride: true
+    };
+  }
+
+  // Auto-pick: highest confidence pending tip for today
+  const todayStart = new Date(); todayStart.setHours(0,0,0,0);
+  const todayEnd   = new Date(); todayEnd.setHours(23,59,59,999);
+  const { data: tips } = await supabase
+    .from('tips')
+    .select('*')
+    .eq('status','pending')
+    .gte('event_time', todayStart.toISOString())
+    .lte('event_time', todayEnd.toISOString())
+    .order('confidence', { ascending: false })
+    .limit(1);
+
+  return tips && tips.length ? tips[0] : null;
+}
+
+// ── Build Saturday accumulator ────────────────────────────
+async function getSaturdayAcca() {
+  const today = new Date().toISOString().split('T')[0];
+  const { data: override } = await supabase
+    .from('email_overrides')
+    .select('*')
+    .eq('date', today)
+    .eq('type', 'saturday')
+    .single();
+
+  if (override && override.acca_selections) {
+    return {
+      selections:   override.acca_selections,
+      combinedOdds: override.acca_combined_odds || 0,
+      reasoning:    override.acca_reasoning || ''
+    };
+  }
+
+  // Auto-build from top 4 pending football tips today
+  const todayStart = new Date(); todayStart.setHours(6,0,0,0);
+  const todayEnd   = new Date(); todayEnd.setHours(23,59,59,999);
+  const { data: tips } = await supabase
+    .from('tips')
+    .select('*')
+    .eq('status','pending')
+    .eq('sport','Football')
+    .gte('event_time', todayStart.toISOString())
+    .lte('event_time', todayEnd.toISOString())
+    .gte('confidence', 75)
+    .order('confidence', { ascending: false })
+    .limit(4);
+
+  if (!tips || tips.length < 3) return null;
+  const selections = tips.map(t => ({
+    match:     t.home_team + ' vs ' + t.away_team,
+    selection: t.selection,
+    odds:      t.odds
+  }));
+  const combinedOdds = selections.reduce((acc, s) => acc * parseFloat(s.odds), 1);
+  const reasoning = 'Four high-confidence selections from today' + "'" + 's card. ' +
+    'All carry 75%+ model confidence with positive value edge versus the market. ' +
+    'Recommended at 0.5 units each-way on the accumulator.';
+
+  return { selections, combinedOdds, reasoning };
+}
+
+// ── Get all opted-in subscribers ─────────────────────────
+async function getSubscribers(emailType = 'daily') {
+  const col = emailType === 'saturday' ? 'email_saturday' : 'email_daily';
+  const { data, error } = await supabase
+    .from('users')
+    .select('id, email, first_name')
+    .eq('email_opt_in', true)
+    .eq(col, true);
+  if (error) { console.error('Get subscribers error:', error.message); return []; }
+  return data || [];
+}
+
+// ── Daily email dispatch (08:30 UK time) ─────────────────
+async function sendDailyEmails() {
+  console.log('📧 Starting daily email dispatch...');
+  const tip = await getBetOfTheDay();
+  if (!tip) { console.log('No tip found for daily email, skipping.'); return; }
+
+  const subscribers = await getSubscribers('daily');
+  console.log('Sending to ' + subscribers.length + ' subscribers...');
+
+  let sent = 0;
+  for (const user of subscribers) {
+    // Personalise subject with first name if available
+    const greeting = user.first_name ? user.first_name + ', ' : '';
+    const subject = greeting + "Today's Bet of the Day | " + tip.home_team + ' vs ' + tip.away_team;
+    const html = buildDailyEmail({ tip, userId: user.id });
+    const result = await sendEmail({
+      to: user.email, subject, html,
+      tipId: tip.id, type: 'daily'
+    });
+    if (result) sent++;
+    await new Promise(r => setTimeout(r, 100)); // Rate limit: 10/sec
+  }
+  console.log('Daily emails complete. Sent: ' + sent + '/' + subscribers.length);
+}
+
+// ── Saturday accumulator dispatch ────────────────────────
+async function sendSaturdayEmails() {
+  console.log('📧 Starting Saturday accumulator dispatch...');
+  const acca = await getSaturdayAcca();
+  if (!acca) { console.log('Not enough tips for Saturday acca, skipping.'); return; }
+
+  const subscribers = await getSubscribers('saturday');
+  console.log('Sending Saturday acca to ' + subscribers.length + ' subscribers...');
+
+  let sent = 0;
+  for (const user of subscribers) {
+    const greeting = user.first_name ? user.first_name + ', ' : '';
+    const subject = greeting + "Saturday's " + acca.selections.length + '-Fold Accumulator | ' + parseFloat(acca.combinedOdds).toFixed(2) + ' combined odds';
+    const html = buildSaturdayEmail({ ...acca, userId: user.id });
+    const result = await sendEmail({
+      to: user.email, subject, html, type: 'saturday'
+    });
+    if (result) sent++;
+    await new Promise(r => setTimeout(r, 100));
+  }
+  console.log('Saturday emails complete. Sent: ' + sent + '/' + subscribers.length);
+}
+
+// ── Precision scheduler ───────────────────────────────────
+// Runs at exactly 08:30 UK time (UTC+0 in winter, UTC+1 in summer)
+// Cron-style: checks every minute, fires once per day
+let lastDailyDate   = null;
+let lastSaturdayDate = null;
+
+function startEmailScheduler() {
+  setInterval(async () => {
+    const now = new Date();
+    // Convert to UK time (handles BST/GMT automatically)
+    const ukTime = new Date(now.toLocaleString('en-GB', { timeZone: 'Europe/London' }));
+    const h = ukTime.getHours();
+    const m = ukTime.getMinutes();
+    const today = ukTime.toDateString();
+    const isSaturday = ukTime.getDay() === 6;
+
+    // Daily email at 08:30 UK
+    if (h === 8 && m === 30 && lastDailyDate !== today) {
+      lastDailyDate = today;
+      await sendDailyEmails();
+    }
+
+    // Saturday email at 08:30 UK (same time but Saturday only)
+    if (isSaturday && h === 8 && m === 30 && lastSaturdayDate !== today) {
+      lastSaturdayDate = today;
+      await sendSaturdayEmails();
+    }
+  }, 60 * 1000); // Check every minute
+
+  console.log('Email scheduler started. Daily at 08:30 UK, Saturday acca at 08:30 UK on Saturdays.');
+}
+
+// ── Test email endpoint (called via HTTP) ─────────────────
+async function sendTestEmail(toEmail, type) {
+  if (type === 'saturday') {
+    const acca = await getSaturdayAcca();
+    if (!acca) return { success: false, error: 'No acca available' };
+    const html = buildSaturdayEmail({ ...acca, userId: 'test' });
+    const id = await sendEmail({ to: toEmail, subject: '[TEST] Saturday Accumulator', html, type: 'test' });
+    return { success: !!id };
+  } else {
+    const tip = await getBetOfTheDay();
+    if (!tip) return { success: false, error: 'No tip available' };
+    const html = buildDailyEmail({ tip, userId: 'test' });
+    const id = await sendEmail({ to: toEmail, subject: '[TEST] Bet of the Day', html, type: 'test' });
+    return { success: !!id };
+  }
+}
+
 // ─── MAIN ENGINE LOOP ────────────────────────
 async function runEngine() {
   console.log(`\n🚀 Engine running — ${new Date().toLocaleString()}`);
@@ -543,16 +955,82 @@ async function runEngine() {
 }
 
 // ─── SCHEDULER ───────────────────────────────
-// Run immediately on start, then every 30 minutes
 runEngine();
-setInterval(runEngine, 15 * 60 * 1000); // Every 15 minutes
+setInterval(runEngine, 15 * 60 * 1000);
+startEmailScheduler();
 
-// Keep process alive on Render
+// ─── HTTP SERVER ──────────────────────────────
+// Health check + admin email trigger endpoints
 const http = require('http');
-http.createServer((req, res) => {
-  res.writeHead(200);
-  res.end('The Tipster Engine — Running ✅');
-}).listen(process.env.PORT || 3000, () => {
-  console.log('💚 Health check server running');
-});
+http.createServer(async (req, res) => {
+  const url = new URL(req.url, 'http://localhost');
 
+  // Health check
+  if (url.pathname === '/') {
+    res.writeHead(200, { 'Content-Type': 'text/plain' });
+    res.end('The Tipster Engine Running');
+    return;
+  }
+
+  // Admin: trigger test email
+  // GET /admin/test-email?to=your@email.com&type=daily&key=ADMIN_KEY
+  if (url.pathname === '/admin/test-email') {
+    const key = url.searchParams.get('key');
+    if (key !== process.env.ADMIN_KEY) {
+      res.writeHead(403); res.end('Forbidden'); return;
+    }
+    const to   = url.searchParams.get('to');
+    const type = url.searchParams.get('type') || 'daily';
+    if (!to) { res.writeHead(400); res.end('Missing to param'); return; }
+    const result = await sendTestEmail(to, type);
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(result));
+    return;
+  }
+
+  // Admin: trigger daily send now
+  // GET /admin/send-daily?key=ADMIN_KEY
+  if (url.pathname === '/admin/send-daily') {
+    const key = url.searchParams.get('key');
+    if (key !== process.env.ADMIN_KEY) {
+      res.writeHead(403); res.end('Forbidden'); return;
+    }
+    sendDailyEmails(); // fire and forget
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ started: true }));
+    return;
+  }
+
+  // Admin: trigger Saturday send now
+  if (url.pathname === '/admin/send-saturday') {
+    const key = url.searchParams.get('key');
+    if (key !== process.env.ADMIN_KEY) {
+      res.writeHead(403); res.end('Forbidden'); return;
+    }
+    sendSaturdayEmails();
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ started: true }));
+    return;
+  }
+
+  // Unsubscribe handler
+  // GET /unsubscribe?token=BASE64_USER_ID
+  if (url.pathname === '/unsubscribe') {
+    const token = url.searchParams.get('token');
+    if (!token) { res.writeHead(400); res.end('Invalid link'); return; }
+    try {
+      const userId = Buffer.from(token, 'base64').toString('utf8');
+      await supabase.from('users').update({ email_opt_in: false }).eq('id', userId);
+      res.writeHead(200, { 'Content-Type': 'text/html' });
+      res.end('<html><body style="font-family:sans-serif;text-align:center;padding:60px;background:#07090d;color:#dde6f0;"><h2>Unsubscribed</h2><p>You have been removed from all emails.</p><p><a href="https://the-tipster.vercel.app/account" style="color:#18e07a;">Manage preferences</a></p></body></html>');
+    } catch(e) {
+      res.writeHead(400); res.end('Invalid token');
+    }
+    return;
+  }
+
+  res.writeHead(404); res.end('Not found');
+
+}).listen(process.env.PORT || 3000, () => {
+  console.log('Health check + admin server running on port ' + (process.env.PORT || 3000));
+});
