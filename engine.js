@@ -306,9 +306,56 @@ async function saveTips(tips) {
   console.log(`✅ Saved ${saved} new tips, skipped ${skipped} duplicates`);
 }
 
-// ─── AUTO-SETTLE RESULTS ─────────────────────
-// Checks completed events and marks tips as won/lost
+// ─── AUTO-SETTLE RESULTS ─────────────────────────────
+// Uses API-Football for reliable result detection
+const API_FOOTBALL_KEY = '80ac2af304202d84314a48f52d7a86b9';
+const API_FOOTBALL_BASE = 'https://v3.football.api-sports.io';
+
+// League ID mapping for API-Football
+const LEAGUE_IDS = {
+  'Premier League': 39,
+  'La Liga': 140,
+  'Bundesliga': 78,
+  'Serie A': 135,
+  'Ligue 1': 61,
+  'Champions League': 2,
+};
+
+// Cache fetched fixtures to avoid duplicate API calls
+const fixtureCache = {};
+
+async function fetchAPIFootballFixtures(leagueId) {
+  if (fixtureCache[leagueId]) return fixtureCache[leagueId];
+  try {
+    const today = new Date().toISOString().split('T')[0];
+    const yesterday = new Date(Date.now() - 86400000).toISOString().split('T')[0];
+    const url = `${API_FOOTBALL_BASE}/fixtures?league=${leagueId}&season=2025&from=${yesterday}&to=${today}&status=FT`;
+    const res = await fetch(url, {
+      headers: { 'x-apisports-key': API_FOOTBALL_KEY }
+    });
+    if (!res.ok) return [];
+    const data = await res.json();
+    const fixtures = data.response || [];
+    fixtureCache[leagueId] = fixtures;
+    console.log('API-Football: ' + fixtures.length + ' finished fixtures for league ' + leagueId);
+    return fixtures;
+  } catch(e) {
+    console.error('API-Football error:', e.message);
+    return [];
+  }
+}
+
+function nameMatch(a, b) {
+  if (!a || !b) return false;
+  const clean = s => s.toLowerCase().replace(/[^a-z0-9]/g, '');
+  const ac = clean(a), bc = clean(b);
+  return ac === bc || ac.includes(bc) || bc.includes(ac);
+}
+
 async function settleResults() {
+  // Clear fixture cache each cycle
+  Object.keys(fixtureCache).forEach(k => delete fixtureCache[k]);
+
   const { data: pending, error } = await supabase
     .from('tips')
     .select('*')
@@ -316,49 +363,46 @@ async function settleResults() {
     .lt('event_time', new Date().toISOString());
 
   if (error || !pending?.length) return;
-  console.log(`🔍 Checking ${pending.length} pending tips for results...`);
+  console.log('Checking ' + pending.length + ' pending tips for results...');
 
   for (const tip of pending) {
     try {
-      // Find the sport config
-      const sportConfig = SPORTS.find(s => s.name === tip.sport && s.league === tip.league);
-      if (!sportConfig) continue;
+      let homeScore = null, awayScore = null;
 
-      // Fetch scores from Odds API
-      const url = `${ODDS_BASE}/sports/${sportConfig.key}/scores/?apiKey=${ODDS_API_KEY}&daysFrom=3`;
-      const res = await fetch(url);
-      if (!res.ok) continue;
+      // Use API-Football for football leagues
+      if (tip.sport === 'Football') {
+        const leagueId = LEAGUE_IDS[tip.league];
+        if (!leagueId) {
+          console.log('No league ID for: ' + tip.league);
+          continue;
+        }
 
-      const scores = await res.json();
+        const fixtures = await fetchAPIFootballFixtures(leagueId);
+        const fixture = fixtures.find(f => {
+          const h = f.teams?.home?.name || '';
+          const a = f.teams?.away?.name || '';
+          return (nameMatch(h, tip.home_team) && nameMatch(a, tip.away_team)) ||
+                 (nameMatch(h, tip.away_team) && nameMatch(a, tip.home_team));
+        });
 
-      // Fuzzy match — handles name variations like "Marseille" vs "Olympique de Marseille"
-      function nameMatch(a, b) {
-        if (!a || !b) return false;
-        const clean = s => s.toLowerCase().replace(/[^a-z0-9]/g, '');
-        const ac = clean(a), bc = clean(b);
-        return ac === bc || ac.includes(bc) || bc.includes(ac);
-      }
+        if (!fixture) {
+          console.log('No result yet: ' + tip.home_team + ' vs ' + tip.away_team);
+          continue;
+        }
 
-      const match = scores.find(s =>
-        s.completed === true && (
-          (nameMatch(s.home_team, tip.home_team) && nameMatch(s.away_team, tip.away_team)) ||
-          (nameMatch(s.home_team, tip.away_team) && nameMatch(s.away_team, tip.home_team))
-        )
-      );
+        const goals = fixture.goals;
+        const homeIsHome = nameMatch(fixture.teams?.home?.name, tip.home_team);
+        homeScore = homeIsHome ? goals.home : goals.away;
+        awayScore = homeIsHome ? goals.away : goals.home;
+        console.log('Result: ' + tip.home_team + ' ' + homeScore + ' - ' + awayScore + ' ' + tip.away_team);
 
-      if (!match || !match.scores) {
-        console.log(`No scores found yet for: ${tip.home_team} vs ${tip.away_team}`);
+      } else {
+        // For non-football sports, skip auto-settle for now
+        // (can add NBA, NHL etc later with API-Basketball etc)
         continue;
       }
 
-      // Work out which side is home/away after fuzzy match
-      const homeIsHome = nameMatch(match.home_team, tip.home_team);
-      const homeScore = parseFloat(match.scores.find(s => nameMatch(s.name, match.home_team))?.score || 0);
-      const awayScore = parseFloat(match.scores.find(s => nameMatch(s.name, match.away_team))?.score || 0);
-      const tipHomeScore = homeIsHome ? homeScore : awayScore;
-      const tipAwayScore = homeIsHome ? awayScore : homeScore;
-
-      console.log(`Scores: ${tip.home_team} ${tipHomeScore} - ${tipAwayScore} ${tip.away_team}`);
+      if (homeScore === null || awayScore === null) continue;
 
       // Determine result
       let won = false;
@@ -367,7 +411,7 @@ async function settleResults() {
       if (sel.includes('win')) {
         const teamName = tip.selection.replace(/ win$/i, '').trim();
         const tipHome = nameMatch(teamName, tip.home_team);
-        won = tipHome ? tipHomeScore > tipAwayScore : tipAwayScore > tipHomeScore;
+        won = tipHome ? homeScore > awayScore : awayScore > homeScore;
       } else if (sel.startsWith('over')) {
         const line = parseFloat(sel.replace('over ', ''));
         won = (homeScore + awayScore) > line;
@@ -382,14 +426,14 @@ async function settleResults() {
         ? parseFloat(((tip.odds - 1) * tip.stake).toFixed(2))
         : parseFloat((-tip.stake).toFixed(2));
 
-      // Update tip
+      // Update tip status
       await supabase.from('tips').update({
         status: won ? 'won' : 'lost',
         profit_loss: pl,
         result_updated_at: new Date().toISOString()
       }).eq('id', tip.id);
 
-      // Add to results history
+      // Get last running P&L
       const { data: lastResult } = await supabase
         .from('results_history')
         .select('running_pl')
@@ -399,10 +443,11 @@ async function settleResults() {
 
       const previousPL = lastResult?.running_pl || 0;
 
+      // Add to results history
       await supabase.from('results_history').insert({
         tip_id: tip.id,
         sport: tip.sport,
-        event: `${tip.home_team} vs ${tip.away_team}`,
+        event: tip.home_team + ' vs ' + tip.away_team,
         selection: tip.selection,
         odds: tip.odds,
         stake: tip.stake,
@@ -412,13 +457,14 @@ async function settleResults() {
         running_pl: parseFloat((previousPL + pl).toFixed(2))
       });
 
-      console.log(`${won ? '✅ WON' : '❌ LOST'}: ${tip.home_team} vs ${tip.away_team} — ${tip.selection} (${pl > 0 ? '+' : ''}${pl}u)`);
+      console.log((won ? 'WON' : 'LOST') + ': ' + tip.home_team + ' vs ' + tip.away_team + ' — ' + tip.selection + ' (' + (pl > 0 ? '+' : '') + pl + 'u)');
 
     } catch(e) {
-      console.error(`Error settling ${tip.id}:`, e.message);
+      console.error('Error settling ' + tip.id + ':', e.message);
     }
   }
 }
+
 
 // ─── MAIN ENGINE LOOP ────────────────────────
 async function runEngine() {
