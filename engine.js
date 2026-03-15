@@ -566,7 +566,7 @@ async function settleResults() {
 const RESEND_API_KEY = process.env.RESEND_API_KEY || '';
 const FROM_EMAIL     = 'onboarding@resend.dev';
 const FROM_NAME      = 'The Tipster';
-const SITE_URL       = 'https://the-tipster.vercel.app';
+const SITE_URL       = 'https://www.thetipsteredge.com';
 
 // ── Send via Resend API ───────────────────────────────────
 async function sendEmail({ to, subject, html, tipId = null, type = 'daily' }) {
@@ -1204,6 +1204,191 @@ async function processAdminJobs() {
   }
 }
 
+
+// ════════════════════════════════════════════════════════════
+// STRIPE PAYMENT SYSTEM
+// ════════════════════════════════════════════════════════════
+
+const STRIPE_SECRET_KEY      = process.env.STRIPE_SECRET_KEY || '';
+const STRIPE_WEBHOOK_SECRET  = process.env.STRIPE_WEBHOOK_SECRET || '';
+const STRIPE_PRICE_MONTHLY   = process.env.STRIPE_PRICE_MONTHLY || 'price_1TBEpeFWJjdJlwwsgLilMcBt';
+const STRIPE_PRICE_ANNUAL    = process.env.STRIPE_PRICE_ANNUAL  || 'price_1TBEqbFWJjdJlwwsTH08T82z';
+const STRIPE_PUBLISHABLE_KEY = process.env.STRIPE_PUBLISHABLE_KEY || '';
+
+// ── Stripe API helper ─────────────────────────────────────
+async function stripeRequest(path, method = 'GET', body = null) {
+  if (!STRIPE_SECRET_KEY) { console.error('STRIPE_SECRET_KEY not set'); return null; }
+  const opts = {
+    method,
+    headers: {
+      'Authorization': 'Bearer ' + STRIPE_SECRET_KEY,
+      'Content-Type': 'application/x-www-form-urlencoded',
+    }
+  };
+  if (body) opts.body = new URLSearchParams(body).toString();
+  try {
+    const res = await fetch('https://api.stripe.com/v1' + path, opts);
+    const data = await res.json();
+    if (!res.ok) { console.error('Stripe error:', data.error?.message); return null; }
+    return data;
+  } catch(e) { console.error('Stripe request error:', e.message); return null; }
+}
+
+// ── Create Stripe Checkout session ───────────────────────
+async function createCheckoutSession(userId, userEmail, priceId, plan) {
+  const session = await stripeRequest('/checkout/sessions', 'POST', {
+    'mode': 'subscription',
+    'customer_email': userEmail,
+    'line_items[0][price]': priceId,
+    'line_items[0][quantity]': '1',
+    'success_url': 'https://thetipsteredge.com/account.html?upgraded=1',
+    'cancel_url': 'https://thetipsteredge.com/#pricing',
+    'metadata[user_id]': userId,
+    'metadata[plan]': plan,
+    'subscription_data[metadata][user_id]': userId,
+    'allow_promotion_codes': 'true',
+    'billing_address_collection': 'auto',
+  });
+  return session;
+}
+
+// ── Verify Stripe webhook signature ──────────────────────
+function verifyStripeWebhook(payload, sigHeader) {
+  if (!STRIPE_WEBHOOK_SECRET) return null;
+  try {
+    // Parse timestamp and signatures from header
+    const parts = sigHeader.split(',');
+    const ts = parts.find(p => p.startsWith('t=')).split('=')[1];
+    const sig = parts.find(p => p.startsWith('v1=')).split('=').slice(1).join('=');
+
+    // Build signed payload
+    const signedPayload = ts + '.' + payload;
+
+    // HMAC-SHA256
+    const crypto = require('crypto');
+    const expected = crypto
+      .createHmac('sha256', STRIPE_WEBHOOK_SECRET)
+      .update(signedPayload, 'utf8')
+      .digest('hex');
+
+    // Constant-time comparison
+    if (expected !== sig) return null;
+
+    // Check timestamp tolerance (5 minutes)
+    if (Math.abs(Date.now() / 1000 - parseInt(ts)) > 300) return null;
+
+    return JSON.parse(payload);
+  } catch(e) {
+    console.error('Webhook verification error:', e.message);
+    return null;
+  }
+}
+
+// ── Handle Stripe webhook events ─────────────────────────
+async function handleStripeWebhook(event) {
+  console.log('Stripe webhook:', event.type);
+
+  switch(event.type) {
+
+    case 'checkout.session.completed': {
+      // Payment succeeded — upgrade user to Pro
+      const session = event.data.object;
+      const userId  = session.metadata?.user_id;
+      if (!userId) { console.error('No user_id in checkout session metadata'); break; }
+
+      await supabase.from('users').update({
+        subscription_status: 'pro',
+        stripe_customer_id:  session.customer,
+        stripe_subscription_id: session.subscription
+      }).eq('id', userId);
+
+      console.log('Upgraded to Pro: ' + userId);
+
+      // Send welcome email
+      const { data: user } = await supabase
+        .from('users').select('email, first_name').eq('id', userId).single();
+      if (user) {
+        const greeting = user.first_name || 'there';
+        const html = emailBase(`
+          <p style="font-family:monospace;font-size:10px;text-transform:uppercase;letter-spacing:3px;color:#f0b429;margin:0 0 10px;">Pro Member</p>
+          <h1 style="font-size:22px;font-weight:800;color:#dde6f0;margin:0 0 8px;">Welcome to Pro, ${greeting}.</h1>
+          <p style="font-size:13px;color:#4a5a70;line-height:1.7;margin:0 0 20px;">
+            Your account is now active. From tomorrow you'll receive the full card at 07:00 — 
+            every tip, every value edge, every stake recommendation.
+          </p>
+          <div style="text-align:center;">
+            <a href="https://thetipsteredge.com" style="display:inline-block;background:#f0b429;color:#07090d;font-size:13px;font-weight:700;padding:12px 28px;border-radius:5px;text-decoration:none;">
+              View Today's Tips
+            </a>
+          </div>
+        `, userId);
+        await sendEmail({
+          to: user.email,
+          subject: 'Welcome to The Tipster Pro',
+          html,
+          type: 'welcome_pro'
+        });
+      }
+      break;
+    }
+
+    case 'customer.subscription.updated': {
+      const sub    = event.data.object;
+      const status = sub.status; // active, past_due, canceled, etc.
+      const custId = sub.customer;
+
+      if (status === 'active') {
+        await supabase.from('users')
+          .update({ subscription_status: 'pro' })
+          .eq('stripe_customer_id', custId);
+      } else if (status === 'past_due') {
+        await supabase.from('users')
+          .update({ subscription_status: 'past_due' })
+          .eq('stripe_customer_id', custId);
+        console.log('Subscription past due for customer: ' + custId);
+      }
+      break;
+    }
+
+    case 'customer.subscription.deleted': {
+      // Subscription cancelled — downgrade to free
+      const sub    = event.data.object;
+      const custId = sub.customer;
+      await supabase.from('users')
+        .update({ subscription_status: 'free', stripe_subscription_id: null })
+        .eq('stripe_customer_id', custId);
+      console.log('Downgraded to free: ' + custId);
+      break;
+    }
+
+    case 'invoice.payment_failed': {
+      const inv    = event.data.object;
+      const custId = inv.customer;
+      await supabase.from('users')
+        .update({ subscription_status: 'past_due' })
+        .eq('stripe_customer_id', custId);
+      console.log('Payment failed for customer: ' + custId);
+      break;
+    }
+
+    case 'invoice.payment_succeeded': {
+      // Renewal succeeded — ensure status is pro
+      const inv    = event.data.object;
+      const custId = inv.customer;
+      if (inv.billing_reason === 'subscription_cycle') {
+        await supabase.from('users')
+          .update({ subscription_status: 'pro' })
+          .eq('stripe_customer_id', custId);
+        console.log('Renewal succeeded for customer: ' + custId);
+      }
+      break;
+    }
+
+    default:
+      console.log('Unhandled webhook event:', event.type);
+  }
+}
+
 // ─── MAIN ENGINE LOOP ────────────────────────
 async function runEngine() {
   console.log(`\n🚀 Engine running — ${new Date().toLocaleString()}`);
@@ -1318,6 +1503,88 @@ http.createServer(async (req, res) => {
     return;
   }
 
+  // ── Stripe webhook ───────────────────────────────────────
+  // POST /stripe/webhook
+  if (url.pathname === '/stripe/webhook' && req.method === 'POST') {
+    let body = '';
+    req.on('data', chunk => { body += chunk.toString(); });
+    req.on('end', async () => {
+      const sig = req.headers['stripe-signature'];
+      if (!sig) { res.writeHead(400); res.end('Missing signature'); return; }
+
+      const event = verifyStripeWebhook(body, sig);
+      if (!event) {
+        console.error('Invalid Stripe webhook signature');
+        res.writeHead(400); res.end('Invalid signature'); return;
+      }
+
+      res.writeHead(200, { ...corsHeaders, 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ received: true }));
+
+      // Process async after responding
+      handleStripeWebhook(event).catch(e => console.error('Webhook handler error:', e.message));
+    });
+    return;
+  }
+
+  // ── Create checkout session ───────────────────────────────
+  // POST /stripe/checkout  body: { userId, email, plan }
+  if (url.pathname === '/stripe/checkout' && req.method === 'POST') {
+    let body = '';
+    req.on('data', chunk => { body += chunk.toString(); });
+    req.on('end', async () => {
+      try {
+        const { userId, email, plan } = JSON.parse(body);
+        if (!userId || !email || !plan) {
+          res.writeHead(400, corsHeaders); res.end('Missing params'); return;
+        }
+        const priceId = plan === 'annual' ? STRIPE_PRICE_ANNUAL : STRIPE_PRICE_MONTHLY;
+        const session = await createCheckoutSession(userId, email, priceId, plan);
+        if (!session) {
+          res.writeHead(500, { ...corsHeaders, 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'Failed to create session' })); return;
+        }
+        res.writeHead(200, { ...corsHeaders, 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ url: session.url }));
+      } catch(e) {
+        console.error('Checkout error:', e.message);
+        res.writeHead(500, corsHeaders); res.end('Server error');
+      }
+    });
+    return;
+  }
+
+  // ── Get Stripe publishable key (safe to expose) ──────────
+  if (url.pathname === '/stripe/config') {
+    res.writeHead(200, { ...corsHeaders, 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ publishableKey: STRIPE_PUBLISHABLE_KEY }));
+    return;
+  }
+
+  // ── Stripe customer portal ────────────────────────────────
+  // POST /stripe/portal  body: { customerId }
+  if (url.pathname === '/stripe/portal' && req.method === 'POST') {
+    let body = '';
+    req.on('data', chunk => { body += chunk.toString(); });
+    req.on('end', async () => {
+      try {
+        const { customerId } = JSON.parse(body);
+        const session = await stripeRequest('/billing_portal/sessions', 'POST', {
+          customer:   customerId,
+          return_url: 'https://thetipsteredge.com/account.html'
+        });
+        if (!session) {
+          res.writeHead(500, corsHeaders); res.end(JSON.stringify({ error: 'Failed' })); return;
+        }
+        res.writeHead(200, { ...corsHeaders, 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ url: session.url }));
+      } catch(e) {
+        res.writeHead(500, corsHeaders); res.end('Server error');
+      }
+    });
+    return;
+  }
+
   // Unsubscribe handler
   // GET /unsubscribe?token=BASE64_USER_ID
   if (url.pathname === '/unsubscribe') {
@@ -1327,7 +1594,7 @@ http.createServer(async (req, res) => {
       const userId = Buffer.from(token, 'base64').toString('utf8');
       await supabase.from('users').update({ email_opt_in: false }).eq('id', userId);
       res.writeHead(200, { 'Content-Type': 'text/html' });
-      res.end('<html><body style="font-family:sans-serif;text-align:center;padding:60px;background:#07090d;color:#dde6f0;"><h2>Unsubscribed</h2><p>You have been removed from all emails.</p><p><a href="https://the-tipster.vercel.app/account" style="color:#18e07a;">Manage preferences</a></p></body></html>');
+      res.end('<html><body style="font-family:sans-serif;text-align:center;padding:60px;background:#07090d;color:#dde6f0;"><h2>Unsubscribed</h2><p>You have been removed from all emails.</p><p><a href="https://www.thetipsteredge.com/account" style="color:#18e07a;">Manage preferences</a></p></body></html>');
     } catch(e) {
       res.writeHead(400); res.end('Invalid token');
     }
