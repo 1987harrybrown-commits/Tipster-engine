@@ -724,7 +724,7 @@ function buildDailyEmail({ tip, userId }) {
       </a>
     </div>
     <p style="text-align:center;font-size:11px;color:#4a5a70;margin:10px 0 0;">
-      Pro members get all tips, full analysis and early access. <a href="${SITE_URL}/#pricing" style="color:#18e07a;text-decoration:none;">Upgrade for £9.99/mo</a>
+      Pro members get all tips, full analysis and early access. <a href="${SITE_URL}/#pricing" style="color:#18e07a;text-decoration:none;">Upgrade — £9.99/mo</a>
     </p>`;
 
   return emailBase(content, userId);
@@ -1073,7 +1073,7 @@ function buildFreeEmail({ tip, proTipCount, userId, firstName }) {
             ${proTipCount} more tips were sent to Pro members 90 minutes ago — including full value edge data, stake recommendations and selections across every league today.
           </p>
           <a href="${SITE_URL}/#pricing" style="display:inline-block;background:#f0b429;color:#07090d;font-size:12px;font-weight:700;padding:9px 20px;border-radius:4px;text-decoration:none;">
-            Unlock Pro — £9.99/mo
+            Go Pro — £9.99/mo
           </a>
         </td>
       </tr>
