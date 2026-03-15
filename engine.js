@@ -334,19 +334,54 @@ const fixtureCache = {};
 
 async function fetchAPIFootballFixtures(leagueId) {
   if (fixtureCache[leagueId]) return fixtureCache[leagueId];
+  console.log('Fetching API-Football fixtures for league ' + leagueId + '...');
   try {
     const today = new Date().toISOString().split('T')[0];
     const threeDaysAgo = new Date(Date.now() - 3 * 86400000).toISOString().split('T')[0];
-    const url = `${API_FOOTBALL_BASE}/fixtures?league=${leagueId}&season=2025&from=${threeDaysAgo}&to=${today}&status=FT`;
-    const res = await fetch(url, {
-      headers: { 'x-apisports-key': API_FOOTBALL_KEY }
+
+    // Try current season first, then fall back to previous season
+    // API-Football uses season year = year season started
+    // 2024/25 season = season=2024, 2025/26 season = season=2025
+    const seasons = [2024, 2025];
+    let allFixtures = [];
+
+    for (const season of seasons) {
+      const url = `${API_FOOTBALL_BASE}/fixtures?league=${leagueId}&season=${season}&from=${threeDaysAgo}&to=${today}&status=FT`;
+      const res = await fetch(url, {
+        headers: {
+          'x-apisports-key': API_FOOTBALL_KEY,
+          'x-rapidapi-key': API_FOOTBALL_KEY,
+          'x-rapidapi-host': 'v3.football.api-sports.io'
+        }
+      });
+      if (!res.ok) {
+        const body = await res.text().catch(() => '');
+        console.error('API-Football HTTP ' + res.status + ' for league ' + leagueId + ' season ' + season + ' body: ' + body.substring(0, 200));
+        continue;
+      }
+      const data = await res.json();
+      if (data.errors && Object.keys(data.errors).length > 0) {
+        console.error('API-Football errors for league ' + leagueId + ':', JSON.stringify(data.errors));
+        continue;
+      }
+      const fixtures = data.response || [];
+      allFixtures = allFixtures.concat(fixtures);
+      if (fixtures.length > 0) {
+        console.log('API-Football: ' + fixtures.length + ' fixtures for league ' + leagueId + ' season ' + season);
+      }
+    }
+
+    // Deduplicate by fixture ID
+    const seen = new Set();
+    const unique = allFixtures.filter(f => {
+      if (seen.has(f.fixture.id)) return false;
+      seen.add(f.fixture.id); return true;
     });
-    if (!res.ok) return [];
-    const data = await res.json();
-    const fixtures = data.response || [];
-    fixtureCache[leagueId] = fixtures;
-    console.log('API-Football: ' + fixtures.length + ' finished fixtures for league ' + leagueId);
-    return fixtures;
+
+    fixtureCache[leagueId] = unique;
+    fixtureCacheTime[leagueId] = Date.now();
+    console.log('API-Football: ' + unique.length + ' total finished fixtures for league ' + leagueId);
+    return unique;
   } catch(e) {
     console.error('API-Football error:', e.message);
     return [];
@@ -360,9 +395,27 @@ function nameMatch(a, b) {
   return ac === bc || ac.includes(bc) || bc.includes(ac);
 }
 
+// Track when we last settled to avoid hammering API-Football
+let lastSettleRun = null;
+const SETTLE_INTERVAL_MS = 60 * 60 * 1000; // Run settler max once per hour
+// Cache expires after 2 hours
+let fixtureCacheTime = {};
+
 async function settleResults() {
-  // Clear fixture cache each cycle
-  Object.keys(fixtureCache).forEach(k => delete fixtureCache[k]);
+  const now = Date.now();
+  // Only run settler once per hour max
+  if (lastSettleRun && (now - lastSettleRun) < SETTLE_INTERVAL_MS) {
+    return;
+  }
+  lastSettleRun = now;
+
+  // Clear fixture cache (expires after 2 hours)
+  Object.keys(fixtureCacheTime).forEach(k => {
+    if (now - fixtureCacheTime[k] > 2 * 60 * 60 * 1000) {
+      delete fixtureCache[k];
+      delete fixtureCacheTime[k];
+    }
+  });
 
   const { data: pending, error } = await supabase
     .from('tips')
@@ -394,7 +447,7 @@ async function settleResults() {
         });
 
         if (!fixture) {
-          console.log('No result yet: ' + tip.home_team + ' vs ' + tip.away_team);
+          console.log('No result yet: ' + tip.home_team + ' vs ' + tip.away_team + ' (league ' + leagueId + ', checked ' + fixtures.length + ' fixtures)');
           continue;
         }
 
