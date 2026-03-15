@@ -861,41 +861,81 @@ async function getSaturdayAcca() {
   return { selections, combinedOdds, reasoning };
 }
 
-// ── Get all opted-in subscribers ─────────────────────────
-async function getSubscribers(emailType = 'daily') {
+// ── Get subscribers split by tier ────────────────────────
+async function getSubscribers(emailType = 'daily', tier = 'all') {
   const col = emailType === 'saturday' ? 'email_saturday' : 'email_daily';
-  const { data, error } = await supabase
+  let query = supabase
     .from('users')
-    .select('id, email, first_name')
+    .select('id, email, first_name, subscription_status')
     .eq('email_opt_in', true)
     .eq(col, true);
+  if (tier === 'pro')  query = query.eq('subscription_status', 'pro');
+  if (tier === 'free') query = query.neq('subscription_status', 'pro');
+  const { data, error } = await query;
   if (error) { console.error('Get subscribers error:', error.message); return []; }
   return data || [];
 }
 
-// ── Daily email dispatch (08:30 UK time) ─────────────────
+// ── Get top N tips for today ──────────────────────────────
+async function getTodaysTips(limit = 10) {
+  const todayStart = new Date(); todayStart.setHours(0,0,0,0);
+  const todayEnd   = new Date(); todayEnd.setHours(23,59,59,999);
+  const { data } = await supabase
+    .from('tips')
+    .select('*')
+    .eq('status', 'pending')
+    .gte('event_time', todayStart.toISOString())
+    .lte('event_time', todayEnd.toISOString())
+    .order('confidence', { ascending: false })
+    .limit(limit);
+  return data || [];
+}
+
+// ── Pro email dispatch (07:00 UK) ────────────────────────
+async function sendProEmails() {
+  console.log('📧 Starting Pro email dispatch (07:00)...');
+  const allTips = await getTodaysTips(15);
+  if (!allTips.length) { console.log('No tips for Pro email, skipping.'); return; }
+  const tip = allTips[0];
+
+  const proSubs = await getSubscribers('daily', 'pro');
+  console.log('Sending Pro email to ' + proSubs.length + ' subscribers...');
+
+  let sent = 0;
+  for (const user of proSubs) {
+    const greeting = user.first_name ? user.first_name + ', ' : '';
+    const subject  = greeting + 'Pro Early Access | ' + allTips.length + ' tips ready — ' + tip.home_team + ' vs ' + tip.away_team;
+    const html     = buildProEmail({ tip, allTips, userId: user.id, firstName: user.first_name });
+    const result   = await sendEmail({ to: user.email, subject, html, tipId: tip.id, type: 'pro_daily' });
+    if (result) sent++;
+    await new Promise(r => setTimeout(r, 100));
+  }
+  console.log('Pro emails complete. Sent: ' + sent + '/' + proSubs.length);
+}
+
+// ── Free email dispatch (08:30 UK) ───────────────────────
 async function sendDailyEmails() {
-  console.log('📧 Starting daily email dispatch...');
+  console.log('📧 Starting free email dispatch (08:30)...');
   const tip = await getBetOfTheDay();
   if (!tip) { console.log('No tip found for daily email, skipping.'); return; }
 
-  const subscribers = await getSubscribers('daily');
-  console.log('Sending to ' + subscribers.length + ' subscribers...');
+  // Count how many pro tips went out at 07:00 for upsell messaging
+  const allTips = await getTodaysTips(15);
+  const proTipCount = Math.max(allTips.length - 1, 0);
+
+  const freeSubs = await getSubscribers('daily', 'free');
+  console.log('Sending free email to ' + freeSubs.length + ' subscribers...');
 
   let sent = 0;
-  for (const user of subscribers) {
-    // Personalise subject with first name if available
+  for (const user of freeSubs) {
     const greeting = user.first_name ? user.first_name + ', ' : '';
-    const subject = greeting + "Today's Bet of the Day | " + tip.home_team + ' vs ' + tip.away_team;
-    const html = buildDailyEmail({ tip, userId: user.id });
-    const result = await sendEmail({
-      to: user.email, subject, html,
-      tipId: tip.id, type: 'daily'
-    });
+    const subject  = greeting + "Today's Bet of the Day | " + tip.home_team + ' vs ' + tip.away_team;
+    const html     = buildFreeEmail({ tip, proTipCount, userId: user.id, firstName: user.first_name });
+    const result   = await sendEmail({ to: user.email, subject, html, tipId: tip.id, type: 'daily' });
     if (result) sent++;
-    await new Promise(r => setTimeout(r, 100)); // Rate limit: 10/sec
+    await new Promise(r => setTimeout(r, 100));
   }
-  console.log('Daily emails complete. Sent: ' + sent + '/' + subscribers.length);
+  console.log('Free emails complete. Sent: ' + sent + '/' + freeSubs.length);
 }
 
 // ── Saturday accumulator dispatch ────────────────────────
@@ -921,10 +961,138 @@ async function sendSaturdayEmails() {
   console.log('Saturday emails complete. Sent: ' + sent + '/' + subscribers.length);
 }
 
+
+// ── Pro full card email template ─────────────────────────
+function buildProEmail({ tip, allTips, userId, firstName }) {
+  const greeting = firstName ? firstName : 'there';
+  const edge = (parseFloat(tip.confidence||0) - (1/parseFloat(tip.odds||1))*100).toFixed(1);
+  const edgeColor = parseFloat(edge) >= 0 ? '#18e07a' : '#ff3d5a';
+  const edgeStr   = parseFloat(edge) >= 0 ? '+' + edge + '%' : edge + '%';
+
+  // Build additional tips rows (tips 2 onwards)
+  const extraTips = allTips.slice(1, 8); // Up to 7 more
+  const extraRows = extraTips.map(t => {
+    const e = (parseFloat(t.confidence||0) - (1/parseFloat(t.odds||1))*100).toFixed(1);
+    const ec = parseFloat(e) >= 0 ? '#18e07a' : '#ff3d5a';
+    const es = parseFloat(e) >= 0 ? '+' + e + '%' : e + '%';
+    return `
+    <tr style="border-top:1px solid #1c2535;">
+      <td style="padding:10px 14px;">
+        <p style="font-size:11px;color:#4a5a70;margin:0 0 2px;font-family:monospace;text-transform:uppercase;letter-spacing:1px;">${t.sport} &bull; ${t.league||''}</p>
+        <p style="font-size:13px;font-weight:700;color:#dde6f0;margin:0 0 2px;">${t.home_team} vs ${t.away_team}</p>
+        <p style="font-size:12px;color:#18e07a;margin:0;">${t.selection} <span style="color:#4a5a70;">@ </span><span style="color:#f0b429;font-family:monospace;">${parseFloat(t.odds).toFixed(2)}</span></p>
+      </td>
+      <td style="padding:10px 14px;text-align:right;white-space:nowrap;">
+        <p style="font-family:monospace;font-size:11px;color:${ec};margin:0 0 3px;">${es} edge</p>
+        <p style="font-family:monospace;font-size:11px;color:#4a5a70;margin:0;">${t.confidence}% conf</p>
+        <p style="font-family:monospace;font-size:11px;color:#4a5a70;margin:3px 0 0;">${t.stake}u stake</p>
+      </td>
+    </tr>`;
+  }).join('');
+
+  const content = `
+    <p style="font-family:monospace;font-size:10px;text-transform:uppercase;letter-spacing:3px;color:#f0b429;margin:0 0 10px;">
+      Pro Early Access &bull; 07:00
+    </p>
+    <h1 style="font-size:20px;font-weight:800;color:#dde6f0;margin:0 0 4px;line-height:1.2;">
+      Morning, ${greeting}. Here's your full card.
+    </h1>
+    <p style="font-size:12px;color:#4a5a70;margin:0 0 22px;">
+      ${allTips.length} tips ready. Free members get one pick at 08:30 — you have them all now.
+    </p>
+
+    <!-- BET OF THE DAY -->
+    <p style="font-family:monospace;font-size:9px;text-transform:uppercase;letter-spacing:2px;color:#18e07a;margin:0 0 8px;">Best Pick Today</p>
+    <table width="100%" cellpadding="0" cellspacing="0" style="background:#111620;border-radius:7px;margin-bottom:16px;">
+      <tr>
+        <td style="padding:14px 16px;">
+          <p style="font-size:11px;color:#4a5a70;margin:0 0 3px;font-family:monospace;text-transform:uppercase;">${tip.sport} &bull; ${tip.league||''}</p>
+          <p style="font-size:17px;font-weight:800;color:#dde6f0;margin:0 0 2px;">${tip.home_team} vs ${tip.away_team}</p>
+          <p style="font-size:14px;color:#18e07a;margin:0;">${tip.selection}</p>
+        </td>
+        <td style="padding:14px 16px;text-align:right;">
+          <p style="font-family:monospace;font-size:26px;font-weight:700;color:#f0b429;margin:0;line-height:1;">${parseFloat(tip.odds).toFixed(2)}</p>
+          <p style="font-family:monospace;font-size:10px;color:${edgeColor};margin:4px 0 0;">${edgeStr} edge</p>
+          <p style="font-family:monospace;font-size:10px;color:#4a5a70;margin:2px 0 0;">${tip.stake}u stake</p>
+        </td>
+      </tr>
+    </table>
+
+    ${extraTips.length > 0 ? `
+    <!-- FULL CARD -->
+    <p style="font-family:monospace;font-size:9px;text-transform:uppercase;letter-spacing:2px;color:#4a5a70;margin:0 0 8px;">Full Card Today (${allTips.length} tips)</p>
+    <table width="100%" cellpadding="0" cellspacing="0" style="background:#0c0f15;border:1px solid #1c2535;border-radius:7px;margin-bottom:20px;">
+      ${extraRows}
+    </table>` : ''}
+
+    <div style="text-align:center;margin-bottom:8px;">
+      <a href="${SITE_URL}/#tips" style="display:inline-block;background:#f0b429;color:#07090d;font-size:13px;font-weight:700;padding:12px 28px;border-radius:5px;text-decoration:none;">
+        View Full Card on Site
+      </a>
+    </div>`;
+
+  return emailBase(content, userId);
+}
+
+// ── Free teaser email (08:30) ─────────────────────────────
+function buildFreeEmail({ tip, proTipCount, userId, firstName }) {
+  const greeting = firstName ? firstName : 'there';
+  const edge = (parseFloat(tip.confidence||0) - (1/parseFloat(tip.odds||1))*100).toFixed(1);
+  const edgeColor = parseFloat(edge) >= 0 ? '#18e07a' : '#ff3d5a';
+  const edgeStr   = parseFloat(edge) >= 0 ? '+' + edge + '%' : edge + '%';
+
+  const content = `
+    <p style="font-family:monospace;font-size:10px;text-transform:uppercase;letter-spacing:3px;color:#18e07a;margin:0 0 10px;">
+      Bet of the Day
+    </p>
+    <h1 style="font-size:20px;font-weight:800;color:#dde6f0;margin:0 0 4px;line-height:1.2;">
+      Morning, ${greeting}.
+    </h1>
+    <p style="font-size:12px;color:#4a5a70;margin:0 0 22px;">Your daily pick is ready.</p>
+
+    <table width="100%" cellpadding="0" cellspacing="0" style="background:#111620;border-radius:7px;margin-bottom:16px;">
+      <tr>
+        <td style="padding:14px 16px;">
+          <p style="font-size:11px;color:#4a5a70;margin:0 0 3px;font-family:monospace;text-transform:uppercase;">${tip.sport} &bull; ${tip.league||''}</p>
+          <p style="font-size:17px;font-weight:800;color:#dde6f0;margin:0 0 2px;">${tip.home_team} vs ${tip.away_team}</p>
+          <p style="font-size:14px;color:#18e07a;margin:0;">${tip.selection}</p>
+        </td>
+        <td style="padding:14px 16px;text-align:right;">
+          <p style="font-family:monospace;font-size:26px;font-weight:700;color:#f0b429;margin:0;line-height:1;">${parseFloat(tip.odds).toFixed(2)}</p>
+          <p style="font-family:monospace;font-size:10px;color:${edgeColor};margin:4px 0 0;">${edgeStr} edge</p>
+        </td>
+      </tr>
+    </table>
+
+    <!-- PRO UPSELL BLOCK -->
+    <table width="100%" cellpadding="0" cellspacing="0" style="background:#0c0f15;border:1px solid rgba(240,180,41,0.25);border-radius:7px;margin-bottom:20px;">
+      <tr>
+        <td style="padding:16px 18px;">
+          <p style="font-family:monospace;font-size:9px;text-transform:uppercase;letter-spacing:2px;color:#f0b429;margin:0 0 8px;">Pro members got this at 07:00</p>
+          <p style="font-size:13px;color:#dde6f0;margin:0 0 10px;">
+            ${proTipCount} more tips were sent to Pro members 90 minutes ago — including full value edge data, stake recommendations and selections across every league today.
+          </p>
+          <a href="${SITE_URL}/#pricing" style="display:inline-block;background:#f0b429;color:#07090d;font-size:12px;font-weight:700;padding:9px 20px;border-radius:4px;text-decoration:none;">
+            Unlock Pro — £9.99/mo
+          </a>
+        </td>
+      </tr>
+    </table>
+
+    <div style="text-align:center;">
+      <a href="${SITE_URL}/#tips" style="display:inline-block;background:#18e07a;color:#07090d;font-size:13px;font-weight:700;padding:12px 28px;border-radius:5px;text-decoration:none;">
+        View Today's Free Tips
+      </a>
+    </div>`;
+
+  return emailBase(content, userId);
+}
+
 // ── Precision scheduler ───────────────────────────────────
 // Runs at exactly 08:30 UK time (UTC+0 in winter, UTC+1 in summer)
 // Cron-style: checks every minute, fires once per day
-let lastDailyDate   = null;
+let lastProDate      = null;
+let lastDailyDate    = null;
 let lastSaturdayDate = null;
 
 function startEmailScheduler() {
@@ -937,20 +1105,26 @@ function startEmailScheduler() {
     const today = ukTime.toDateString();
     const isSaturday = ukTime.getDay() === 6;
 
-    // Daily email at 08:30 UK
+    // Pro email at 07:00 UK — early access
+    if (h === 7 && m === 0 && lastProDate !== today) {
+      lastProDate = today;
+      await sendProEmails();
+    }
+
+    // Free email at 08:30 UK — Bet of the Day
     if (h === 8 && m === 30 && lastDailyDate !== today) {
       lastDailyDate = today;
       await sendDailyEmails();
     }
 
-    // Saturday email at 08:30 UK (same time but Saturday only)
-    if (isSaturday && h === 8 && m === 30 && lastSaturdayDate !== today) {
+    // Saturday accumulator at 08:00 UK (Pro gets it earlier)
+    if (isSaturday && h === 8 && m === 0 && lastSaturdayDate !== today) {
       lastSaturdayDate = today;
       await sendSaturdayEmails();
     }
   }, 60 * 1000); // Check every minute
 
-  console.log('Email scheduler started. Daily at 08:30 UK, Saturday acca at 08:30 UK on Saturdays.');
+  console.log('Email scheduler started. Pro at 07:00 UK, Free at 08:30 UK, Saturday acca at 08:00 UK.');
 }
 
 // ── Test email endpoint (called via HTTP) ─────────────────
@@ -961,11 +1135,18 @@ async function sendTestEmail(toEmail, type) {
     const html = buildSaturdayEmail({ ...acca, userId: 'test' });
     const id = await sendEmail({ to: toEmail, subject: '[TEST] Saturday Accumulator', html, type: 'test' });
     return { success: !!id };
+  } else if (type === 'pro_daily') {
+    const allTips = await getTodaysTips(15);
+    if (!allTips.length) return { success: false, error: 'No tips available' };
+    const html = buildProEmail({ tip: allTips[0], allTips, userId: 'test', firstName: 'Test' });
+    const id = await sendEmail({ to: toEmail, subject: '[TEST] Pro Early Access Email', html, type: 'test' });
+    return { success: !!id };
   } else {
     const tip = await getBetOfTheDay();
     if (!tip) return { success: false, error: 'No tip available' };
-    const html = buildDailyEmail({ tip, userId: 'test' });
-    const id = await sendEmail({ to: toEmail, subject: '[TEST] Bet of the Day', html, type: 'test' });
+    const allTips = await getTodaysTips(15);
+    const html = buildFreeEmail({ tip, proTipCount: allTips.length - 1, userId: 'test', firstName: 'Test' });
+    const id = await sendEmail({ to: toEmail, subject: '[TEST] Bet of the Day (Free)', html, type: 'test' });
     return { success: !!id };
   }
 }
