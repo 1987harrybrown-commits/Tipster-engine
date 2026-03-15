@@ -9,7 +9,7 @@ const fetch = (...args) => import('node-fetch').then(({default: f}) => f(...args
 // ─── CREDENTIALS ────────────────────────────
 const SUPABASE_URL = 'https://eyhlzzaaxrwisrtwyoyh.supabase.co';
 const SUPABASE_SERVICE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImV5aGx6emFheHJ3aXNydHd5b3loIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3MzM3OTI3NywiZXhwIjoyMDg4OTU1Mjc3fQ.9Lry94K4qWWYzh0yd4zcgEaGvb8myeAzxrSHtcBSQus';
-const ODDS_API_KEY = '8a0d4da4da83840716db786d5e98d0dc';
+const ODDS_API_KEY = 'cd4587438ed62cce94274935545c86a3';
 const ODDS_BASE = 'https://api.the-odds-api.com/v4';
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
@@ -342,7 +342,7 @@ async function fetchAPIFootballFixtures(leagueId) {
     // Try current season first, then fall back to previous season
     // API-Football uses season year = year season started
     // 2024/25 season = season=2024, 2025/26 season = season=2025
-    const seasons = [2024, 2025];
+    const seasons = [2024]; // Free plan max season is 2024
     let allFixtures = [];
 
     for (const season of seasons) {
