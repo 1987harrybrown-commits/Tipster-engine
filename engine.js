@@ -511,7 +511,7 @@ async function settleResults() {
 // ════════════════════════════════════════════════════════════
 
 const RESEND_API_KEY = process.env.RESEND_API_KEY || '';
-const FROM_EMAIL     = 'tips@the-tipster.app';
+const FROM_EMAIL     = 'onboarding@resend.dev';
 const FROM_NAME      = 'The Tipster';
 const SITE_URL       = 'https://the-tipster.vercel.app';
 
