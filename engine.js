@@ -564,7 +564,7 @@ async function settleResults() {
 // ════════════════════════════════════════════════════════════
 
 const RESEND_API_KEY = process.env.RESEND_API_KEY || '';
-const FROM_EMAIL     = 'onboarding@resend.dev';
+const FROM_EMAIL     = 'info@thetipsteredge.com';
 const FROM_NAME      = 'The Tipster';
 const SITE_URL       = 'https://www.thetipsteredge.com';
 
