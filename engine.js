@@ -117,30 +117,37 @@ function generateRacingTips(events, sport) {
 }
 
 // ─── TIP GENERATION ENGINE ───────────────────
-// ONE tip per game — picks the single highest-confidence
-// selection across all markets (h2h vs totals).
-// This guarantees no duplicate entries per fixture.
-function generateTips(events, sport) {
+// ONE tip per game. For football, blends market consensus
+// with real form data (last 5 results, goals for/against).
+async function generateTips(events, sport) {
   const tips = [];
+  const isFootball = sport.name === 'Football';
+  const leagueId = FORM_LEAGUE_IDS[sport.league];
 
   for (const event of events) {
     if (!event.bookmakers || event.bookmakers.length < 2) continue;
 
     const eventTime = new Date(event.commence_time);
     const now = new Date();
-
-    // Only tip events in the next 48 hours
     const hoursUntil = (eventTime - now) / 3600000;
     if (hoursUntil < 0 || hoursUntil > 48) continue;
 
-    // Analyse both markets, pick the single best tip
+    // Fetch form data for football only
+    let homeForm = null, awayForm = null;
+    if (isFootball && leagueId) {
+      [homeForm, awayForm] = await Promise.all([
+        fetchTeamForm(event.home_team, leagueId),
+        fetchTeamForm(event.away_team, leagueId)
+      ]);
+    }
+
     const candidates = [];
 
     const h2hBooks = event.bookmakers
       .map(b => b.markets.find(m => m.key === 'h2h'))
       .filter(Boolean);
     if (h2hBooks.length >= 2) {
-      const h2hTip = analyseH2H(event, h2hBooks, sport);
+      const h2hTip = analyseH2H(event, h2hBooks, sport, homeForm, awayForm);
       if (h2hTip) candidates.push(h2hTip);
     }
 
@@ -148,13 +155,12 @@ function generateTips(events, sport) {
       .map(b => b.markets.find(m => m.key === 'totals'))
       .filter(Boolean);
     if (totalsBooks.length >= 2) {
-      const totalsTip = analyseTotals(event, totalsBooks, sport);
+      const totalsTip = analyseTotals(event, totalsBooks, sport, homeForm, awayForm);
       if (totalsTip) candidates.push(totalsTip);
     }
 
     if (!candidates.length) continue;
 
-    // Pick the single highest-confidence tip for this game
     const best = candidates.reduce((a, b) => a.confidence >= b.confidence ? a : b);
     tips.push(best);
   }
@@ -163,9 +169,9 @@ function generateTips(events, sport) {
 }
 
 // Analyse head-to-head odds for value
-function analyseH2H(event, books, sport) {
+// homeForm/awayForm: form data from API-Football (optional, football only)
+function analyseH2H(event, books, sport, homeForm = null, awayForm = null) {
   try {
-    // Collect all odds for each outcome
     const oddsMap = {};
     for (const book of books) {
       for (const outcome of book.outcomes) {
@@ -174,7 +180,6 @@ function analyseH2H(event, books, sport) {
       }
     }
 
-    // Find best odds and implied probability
     let bestPick = null;
     let bestValue = 0;
 
@@ -182,23 +187,26 @@ function analyseH2H(event, books, sport) {
       const maxOdds = Math.max(...oddsList);
       const avgOdds = oddsList.reduce((a,b) => a+b, 0) / oddsList.length;
       const impliedProb = 1 / avgOdds;
-
-      // Value = when best odds imply better chance than market average
-      const value = (1/avgOdds) - (1/maxOdds);
       const marketConsensus = impliedProb;
 
-      // Only tip if there's reasonable consensus (>45% implied prob)
-      // and odds are attractive (>1.40)
       if (marketConsensus > 0.45 && maxOdds >= 1.40 && maxOdds <= 5.00) {
         const valueScore = marketConsensus * 100;
         if (valueScore > bestValue) {
           bestValue = valueScore;
+          const isHomeTeam = team === event.home_team;
+          const isDraw = team !== event.home_team && team !== event.away_team;
+          // Base confidence from market consensus
+          const baseConf = Math.min(95, Math.round(50 + (marketConsensus * 50)));
+          // Blend in form data for football
+          const finalConf = blendFormIntoConfidence(baseConf, homeForm, awayForm,
+            isDraw ? null : team, isHomeTeam);
           bestPick = {
-            selection: team === event.home_team ? `${team} Win` :
-                       team === event.away_team ? `${team} Win` : 'Draw',
+            selection: isHomeTeam ? `${team} Win` : isDraw ? 'Draw' : `${team} Win`,
             odds: maxOdds,
-            confidence: Math.min(95, Math.round(50 + (marketConsensus * 50))),
-            market: 'h2h'
+            confidence: finalConf,
+            market: 'h2h',
+            isHomeTeam,
+            isDraw
           };
         }
       }
@@ -206,15 +214,8 @@ function analyseH2H(event, books, sport) {
 
     if (!bestPick) return null;
 
-    // Stake recommendation based on confidence (Kelly-inspired)
-    // 90%+ = 3 units, 85-89% = 2 units, 78-84% = 1.5 units, below = 1 unit
     const conf = bestPick.confidence;
     const stake = conf >= 90 ? 3.0 : conf >= 85 ? 2.0 : conf >= 78 ? 1.5 : 1.0;
-
-    // Tier logic: all tips start as 'pro'
-    // The website shows top 3 highest-confidence tips as 'free' previews
-    // Everything else is pro-only
-    const tier = 'pro'; // Website handles free preview display
 
     return {
       sport: sport.name,
@@ -227,10 +228,10 @@ function analyseH2H(event, books, sport) {
       odds: parseFloat(bestPick.odds.toFixed(2)),
       stake,
       confidence: bestPick.confidence,
-      tier,
+      tier: 'pro',
       status: 'pending',
       bookmaker: event.bookmakers[0]?.title || 'Multiple',
-      notes: `Consensus from ${event.bookmakers.length} bookmakers`
+      notes: buildFormNotes(homeForm, awayForm, event.bookmakers.length, bestPick.selection)
     };
   } catch(e) {
     return null;
@@ -238,7 +239,8 @@ function analyseH2H(event, books, sport) {
 }
 
 // Analyse totals (over/under) for value
-function analyseTotals(event, books, sport) {
+// For football: factors in goals scored/conceded to adjust over/under confidence
+function analyseTotals(event, books, sport, homeForm = null, awayForm = null) {
   try {
     const overOdds = [], underOdds = [];
     let point = null;
@@ -254,21 +256,35 @@ function analyseTotals(event, books, sport) {
 
     const avgOver = overOdds.reduce((a,b)=>a+b,0)/overOdds.length;
     const avgUnder = underOdds.reduce((a,b)=>a+b,0)/underOdds.length;
-
-    // Pick the side with better consensus value
     const overProb = 1/avgOver;
     const underProb = 1/avgUnder;
 
-    // Only tip totals as pro picks
     if (Math.max(overProb, underProb) < 0.52) return null;
 
     const pickOver = overProb >= underProb;
     const bestOdds = pickOver ? Math.max(...overOdds) : Math.max(...underOdds);
-    const confidence = Math.min(85, Math.round(48 + (Math.max(overProb,underProb) * 40)));
+    let confidence = Math.min(85, Math.round(48 + (Math.max(overProb,underProb) * 40)));
 
     if (bestOdds < 1.60 || bestOdds > 2.20) return null;
 
+    // Goals-based adjustment for football totals
+    if (homeForm && awayForm) {
+      const combinedAvgGoals = homeForm.avgGoalsFor + awayForm.avgGoalsFor;
+      if (pickOver) {
+        // Both teams score a lot = boost over confidence
+        if (combinedAvgGoals > 3.0) confidence = Math.min(88, confidence + 5);
+        if (combinedAvgGoals < 1.8) confidence = Math.max(45, confidence - 6);
+      } else {
+        // Both teams score few = boost under confidence
+        if (combinedAvgGoals < 1.8) confidence = Math.min(88, confidence + 5);
+        if (combinedAvgGoals > 3.0) confidence = Math.max(45, confidence - 6);
+      }
+    }
+
     const totalsStake = confidence >= 85 ? 2.0 : confidence >= 78 ? 1.5 : 1.0;
+    const goalsNote = (homeForm && awayForm)
+      ? ` | Avg goals: ${(homeForm.avgGoalsFor + awayForm.avgGoalsFor).toFixed(1)}/game`
+      : '';
 
     return {
       sport: sport.name,
@@ -284,7 +300,7 @@ function analyseTotals(event, books, sport) {
       tier: 'pro',
       status: 'pending',
       bookmaker: event.bookmakers[0]?.title || 'Multiple',
-      notes: `Totals analysis — ${event.bookmakers.length} books checked`
+      notes: `${event.bookmakers.length} books${goalsNote}`
     };
   } catch(e) {
     return null;
@@ -292,9 +308,8 @@ function analyseTotals(event, books, sport) {
 }
 
 // ─── SAVE TIPS TO DATABASE ───────────────────
-// ONE tip per game enforced at both app and DB level.
-// Uses upsert with ON CONFLICT on (home_team, away_team, event_date)
-// so even if engine runs multiple times, only one row per game exists.
+// ONE tip per game enforced: checks by home+away+date, not selection text.
+// Updates if new tip has higher confidence than existing.
 async function saveTips(tips) {
   if (!tips.length) return;
 
@@ -302,7 +317,6 @@ async function saveTips(tips) {
 
   for (const tip of tips) {
     try {
-      // Check if a tip already exists for this game today (any market)
       const eventDate = new Date(tip.event_time).toISOString().split('T')[0];
       const { data: existing } = await supabase
         .from('tips')
@@ -315,19 +329,14 @@ async function saveTips(tips) {
         .maybeSingle();
 
       if (existing) {
-        // Only update if new tip has higher confidence
         if (tip.confidence > existing.confidence) {
           await supabase.from('tips').update({
-            selection: tip.selection,
-            market: tip.market,
-            odds: tip.odds,
-            stake: tip.stake,
-            confidence: tip.confidence,
-            bookmaker: tip.bookmaker,
+            selection: tip.selection, market: tip.market,
+            odds: tip.odds, stake: tip.stake,
+            confidence: tip.confidence, bookmaker: tip.bookmaker,
             notes: tip.notes
           }).eq('id', existing.id);
           saved++;
-          console.log(`↑ Updated tip for ${tip.home_team} vs ${tip.away_team} — better confidence ${tip.confidence}%`);
         } else {
           skipped++;
         }
@@ -336,7 +345,6 @@ async function saveTips(tips) {
 
       const { error } = await supabase.from('tips').insert(tip);
       if (error) {
-        // Unique constraint violation — silently skip
         if (error.code === '23505') { skipped++; }
         else { console.error('Insert error:', error.message); }
       } else {
@@ -347,7 +355,7 @@ async function saveTips(tips) {
     }
   }
 
-  console.log(`✅ Saved ${saved} new tips, skipped ${skipped} duplicates`);
+  console.log(`✅ Saved ${saved} new/updated tips, skipped ${skipped} duplicates`);
 }
 
 // ─── AUTO-SETTLE RESULTS ─────────────────────────────
@@ -429,6 +437,164 @@ function nameMatch(a, b) {
   const clean = s => s.toLowerCase().replace(/[^a-z0-9]/g, '');
   const ac = clean(a), bc = clean(b);
   return ac === bc || ac.includes(bc) || bc.includes(ac);
+}
+
+// ─── FORM DATA SYSTEM ────────────────────────────────────────
+// Fetches last 5 results + goals for/against for football teams
+// Cached per team per day to stay within 100 req/day API limit
+// API-Football league IDs for team lookup
+const FORM_LEAGUE_IDS = {
+  'Premier League': 39,
+  'La Liga': 140,
+  'Bundesliga': 78,
+  'Serie A': 135,
+  'Ligue 1': 61,
+  'Champions League': 2,
+};
+
+// In-memory cache: { 'TeamName_leagueId': { form, goalsFor, goalsAgainst, cachedAt } }
+const formCache = {};
+const FORM_CACHE_TTL = 24 * 60 * 60 * 1000; // 24 hours
+
+// Track API calls today to stay under 100/day limit
+let formApiCallsToday = 0;
+let formApiCallDate = '';
+const MAX_FORM_CALLS_PER_DAY = 40; // Reserve 60 for settler
+
+function resetFormCallsIfNewDay() {
+  const today = new Date().toISOString().split('T')[0];
+  if (formApiCallDate !== today) {
+    formApiCallsToday = 0;
+    formApiCallDate = today;
+  }
+}
+
+async function fetchTeamForm(teamName, leagueId) {
+  resetFormCallsIfNewDay();
+
+  const cacheKey = `${teamName}_${leagueId}`;
+  const cached = formCache[cacheKey];
+  if (cached && (Date.now() - cached.cachedAt) < FORM_CACHE_TTL) {
+    return cached;
+  }
+
+  // Budget check
+  if (formApiCallsToday >= MAX_FORM_CALLS_PER_DAY) {
+    return null;
+  }
+
+  try {
+    formApiCallsToday++;
+    // Search for team ID first
+    const searchUrl = `${API_FOOTBALL_BASE}/teams?name=${encodeURIComponent(teamName)}&league=${leagueId}&season=2024`;
+    const searchRes = await fetch(searchUrl, {
+      headers: {
+        'x-apisports-key': API_FOOTBALL_KEY,
+        'x-rapidapi-key': API_FOOTBALL_KEY,
+        'x-rapidapi-host': 'v3.football.api-sports.io'
+      }
+    });
+    if (!searchRes.ok) return null;
+    const searchData = await searchRes.json();
+    const team = searchData.response?.[0]?.team;
+    if (!team) return null;
+
+    formApiCallsToday++;
+    // Fetch last 5 fixtures for this team
+    const fixturesUrl = `${API_FOOTBALL_BASE}/fixtures?team=${team.id}&league=${leagueId}&season=2024&last=5&status=FT`;
+    const fixturesRes = await fetch(fixturesUrl, {
+      headers: {
+        'x-apisports-key': API_FOOTBALL_KEY,
+        'x-rapidapi-key': API_FOOTBALL_KEY,
+        'x-rapidapi-host': 'v3.football.api-sports.io'
+      }
+    });
+    if (!fixturesRes.ok) return null;
+    const fixturesData = await fixturesRes.json();
+    const fixtures = fixturesData.response || [];
+
+    if (!fixtures.length) return null;
+
+    // Calculate form metrics
+    let wins = 0, draws = 0, losses = 0;
+    let goalsFor = 0, goalsAgainst = 0;
+
+    for (const f of fixtures) {
+      const isHome = f.teams.home.id === team.id;
+      const teamGoals   = isHome ? f.goals.home : f.goals.away;
+      const oppGoals    = isHome ? f.goals.away : f.goals.home;
+      const teamWinner  = isHome ? f.teams.home.winner : f.teams.away.winner;
+
+      goalsFor     += teamGoals || 0;
+      goalsAgainst += oppGoals  || 0;
+
+      if (teamWinner === true)       wins++;
+      else if (teamWinner === false) losses++;
+      else                           draws++;
+    }
+
+    const played = fixtures.length;
+    const formScore = ((wins * 3 + draws) / (played * 3)); // 0-1 scale
+    const avgGoalsFor     = goalsFor     / played;
+    const avgGoalsAgainst = goalsAgainst / played;
+
+    // Form string e.g. "WWDLW"
+    const formString = fixtures.slice().reverse().map(f => {
+      const isHome   = f.teams.home.id === team.id;
+      const winner   = isHome ? f.teams.home.winner : f.teams.away.winner;
+      return winner === true ? 'W' : winner === false ? 'L' : 'D';
+    }).join('');
+
+    const result = { formScore, avgGoalsFor, avgGoalsAgainst, formString, wins, draws, losses, played, cachedAt: Date.now() };
+    formCache[cacheKey] = result;
+    console.log(`Form fetched: ${teamName} — ${formString} (${avgGoalsFor.toFixed(1)} scored, ${avgGoalsAgainst.toFixed(1)} conceded)`);
+    return result;
+
+  } catch(e) {
+    console.error(`Form fetch error for ${teamName}:`, e.message);
+    return null;
+  }
+}
+
+// Blend market confidence with form data
+// Returns adjusted confidence score
+function blendFormIntoConfidence(baseConfidence, homeForm, awayForm, selection, isHome) {
+  if (!homeForm && !awayForm) return baseConfidence;
+
+  const tipTeamForm   = isHome ? homeForm : awayForm;
+  const otherTeamForm = isHome ? awayForm : homeForm;
+
+  if (!tipTeamForm) return baseConfidence;
+
+  // Form adjustment: +/- up to 8 points based on recent form
+  // formScore is 0-1, 0.5 = average, above = good form, below = poor
+  const formAdj = (tipTeamForm.formScore - 0.5) * 16; // -8 to +8
+
+  // Goals adjustment: reward teams scoring well and conceding little
+  let goalsAdj = 0;
+  if (tipTeamForm.avgGoalsFor > 1.8)    goalsAdj += 3;
+  if (tipTeamForm.avgGoalsFor < 0.8)    goalsAdj -= 3;
+  if (tipTeamForm.avgGoalsAgainst < 0.8) goalsAdj += 2;
+  if (tipTeamForm.avgGoalsAgainst > 2.0) goalsAdj -= 2;
+
+  // Opposition form adjustment (weaker opponent = slight boost)
+  let oppAdj = 0;
+  if (otherTeamForm) {
+    if (otherTeamForm.formScore < 0.33) oppAdj += 2;
+    if (otherTeamForm.formScore > 0.67) oppAdj -= 2;
+  }
+
+  const adjusted = Math.round(baseConfidence + formAdj + goalsAdj + oppAdj);
+  return Math.min(95, Math.max(45, adjusted));
+}
+
+// Build analysis notes string including form data
+function buildFormNotes(homeForm, awayForm, bookCount, selection) {
+  const parts = [];
+  parts.push(`${bookCount} bookmakers`);
+  if (homeForm) parts.push(`Home: ${homeForm.formString} (${homeForm.avgGoalsFor.toFixed(1)} scored)`);
+  if (awayForm) parts.push(`Away: ${awayForm.formString} (${awayForm.avgGoalsFor.toFixed(1)} scored)`);
+  return parts.join(' | ');
 }
 
 // Track when we last settled to avoid hammering API-Football
@@ -1444,7 +1610,7 @@ async function runEngine() {
     } else {
       const events = await fetchOdds(sport.key);
       if (events.length) {
-        const tips = generateTips(events, sport);
+        const tips = await generateTips(events, sport);
         console.log('   -> ' + events.length + ' events, ' + tips.length + ' tips generated');
         allTips = allTips.concat(tips);
       }
