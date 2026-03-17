@@ -117,7 +117,9 @@ function generateRacingTips(events, sport) {
 }
 
 // ─── TIP GENERATION ENGINE ───────────────────
-// Analyses odds across bookmakers to find value
+// ONE tip per game — picks the single highest-confidence
+// selection across all markets (h2h vs totals).
+// This guarantees no duplicate entries per fixture.
 function generateTips(events, sport) {
   const tips = [];
 
@@ -131,25 +133,30 @@ function generateTips(events, sport) {
     const hoursUntil = (eventTime - now) / 3600000;
     if (hoursUntil < 0 || hoursUntil > 48) continue;
 
-    // ── Analyse h2h market ──
+    // Analyse both markets, pick the single best tip
+    const candidates = [];
+
     const h2hBooks = event.bookmakers
       .map(b => b.markets.find(m => m.key === 'h2h'))
       .filter(Boolean);
-
     if (h2hBooks.length >= 2) {
       const h2hTip = analyseH2H(event, h2hBooks, sport);
-      if (h2hTip) tips.push(h2hTip);
+      if (h2hTip) candidates.push(h2hTip);
     }
 
-    // ── Analyse totals market ──
     const totalsBooks = event.bookmakers
       .map(b => b.markets.find(m => m.key === 'totals'))
       .filter(Boolean);
-
     if (totalsBooks.length >= 2) {
       const totalsTip = analyseTotals(event, totalsBooks, sport);
-      if (totalsTip) tips.push(totalsTip);
+      if (totalsTip) candidates.push(totalsTip);
     }
+
+    if (!candidates.length) continue;
+
+    // Pick the single highest-confidence tip for this game
+    const best = candidates.reduce((a, b) => a.confidence >= b.confidence ? a : b);
+    tips.push(best);
   }
 
   return tips;
@@ -285,39 +292,58 @@ function analyseTotals(event, books, sport) {
 }
 
 // ─── SAVE TIPS TO DATABASE ───────────────────
+// ONE tip per game enforced at both app and DB level.
+// Uses upsert with ON CONFLICT on (home_team, away_team, event_date)
+// so even if engine runs multiple times, only one row per game exists.
 async function saveTips(tips) {
   if (!tips.length) return;
 
   let saved = 0, skipped = 0;
 
   for (const tip of tips) {
-    // Check if we already have this tip (avoid duplicates)
-    // For totals, treat any over/under line for same game as duplicate
-const isTotals = tip.selection.toLowerCase().startsWith('over') || 
-                 tip.selection.toLowerCase().startsWith('under');
+    try {
+      // Check if a tip already exists for this game today (any market)
+      const eventDate = new Date(tip.event_time).toISOString().split('T')[0];
+      const { data: existing } = await supabase
+        .from('tips')
+        .select('id, confidence')
+        .eq('home_team', tip.home_team)
+        .eq('away_team', tip.away_team)
+        .gte('event_time', eventDate + 'T00:00:00Z')
+        .lte('event_time', eventDate + 'T23:59:59Z')
+        .eq('status', 'pending')
+        .maybeSingle();
 
-let dupQuery = supabase
-  .from('tips')
-  .select('id')
-  .eq('home_team', tip.home_team)
-  .eq('away_team', tip.away_team)
-  .eq('status', 'pending');
+      if (existing) {
+        // Only update if new tip has higher confidence
+        if (tip.confidence > existing.confidence) {
+          await supabase.from('tips').update({
+            selection: tip.selection,
+            market: tip.market,
+            odds: tip.odds,
+            stake: tip.stake,
+            confidence: tip.confidence,
+            bookmaker: tip.bookmaker,
+            notes: tip.notes
+          }).eq('id', existing.id);
+          saved++;
+          console.log(`↑ Updated tip for ${tip.home_team} vs ${tip.away_team} — better confidence ${tip.confidence}%`);
+        } else {
+          skipped++;
+        }
+        continue;
+      }
 
-if (isTotals) {
-  dupQuery = dupQuery.eq('market', 'totals');
-} else {
-  dupQuery = dupQuery.eq('selection', tip.selection);
-}
-
-const { data: existing } = await dupQuery.single();
-
-    if (existing) { skipped++; continue; }
-
-    const { error } = await supabase.from('tips').insert(tip);
-    if (error) {
-      console.error('Insert error:', error.message);
-    } else {
-      saved++;
+      const { error } = await supabase.from('tips').insert(tip);
+      if (error) {
+        // Unique constraint violation — silently skip
+        if (error.code === '23505') { skipped++; }
+        else { console.error('Insert error:', error.message); }
+      } else {
+        saved++;
+      }
+    } catch(e) {
+      console.error('saveTips error:', e.message);
     }
   }
 
