@@ -292,14 +292,24 @@ async function saveTips(tips) {
 
   for (const tip of tips) {
     // Check if we already have this tip (avoid duplicates)
-    const { data: existing } = await supabase
-      .from('tips')
-      .select('id')
-      .eq('home_team', tip.home_team)
-      .eq('away_team', tip.away_team)
-      .eq('selection', tip.selection)
-      .eq('status', 'pending')
-      .single();
+    // For totals, treat any over/under line for same game as duplicate
+const isTotals = tip.selection.toLowerCase().startsWith('over') || 
+                 tip.selection.toLowerCase().startsWith('under');
+
+let dupQuery = supabase
+  .from('tips')
+  .select('id')
+  .eq('home_team', tip.home_team)
+  .eq('away_team', tip.away_team)
+  .eq('status', 'pending');
+
+if (isTotals) {
+  dupQuery = dupQuery.eq('market', 'totals');
+} else {
+  dupQuery = dupQuery.eq('selection', tip.selection);
+}
+
+const { data: existing } = await dupQuery.single();
 
     if (existing) { skipped++; continue; }
 
