@@ -571,27 +571,34 @@ function footballFormAdj(baseConf, homeForm, awayForm, { isHome, isDraw, isOver,
 
 // ── G. MARKET-AWARE NOTES BUILDER ────────────────────────────
 // [CHANGED] Notes are now market-specific — "win prob" only for win bets.
-function buildFootballNotes({ market, modelProb, fairPrice, bookOdds, bookmaker, edgePct, lambdaHome, lambdaAway, homeForm, awayForm }) {
-  // Probability label by market
-  const probLabel = {
-    home:    'Model home win',
-    away:    'Model away win',
-    draw:    'Model draw',
-    over25:  'Model Over 2.5',
-  }[market] || 'Model probability';
+// ── G. FOOTBALL NOTES BUILDER ────────────────────────────────
+// Generates structured model diagnostics for football tips only.
+// Format: xG: H vs A | Fair odds: X.XX | Book: X.XX (Bookie) | Edge: +X.X% | Model: XX.X% <market> probability
+// Location: called from analyseFootballFixture() just before the tip object is returned.
+// Non-football notes are handled separately in analyseH2H / analyseTotals — unchanged.
+// Fallback: if lambdaHome/lambdaAway are undefined (e.g. stats fetch failed), returns generic text safely.
+function buildFootballNotes({ market, modelProb, fairPrice, bookOdds, bookmaker, edgePct, lambdaHome, lambdaAway }) {
+  // Safety fallback — if model data is missing return generic text
+  if (lambdaHome == null || lambdaAway == null || modelProb == null) {
+    return `Book: ${bookOdds} (${bookmaker || 'Multiple'}) | Edge: +${(edgePct || 0).toFixed(1)}%`;
+  }
 
-  const parts = [
+  // Market-specific probability suffix — matches required format exactly
+  const probSuffix = {
+    home:   'home win probability',
+    away:   'away win probability',
+    draw:   'draw probability',
+    over25: 'over 2.5 probability',
+  }[market] || 'win probability';
+
+  // Required field order: xG | Fair odds | Book | Edge | Model
+  return [
     `xG: ${lambdaHome.toFixed(2)} vs ${lambdaAway.toFixed(2)}`,
-    `${probLabel}: ${(modelProb * 100).toFixed(1)}%`,
     `Fair odds: ${fairPrice}`,
     `Book: ${bookOdds} (${bookmaker})`,
     `Edge: +${edgePct.toFixed(1)}%`,
-  ];
-
-  if (homeForm) parts.push(`Home form: ${homeForm.formString}`);
-  if (awayForm) parts.push(`Away form: ${awayForm.formString}`);
-
-  return parts.join(' | ');
+    `Model: ${(modelProb * 100).toFixed(1)}% ${probSuffix}`,
+  ].join(' | ');
 }
 
 // Appends form strings to existing notes (used by applyFormToPendingTips)
@@ -738,17 +745,17 @@ async function analyseFootballFixture(event, sport) {
 
     // Build tip object
     const stake = pick.conf >= 90 ? 3.0 : pick.conf >= 82 ? 2.0 : 1.5;
+    // Build structured model notes (football only).
+    // Format: xG: H vs A | Fair odds: X.XX | Book: X.XX (Bookie) | Edge: +X.X% | Model: XX.X% <market> probability
     const notes = buildFootballNotes({
-      market:      pick.market,
-      modelProb:   pick.modelProb,
-      fairPrice:   pick.fairPrice,
-      bookOdds:    pick.bookOdds,
-      bookmaker:   pick.bookmaker,
-      edgePct:     pick.edgePct,
-      lambdaHome:  lH,
-      lambdaAway:  lA,
-      homeForm:    hf,
-      awayForm:    af,
+      market:     pick.market,
+      modelProb:  pick.modelProb,
+      fairPrice:  pick.fairPrice,
+      bookOdds:   pick.bookOdds,
+      bookmaker:  pick.bookmaker,
+      edgePct:    pick.edgePct,
+      lambdaHome: lH,
+      lambdaAway: lA,
     });
 
     return {
