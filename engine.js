@@ -1746,17 +1746,19 @@ async function fetchFootballFixtures(leagueId) {
   const now = Date.now();
   if (fixtureCache[leagueId] && now - fixtureCacheTime[leagueId] < 2 * 3600000) return fixtureCache[leagueId];
   try {
-    const from = new Date(now - 3 * 86400000).toISOString().split('T')[0];
+    const from = new Date(now - 4 * 86400000).toISOString().split('T')[0];
     const to   = new Date().toISOString().split('T')[0];
 
-    // Try current season first, then ALWAYS fall back to previous season if empty.
-    // Settler uses its own direct fetch — NOT shared with the tip model budget.
-    // This is critical: CL tips from season=2024 must settle even when
-    // seasonFor() returns 2025 after the July rollover.
-    const seasons = [seasonFor(leagueId), seasonFor(leagueId) - 1];
+    // Try three seasons to handle any mid-season scenario.
+    // Current season (e.g. 2025) covers Aug 2025 onward.
+    // Season-1 (e.g. 2024) covers Aug 2024 - May 2025.
+    // We also try without a date range as fallback in case the
+    // free plan restricts date-filtered queries on CL.
+    const currentSeason = seasonFor(leagueId);
     let fixtures = [];
 
-    for (const season of seasons) {
+    // Pass 1: try current season with date range
+    for (const season of [currentSeason, currentSeason - 1]) {
       const res = await fetch(
         `${API_FOOTBALL_BASE}/fixtures?league=${leagueId}&season=${season}&from=${from}&to=${to}&status=FT`,
         { headers: { 'x-apisports-key': API_FOOTBALL_KEY } }
@@ -1765,8 +1767,28 @@ async function fetchFootballFixtures(leagueId) {
       const data = await res.json();
       if (data.errors && Object.keys(data.errors).length) continue;
       const batch = data.response || [];
-      fixtures = fixtures.concat(batch);
-      if (batch.length > 0) break; // found results in this season — stop
+      if (batch.length > 0) { fixtures = batch; break; }
+    }
+
+    // Pass 2: if still empty, try without date range (last=10 recent FT games)
+    // This catches cases where the free plan blocks date-filtered CL queries
+    if (!fixtures.length) {
+      for (const season of [currentSeason, currentSeason - 1]) {
+        const res = await fetch(
+          `${API_FOOTBALL_BASE}/fixtures?league=${leagueId}&season=${season}&status=FT&last=20`,
+          { headers: { 'x-apisports-key': API_FOOTBALL_KEY } }
+        );
+        if (!res.ok) continue;
+        const data = await res.json();
+        if (data.errors && Object.keys(data.errors).length) continue;
+        const batch = data.response || [];
+        if (batch.length > 0) {
+          // Filter to only games played in the last 4 days
+          const cutoff = now - 4 * 86400000;
+          fixtures = batch.filter(f => new Date(f.fixture.date).getTime() >= cutoff);
+          if (fixtures.length > 0) break;
+        }
+      }
     }
 
     // Deduplicate by fixture ID
@@ -1776,6 +1798,7 @@ async function fetchFootballFixtures(leagueId) {
       seen.add(f.fixture.id); return true;
     });
 
+    console.log(`Settler: league ${leagueId} — ${fixtures.length} recent FT fixtures found`);
     fixtureCache[leagueId] = fixtures;
     fixtureCacheTime[leagueId] = now;
     return fixtures;
