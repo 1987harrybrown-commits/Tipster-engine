@@ -1653,8 +1653,19 @@ async function generateTips(events, sport) {
 
     if (sport.name === 'Football') {
       // ── Football: Dixon-Coles Poisson xG model ───────────
+      // Falls back to market consensus if model has no data or no edge found.
+      // This keeps football tips flowing even when API budget is exhausted
+      // or early-season stats are insufficient (< 4 games played).
       const tip = await analyseFootballFixture(event, sport);
-      if (tip) candidates.push(tip);
+      if (tip) {
+        candidates.push(tip);
+      } else {
+        // Fallback: market consensus with margin stripping
+        const h2h    = event.bookmakers.map(b => b.markets?.find(m => m.key === 'h2h')).filter(Boolean);
+        const totals = event.bookmakers.map(b => b.markets?.find(m => m.key === 'totals')).filter(Boolean);
+        if (h2h.length    >= 2) { const t = analyseH2H(event, h2h, sport);     if (t) candidates.push(t); }
+        if (totals.length >= 2) { const t = analyseTotals(event, totals, sport); if (t) candidates.push(t); }
+      }
     } else if (sport.name === 'Basketball') {
       // ── NBA: pace-adjusted scoring model ─────────────────
       // Falls back to market consensus if stats unavailable
@@ -1735,19 +1746,41 @@ async function fetchFootballFixtures(leagueId) {
   const now = Date.now();
   if (fixtureCache[leagueId] && now - fixtureCacheTime[leagueId] < 2 * 3600000) return fixtureCache[leagueId];
   try {
-    const season = seasonFor(leagueId);
-    const from   = new Date(now - 3 * 86400000).toISOString().split('T')[0];
-    const to     = new Date().toISOString().split('T')[0];
-    const res    = await fetch(
-      `${API_FOOTBALL_BASE}/fixtures?league=${leagueId}&season=${season}&from=${from}&to=${to}&status=FT`,
-      { headers: { 'x-apisports-key': API_FOOTBALL_KEY } }
-    );
-    if (!res.ok) return [];
-    const data = await res.json();
-    if (data.errors && Object.keys(data.errors).length) return [];
-    fixtureCache[leagueId] = data.response || [];
+    const from = new Date(now - 3 * 86400000).toISOString().split('T')[0];
+    const to   = new Date().toISOString().split('T')[0];
+
+    // Try current season first, then fall back to previous season.
+    // This handles mid-season deployment where tips were generated in
+    // season N but the date has rolled past July into a new year.
+    // e.g. CL tips from Feb 2025 stored as season=2024, but today
+    // seasonFor() returns 2025 — so we must also check 2024.
+    const seasons = [seasonFor(leagueId), seasonFor(leagueId) - 1];
+    let fixtures = [];
+
+    for (const season of seasons) {
+      if (!budgetCheck(1)) break;
+      const res = await fetch(
+        `${API_FOOTBALL_BASE}/fixtures?league=${leagueId}&season=${season}&from=${from}&to=${to}&status=FT`,
+        { headers: { 'x-apisports-key': API_FOOTBALL_KEY } }
+      );
+      if (!res.ok) continue;
+      const data = await res.json();
+      if (data.errors && Object.keys(data.errors).length) continue;
+      const batch = data.response || [];
+      fixtures = fixtures.concat(batch);
+      if (batch.length > 0) break; // found results — no need to check prior season
+    }
+
+    // Deduplicate by fixture ID (in case of overlap)
+    const seen = new Set();
+    fixtures = fixtures.filter(f => {
+      if (seen.has(f.fixture.id)) return false;
+      seen.add(f.fixture.id); return true;
+    });
+
+    fixtureCache[leagueId] = fixtures;
     fixtureCacheTime[leagueId] = now;
-    return fixtureCache[leagueId];
+    return fixtures;
   } catch(e) { console.error('Fixture fetch error:', e.message); return []; }
 }
 
