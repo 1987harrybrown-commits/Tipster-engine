@@ -23,7 +23,7 @@ const SUPABASE_URL         = 'https://eyhlzzaaxrwisrtwyoyh.supabase.co';
 const SUPABASE_SERVICE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImV5aGx6emFheHJ3aXNydHd5b3loIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3MzM3OTI3NywiZXhwIjoyMDg4OTU1Mjc3fQ.9Lry94K4qWWYzh0yd4zcgEaGvb8myeAzxrSHtcBSQus';
 const ODDS_API_KEY         = 'cd4587438ed62cce94274935545c86a3';
 const ODDS_BASE            = 'https://api.the-odds-api.com/v4';
-const API_FOOTBALL_KEY     = 'ac0de64e0ea27e1809738361212c003e';
+const API_FOOTBALL_KEY     = 'f53281f35e7871081ebf83478b556b84';
 const API_FOOTBALL_BASE    = 'https://v3.football.api-sports.io';
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
