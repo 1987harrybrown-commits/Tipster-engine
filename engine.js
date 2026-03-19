@@ -1,5 +1,5 @@
 // ============================================================
-// THE TIPSTER EDGE — Engine v4
+// THE TIPSTER EDGE — Engine v6
 // ============================================================
 // Schedule:
 //   Odds fetch     → every 15 minutes
@@ -9,7 +9,8 @@
 //   Emails         → Pro 07:00, Free 08:30, Saturday 08:00 UK
 //
 // Football tips use a Poisson xG model (built inline below).
-// All other sports use market-consensus logic unchanged.
+// NBA + NHL use stats-based scoring models (API-Sports Basketball/Hockey).
+// NFL and MLB use market consensus (insufficient free API data).
 // Tip IDs: sport-prefixed 10-char alphanumeric ref e.g. FB-A3X9K2
 // Min confidence: 75%
 // ============================================================
@@ -25,6 +26,9 @@ const ODDS_API_KEY         = 'cd4587438ed62cce94274935545c86a3';
 const ODDS_BASE            = 'https://api.the-odds-api.com/v4';
 const API_FOOTBALL_KEY     = 'f53281f35e7871081ebf83478b556b84';
 const API_FOOTBALL_BASE    = 'https://v3.football.api-sports.io';
+// API-Sports Basketball + Hockey use same key, separate endpoints + separate 100/day budgets
+// BallDontLie: free tier for NBA/NHL injuries — sign up at app.balldontlie.io
+const BDL_API_KEY          = process.env.BDL_API_KEY || ''; // add to Render env vars
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
 
@@ -134,6 +138,11 @@ async function fetchAllFormData() {
   formFetchedDate = today;
   console.log(`📊 Form fetched. ${formApiCalls} calls used. ${Object.keys(formCache).length} teams cached.`);
   await applyFormToPendingTips();
+
+  // Fetch NBA + NHL injuries alongside form data (same 06:00 run)
+  await fetchNBAInjuries(BDL_API_KEY);
+  await fetchNHLInjuries(BDL_API_KEY);
+  console.log(`🏥 Injury caches updated. ${budgetStatus()}`);
 }
 
 // [CHANGED] Uses seasonFor() instead of hardcoded 2024
@@ -250,27 +259,36 @@ function buildNotes(hf, af, base = '') {
 }
 
 // ═══════════════════════════════════════════════════════════════
-// [NEW] FOOTBALL POISSON MODEL
-// Inline — no separate module.
+// FOOTBALL MODEL v5 — Dixon-Coles Poisson + H2H + Weighted Form
+// ═══════════════════════════════════════════════════════════════
 //
-// Sections:
-//   A. League averages (centralised, with dynamic fallback)
-//   B. Team season stats cache + fetcher
-//   C. Poisson maths (0..MATRIX_MAX_GOALS, renormalised)
-//   D. Market extraction from bookmaker odds
-//   E. Confidence from edge (explicit bands, no modulo)
-//   F. Market-aware form adjustment
-//   G. Market-aware notes builder
-//   H. Main entry: analyseFootballFixture()
+// Architecture:
+//   A. League averages (static, centralised)
+//   B. API call budget manager (shared across all football fetches)
+//   C. Team season stats cache + fetcher (attack/defence strengths)
+//   D. H2H record fetcher (last 10 head-to-head results)
+//   E. Poisson + Dixon-Coles correction (0..8 goal matrix)
+//   F. Bookmaker margin stripping (true implied probability)
+//   G. Edge calculation on margin-stripped prices
+//   H. Fractional Kelly stake sizing (0.25 Kelly, 0.5-3u range)
+//   I. Confidence from edge + form quality signal
+//   J. Market-aware form adjustment
+//   K. Notes builder (full model diagnostics)
+//   L. Main entry: analyseFootballFixture()
+//
+// API call budget per day (free plan = 100 total):
+//   Form data (06:00):    ~40 calls (fetchTeamForm)
+//   Season stats:         ~24 calls (2 per fixture team pair, cached)
+//   H2H:                  ~12 calls (1 per fixture, cached)
+//   Settler:              ~12 calls
+//   Buffer:                12 calls
+//   Total:               ~100 calls ← within free plan
 // ═══════════════════════════════════════════════════════════════
 
 // ── A. LEAGUE AVERAGES ────────────────────────────────────────
-// These are long-run seasonal averages (2020–2024).
-// Used as the denominator in attack/defence strength calculation.
-// Centralised here — update once per season if needed.
-// Dynamic recalculation from API data is possible but would cost
-// ~6 extra API calls per season start; static values are accurate
-// enough for the denominator and are reviewed annually.
+// Long-run home/away scoring averages 2020–2024 per league.
+// Used as league baseline in attack/defence strength formula.
+// Centralised here — review at season start each year.
 const LEAGUE_AVERAGES = {
   39:  { homeGoals: 1.53, awayGoals: 1.21 }, // Premier League
   140: { homeGoals: 1.57, awayGoals: 1.14 }, // La Liga
@@ -279,36 +297,52 @@ const LEAGUE_AVERAGES = {
   61:  { homeGoals: 1.51, awayGoals: 1.18 }, // Ligue 1
   2:   { homeGoals: 1.64, awayGoals: 1.22 }, // Champions League
 };
-
-// Fallback if leagueId not in table — use pan-European average
 const LEAGUE_AVG_FALLBACK = { homeGoals: 1.55, awayGoals: 1.18 };
-
 function getLeagueAvg(leagueId) {
   return LEAGUE_AVERAGES[leagueId] || LEAGUE_AVG_FALLBACK;
 }
 
-// ── B. TEAM SEASON STATS CACHE ────────────────────────────────
-// Keyed by teamId_leagueId_season.
-// Populated on first use per engine run (lazy, not pre-fetched).
-// Budget: 1 call per team per day (uses team ID from formCache if available).
+// ── B. API CALL BUDGET MANAGER ────────────────────────────────
+// Single counter for all API-Football calls made per day.
+// Shared by form fetcher, season stats, H2H, and settler.
+// Prevents overrun on free plan (100/day).
+// Resets automatically when date changes.
+let apiBudget = {
+  date:  '',
+  used:  0,
+  limit: 88, // 88 hard ceiling, leaves 12 for settler
+};
+
+function budgetCheck(n = 1) {
+  const today = new Date().toISOString().split('T')[0];
+  if (apiBudget.date !== today) { apiBudget.date = today; apiBudget.used = 0; }
+  if (apiBudget.used + n > apiBudget.limit) return false;
+  apiBudget.used += n;
+  return true;
+}
+
+function budgetStatus() {
+  return `API budget: ${apiBudget.used}/${apiBudget.limit} used today`;
+}
+
+// ── C. TEAM SEASON STATS ──────────────────────────────────────
+// Fetches full season home/away goals for/against from API-Football.
+// Cached per team+league+season — fetched once then reused all day.
+// Guards against < 4 games played (stats unreliable early season).
 const teamStatsCache = {};
-let teamStatsApiCalls = 0;
-const MAX_TEAM_STATS_CALLS = 30; // daily budget for stats calls
 
-// [CHANGED] Uses seasonFor() — no hardcoded season
 async function fetchTeamSeasonStats(teamName, leagueId) {
-  const season    = seasonFor(leagueId);
-  const cacheKey  = `${teamName}_${leagueId}_${season}`;
+  const season   = seasonFor(leagueId);
+  const cacheKey = `stats_${teamName}_${leagueId}_${season}`;
   if (teamStatsCache[cacheKey]) return teamStatsCache[cacheKey];
-  if (teamStatsApiCalls >= MAX_TEAM_STATS_CALLS) return null;
 
-  try {
-    // Reuse team ID from formCache if already fetched this session
-    const formKey  = `${teamName}_${leagueId}`;
-    let teamId     = formCache[formKey]?.teamId || null;
+  // Reuse team ID from formCache if already resolved today
+  const formKey = `${teamName}_${leagueId}`;
+  let teamId = formCache[formKey]?.teamId || null;
 
-    if (!teamId) {
-      teamStatsApiCalls++;
+  if (!teamId) {
+    if (!budgetCheck(1)) { console.log(`⚠️ Budget: skipping stats for ${teamName}`); return null; }
+    try {
       const sr = await fetch(
         `${API_FOOTBALL_BASE}/teams?name=${encodeURIComponent(teamName)}&league=${leagueId}&season=${season}`,
         { headers: { 'x-apisports-key': API_FOOTBALL_KEY } }
@@ -317,9 +351,14 @@ async function fetchTeamSeasonStats(teamName, leagueId) {
       const sd = await sr.json();
       teamId = sd.response?.[0]?.team?.id || null;
       if (!teamId) return null;
-    }
+      // Cache the teamId for future reuse
+      if (!formCache[formKey]) formCache[formKey] = {};
+      formCache[formKey].teamId = teamId;
+    } catch(e) { console.error(`Team ID error (${teamName}):`, e.message); return null; }
+  }
 
-    teamStatsApiCalls++;
+  if (!budgetCheck(1)) { console.log(`⚠️ Budget: skipping stats for ${teamName}`); return null; }
+  try {
     const res = await fetch(
       `${API_FOOTBALL_BASE}/teams/statistics?team=${teamId}&league=${leagueId}&season=${season}`,
       { headers: { 'x-apisports-key': API_FOOTBALL_KEY } }
@@ -331,12 +370,12 @@ async function fetchTeamSeasonStats(teamName, leagueId) {
 
     const fg = stats.goals;
     const fx = stats.fixtures;
-
-    // Guard: if team has played < 3 home or away games, stats are unreliable
     const hg = fx?.played?.home || 0;
     const ag = fx?.played?.away || 0;
-    if (hg < 3 || ag < 3) {
-      console.log(`  ⚠️ Insufficient games for ${teamName} (H:${hg} A:${ag}) — skipping model`);
+
+    // Require at least 4 home and 4 away games for reliable stats
+    if (hg < 4 || ag < 4) {
+      console.log(`  ⚠️ ${teamName}: only ${hg}H/${ag}A games — insufficient for model`);
       return null;
     }
 
@@ -347,28 +386,112 @@ async function fetchTeamSeasonStats(teamName, leagueId) {
       awayConceded: fg?.against?.total?.away || 0,
       homeGames:    hg,
       awayGames:    ag,
+      teamId,
     };
 
     teamStatsCache[cacheKey] = result;
     return result;
+  } catch(e) { console.error(`Team stats error (${teamName}):`, e.message); return null; }
+}
+
+// ── D. H2H RECORD ─────────────────────────────────────────────
+// Fetches last 10 head-to-head results between two teams.
+// Returns a modifier (-0.08 to +0.08) applied to lambdaHome/Away.
+// Strong historical home dominance slightly lifts home λ.
+// Cached per pair per day — 1 API call per fixture pair.
+const h2hCache = {};
+
+async function fetchH2HModifier(homeTeamId, awayTeamId) {
+  if (!homeTeamId || !awayTeamId) return { homeMod: 0, awayMod: 0 };
+  const cacheKey = `h2h_${Math.min(homeTeamId,awayTeamId)}_${Math.max(homeTeamId,awayTeamId)}`;
+  if (h2hCache[cacheKey]) return h2hCache[cacheKey];
+
+  if (!budgetCheck(1)) return { homeMod: 0, awayMod: 0 };
+
+  try {
+    const res = await fetch(
+      `${API_FOOTBALL_BASE}/fixtures/headtohead?h2h=${homeTeamId}-${awayTeamId}&last=10`,
+      { headers: { 'x-apisports-key': API_FOOTBALL_KEY } }
+    );
+    if (!res.ok) { h2hCache[cacheKey] = { homeMod: 0, awayMod: 0 }; return h2hCache[cacheKey]; }
+    const data     = await res.json();
+    const fixtures = data.response || [];
+    if (fixtures.length < 3) { h2hCache[cacheKey] = { homeMod: 0, awayMod: 0 }; return h2hCache[cacheKey]; }
+
+    let homeWins = 0, awayWins = 0, draws = 0;
+    let homeGF = 0, awayGF = 0;
+
+    for (const f of fixtures) {
+      const fHomeId = f.teams?.home?.id;
+      // Normalise: treat the current home team as "home" regardless of venue
+      const isCurrentHomeActuallyHome = fHomeId === homeTeamId;
+      const fHomeGoals = f.goals?.home || 0;
+      const fAwayGoals = f.goals?.away || 0;
+      const hg = isCurrentHomeActuallyHome ? fHomeGoals : fAwayGoals;
+      const ag = isCurrentHomeActuallyHome ? fAwayGoals : fHomeGoals;
+      homeGF += hg; awayGF += ag;
+      if (hg > ag) homeWins++;
+      else if (hg < ag) awayWins++;
+      else draws++;
+    }
+
+    const total = fixtures.length;
+    const homeWinRate = homeWins / total;
+    const awayWinRate = awayWins / total;
+
+    // Modifier: if home team wins >60% of H2H → slight λ boost
+    // If home team wins <30% of H2H → slight λ reduction
+    // Scale: ±0.08 maximum — meaningful but not overwhelming
+    const homeMod = Math.max(-0.08, Math.min(0.08, (homeWinRate - 0.40) * 0.25));
+    const awayMod = Math.max(-0.08, Math.min(0.08, (awayWinRate - 0.30) * 0.20));
+
+    const modifier = { homeMod, awayMod, homeWins, awayWins, draws, total };
+    h2hCache[cacheKey] = modifier;
+    console.log(`  H2H ${homeTeamId} vs ${awayTeamId}: ${homeWins}W ${draws}D ${awayWins}L (mod: ${homeMod.toFixed(3)} / ${awayMod.toFixed(3)})`);
+    return modifier;
   } catch(e) {
-    console.error(`Team stats error (${teamName}):`, e.message);
-    return null;
+    console.error('H2H error:', e.message);
+    h2hCache[cacheKey] = { homeMod: 0, awayMod: 0 };
+    return h2hCache[cacheKey];
   }
 }
 
-// ── C. POISSON MATHS ─────────────────────────────────────────
-// P(X=k) = e^-λ * λ^k / k!
+// ── E. POISSON + DIXON-COLES CORRECTION ──────────────────────
+// Standard Poisson overestimates probability of low-scoring outcomes
+// (0-0, 1-0, 0-1, 1-1). Dixon-Coles (1997) applies a correction
+// factor τ (tau) to these four cells only.
+//
+// τ(h,a,λH,λA,ρ):
+//   h=0,a=0: 1 - λH*λA*ρ
+//   h=1,a=0: 1 + λA*ρ
+//   h=0,a=1: 1 + λH*ρ
+//   h=1,a=1: 1 - ρ
+//   all other cells: 1 (no correction)
+//
+// ρ (rho) = correlation parameter. Empirically ~0.10 for football.
+// Higher ρ = more correction on low scores.
+// Positive ρ reduces 0-0 and 1-1, increases 1-0 and 0-1 slightly.
+const DC_RHO = 0.10;
+
+function dixonColesTau(h, a, lambdaH, lambdaA, rho) {
+  if (h === 0 && a === 0) return 1 - lambdaH * lambdaA * rho;
+  if (h === 1 && a === 0) return 1 + lambdaA * rho;
+  if (h === 0 && a === 1) return 1 + lambdaH * rho;
+  if (h === 1 && a === 1) return 1 - rho;
+  return 1; // no correction for all other scores
+}
+
 function poisson(lambda, k) {
   if (lambda <= 0) return k === 0 ? 1 : 0;
+  // Log-space calculation to avoid underflow at higher k values
   let logP = -lambda + k * Math.log(lambda);
   for (let i = 1; i <= k; i++) logP -= Math.log(i);
   return Math.exp(logP);
 }
 
-// Build score probability matrix P(home=i, away=j) for i,j in 0..MATRIX_MAX_GOALS
-// Then renormalise so total probability mass sums to 1.0 within the matrix.
-// This corrects for truncation at MATRIX_MAX_GOALS without losing accuracy.
+// Build score probability matrix with Dixon-Coles correction.
+// Matrix is built 0..MATRIX_MAX_GOALS then renormalised to sum=1.
+// DC correction applies to the 4 low-score cells only.
 function buildScoreMatrix(lambdaHome, lambdaAway) {
   const N = MATRIX_MAX_GOALS;
   const matrix = [];
@@ -377,16 +500,19 @@ function buildScoreMatrix(lambdaHome, lambdaAway) {
   for (let h = 0; h <= N; h++) {
     matrix[h] = [];
     for (let a = 0; a <= N; a++) {
-      const p = poisson(lambdaHome, h) * poisson(lambdaAway, a);
-      matrix[h][a] = p;
-      total += p;
+      // Raw Poisson probability
+      const raw = poisson(lambdaHome, h) * poisson(lambdaAway, a);
+      // Apply Dixon-Coles τ correction to low-score cells
+      const tau = dixonColesTau(h, a, lambdaHome, lambdaAway, DC_RHO);
+      const p   = raw * tau;
+      matrix[h][a] = Math.max(0, p); // guard against tiny negatives from τ
+      total += matrix[h][a];
     }
   }
 
-  // Renormalise: divide each cell by total mass captured in matrix.
-  // For λ ≤ 4, truncating at 8 captures >99.9% of mass; renormalisation
-  // corrects the remaining <0.1% so probabilities sum to exactly 1.
-  if (total > 0 && total < 1) {
+  // Renormalise: DC correction shifts some mass between cells, total
+  // will not be exactly 1. Renormalise so outcomes sum to exactly 1.
+  if (total > 0) {
     for (let h = 0; h <= N; h++)
       for (let a = 0; a <= N; a++)
         matrix[h][a] /= total;
@@ -395,195 +521,237 @@ function buildScoreMatrix(lambdaHome, lambdaAway) {
   return matrix;
 }
 
-// Derive outcome probabilities from renormalised matrix
+// Derive win/draw/loss and market probabilities from matrix
 function calcOutcomes(matrix) {
   const N = MATRIX_MAX_GOALS;
   let homeWin = 0, draw = 0, awayWin = 0, over25 = 0, btts = 0;
-
   for (let h = 0; h <= N; h++) {
     for (let a = 0; a <= N; a++) {
       const p = matrix[h][a];
-      if (h > a)        homeWin += p;
-      else if (h === a) draw    += p;
-      else              awayWin += p;
-      if (h + a > 2.5)  over25  += p;
-      if (h > 0 && a > 0) btts  += p;
+      if (h > a)          homeWin += p;
+      else if (h === a)   draw    += p;
+      else                awayWin += p;
+      if (h + a > 2.5)    over25  += p;
+      if (h > 0 && a > 0) btts    += p;
     }
   }
-
+  // Sanity check: probabilities must sum to ~1
+  const total = homeWin + draw + awayWin;
+  if (Math.abs(total - 1) > 0.01) {
+    console.warn(`⚠️ Matrix probability sum off: ${total.toFixed(4)}`);
+  }
   return { homeWin, draw, awayWin, over25, btts };
 }
 
-// Fair decimal odds from probability (no margin)
+// Fair decimal odds from model probability (no margin)
 function fairOdds(prob) {
   if (prob <= 0.001) return 999.0;
   return parseFloat((1 / prob).toFixed(2));
 }
 
-// ── D. MARKET EXTRACTION ──────────────────────────────────────
-// Gets best available price for each outcome from event.bookmakers.
-// Separate from model — purely what the market offers.
-function extractBestOdds(event) {
-  const best = {
-    home: 0, draw: 0, away: 0, over25: 0,
-    homeBook: '', drawBook: '', awayBook: '', over25Book: '',
-  };
+// ── F. BOOKMAKER MARGIN STRIPPING ─────────────────────────────
+// The odds on a three-way market (1X2) always sum to more than 1
+// when converted to implied probabilities. The excess is the margin
+// (overround). Without stripping it, our edge calculation compares
+// model probability to inflated bookmaker implied probability —
+// making every bet look like it has less edge than it really does.
+//
+// Method: for each bookmaker, calculate total implied probability
+// across home/draw/away. True implied probability = raw / total.
+// We then take the BEST true implied probability per outcome across
+// all bookmakers (not the best raw odds, which can be misleading).
+//
+// This function returns:
+//   { home, draw, away, over25 }  — best margin-stripped prices
+//   { homeBook, drawBook, awayBook, over25Book } — source bookmakers
+//   { homeOdds, drawOdds, awayOdds, over25Odds } — best raw decimal odds
+//   { bookCount } — number of books with data
+function extractMarketData(event) {
+  // Collect raw 1X2 odds per bookmaker for margin stripping
+  const books1x2 = [];
+  const bestRaw  = { home: 0, draw: 0, away: 0, over25: 0,
+                     homeBook: '', drawBook: '', awayBook: '', over25Book: '' };
 
   for (const book of (event.bookmakers || [])) {
+    // H2H market
     const h2h = book.markets?.find(m => m.key === 'h2h');
     if (h2h) {
+      let bHome = 0, bDraw = 0, bAway = 0;
       for (const o of h2h.outcomes) {
-        if (nameMatch(o.name, event.home_team) && o.price > best.home) {
-          best.home = o.price; best.homeBook = book.title;
-        } else if (nameMatch(o.name, event.away_team) && o.price > best.away) {
-          best.away = o.price; best.awayBook = book.title;
-        } else if (o.name === 'Draw' && o.price > best.draw) {
-          best.draw = o.price; best.drawBook = book.title;
-        }
+        if (nameMatch(o.name, event.home_team))  bHome = o.price;
+        else if (nameMatch(o.name, event.away_team)) bAway = o.price;
+        else if (o.name === 'Draw')              bDraw = o.price;
       }
+      if (bHome > 0 && bDraw > 0 && bAway > 0) {
+        books1x2.push({ title: book.title, home: bHome, draw: bDraw, away: bAway });
+      }
+      // Also track best raw odds for display
+      if (bHome > bestRaw.home) { bestRaw.home = bHome; bestRaw.homeBook = book.title; }
+      if (bDraw > bestRaw.draw) { bestRaw.draw = bDraw; bestRaw.drawBook = book.title; }
+      if (bAway > bestRaw.away) { bestRaw.away = bAway; bestRaw.awayBook = book.title; }
     }
+    // Over 2.5
     const totals = book.markets?.find(m => m.key === 'totals');
     if (totals) {
       for (const o of totals.outcomes) {
-        if (o.name === 'Over' && Math.abs((o.point || 0) - 2.5) < 0.01 && o.price > best.over25) {
-          best.over25 = o.price; best.over25Book = book.title;
+        if (o.name === 'Over' && Math.abs((o.point || 0) - 2.5) < 0.01 && o.price > bestRaw.over25) {
+          bestRaw.over25 = o.price; bestRaw.over25Book = book.title;
         }
       }
     }
   }
 
-  return best;
+  if (!books1x2.length) return null;
+
+  // For each bookmaker, strip margin and get true implied probabilities
+  // Then take the best (highest) margin-stripped implied prob per outcome
+  // across all bookmakers — this is the tightest price the market offers.
+  let bestTrueHome = 0, bestTrueDraw = 0, bestTrueAway = 0;
+  let bestTrueHomeBook = '', bestTrueDrawBook = '', bestTrueAwayBook = '';
+
+  for (const b of books1x2) {
+    // Total implied probability (includes margin)
+    const totalIP = (1/b.home) + (1/b.draw) + (1/b.away);
+    // True (margin-stripped) probability
+    const trueHome = (1/b.home) / totalIP;
+    const trueDraw = (1/b.draw) / totalIP;
+    const trueAway = (1/b.away) / totalIP;
+
+    if (trueHome > bestTrueHome) { bestTrueHome = trueHome; bestTrueHomeBook = b.title; }
+    if (trueDraw > bestTrueDraw) { bestTrueDraw = trueDraw; bestTrueDrawBook = b.title; }
+    if (trueAway > bestTrueAway) { bestTrueAway = trueAway; bestTrueAwayBook = b.title; }
+  }
+
+  // Average margin across all books (for logging/diagnostics)
+  const avgMargin = books1x2.reduce((s, b) =>
+    s + ((1/b.home) + (1/b.draw) + (1/b.away) - 1), 0) / books1x2.length;
+
+  return {
+    // Margin-stripped true probabilities (used for edge calculation)
+    trueHome: bestTrueHome,
+    trueDraw: bestTrueDraw,
+    trueAway: bestTrueAway,
+    // Best raw decimal odds (used for stake calculation and display)
+    homeOdds: bestRaw.home,
+    drawOdds: bestRaw.draw,
+    awayOdds: bestRaw.away,
+    over25Odds: bestRaw.over25,
+    // Best bookmaker per outcome
+    homeBook:   bestRaw.homeBook,
+    drawBook:   bestRaw.drawBook,
+    awayBook:   bestRaw.awayBook,
+    over25Book: bestRaw.over25Book,
+    // Diagnostics
+    bookCount:  books1x2.length,
+    avgMargin:  parseFloat((avgMargin * 100).toFixed(2)),
+  };
 }
 
-// ── E. CONFIDENCE FROM EDGE ───────────────────────────────────
-// [CHANGED] Explicit edge bands — no modulo, no circular logic.
-// Edge is the primary driver. Form provides a ±5 secondary adjustment.
-// Bands:
-//   5% to <7%  → base 75  (borderline value — tip if form supports)
-//   7% to <10% → base 79  (clear value)
-//   10% to <14%→ base 83  (strong value)
-//   14% to <18%→ base 87  (high-conviction value)
-//   18%+       → base 91  (very high edge — rare, treat with care)
-// Within each band, confidence scales linearly to the next band floor.
-// Final confidence is clamped 75–95.
-function confidenceFromEdge(edgePct, formAdj) {
-  let base, bandWidth, bandFloor;
-
-  if (edgePct >= 18) {
-    base = 91; bandWidth = 4; bandFloor = 18;
-  } else if (edgePct >= 14) {
-    base = 87; bandWidth = 4; bandFloor = 14;
-  } else if (edgePct >= 10) {
-    base = 83; bandWidth = 4; bandFloor = 10;
-  } else if (edgePct >= 7) {
-    base = 79; bandWidth = 3; bandFloor = 7;
-  } else {
-    base = 75; bandWidth = 2; bandFloor = 5;
-  }
-
-  // Linear interpolation within band
-  const progress = Math.min(1, (edgePct - bandFloor) / bandWidth);
-  const scaled   = base + Math.round(progress * (bandWidth - 1));
-
-  return Math.min(95, Math.max(75, scaled + formAdj));
+// ── G. EDGE CALCULATION ───────────────────────────────────────
+// Edge = model probability - margin-stripped bookmaker probability.
+// Positive edge = model thinks outcome more likely than market does.
+// This is a real edge calculation — not inflated by bookmaker margin.
+function calcEdge(modelProb, trueImpliedProb) {
+  return parseFloat(((modelProb - trueImpliedProb) * 100).toFixed(2));
 }
 
-// ── F. MARKET-AWARE FORM ADJUSTMENT ──────────────────────────
-// [CHANGED] Form adjustment only applied where it is meaningful.
-// - Home win / Away win: tip-team form vs opposition form
-// - Draw: small symmetric form adjustment based on how evenly matched
-//   recent form is (high volatility = slightly more draw-probable).
-//   Capped at ±2 so it cannot swing the confidence band.
-// - Over 2.5: based on combined scoring rate, not team-sided
-// - Under 2.5: based on combined defensive rate
-// Returns an integer adjustment in range -5 to +5.
-function footballFormAdj(baseConf, homeForm, awayForm, { isHome, isDraw, isOver, isUnder }) {
-  if (!homeForm && !awayForm) return baseConf;
-
-  let adj = 0;
-
-  if (isDraw) {
-    // Draw form adjustment: if both teams are in similar mid-table form
-    // (neither dominant nor collapsed), draws are slightly more likely.
-    // We don't boost confidence just because a team is in bad form —
-    // that's already baked into the model probabilities.
-    // Cap: ±2 only.
-    if (homeForm && awayForm) {
-      const formDiff = Math.abs(homeForm.formScore - awayForm.formScore);
-      if (formDiff < 0.15) adj = +1;  // evenly matched — marginal draw boost
-      if (formDiff > 0.40) adj = -1;  // clear disparity — draw less likely
-    }
-    return Math.min(95, Math.max(75, baseConf + adj));
-  }
-
-  if (isOver || isUnder) {
-    // Totals form adjustment: driven by combined scoring profile
-    const hAvg = homeForm?.avgGoalsFor  || 0;
-    const aAvg = awayForm?.avgGoalsFor  || 0;
-    const hDef = homeForm?.avgGoalsAgainst || 0;
-    const aDef = awayForm?.avgGoalsAgainst || 0;
-    // Use average goals expected in the game (attack avg + defence conceded avg)
-    const expectedGoals = ((hAvg + aDef) + (aAvg + hDef)) / 2;
-    if (isOver) {
-      if (expectedGoals > 2.8) adj = +3;
-      else if (expectedGoals > 2.3) adj = +1;
-      else if (expectedGoals < 1.8) adj = -3;
-      else if (expectedGoals < 2.1) adj = -1;
-    } else { // Under
-      if (expectedGoals < 1.8) adj = +3;
-      else if (expectedGoals < 2.1) adj = +1;
-      else if (expectedGoals > 2.8) adj = -3;
-      else if (expectedGoals > 2.3) adj = -1;
-    }
-    return Math.min(95, Math.max(75, baseConf + adj));
-  }
-
-  // Home win or Away win — team-sided form adjustment
-  const tipForm = isHome ? homeForm : awayForm;
-  const oppForm = isHome ? awayForm : homeForm;
-
-  if (!tipForm) return baseConf;
-
-  // Form score: 0=all losses, 1=all wins. 0.5 = average.
-  const formAdj = Math.round((tipForm.formScore - 0.5) * 10); // -5 to +5
-
-  // Goals scored by tip team
-  let goalsAdj = 0;
-  if (tipForm.avgGoalsFor      > 2.0) goalsAdj += 2;
-  else if (tipForm.avgGoalsFor > 1.5) goalsAdj += 1;
-  else if (tipForm.avgGoalsFor < 0.8) goalsAdj -= 2;
-  else if (tipForm.avgGoalsFor < 1.2) goalsAdj -= 1;
-
-  // Goals conceded by tip team
-  if (tipForm.avgGoalsAgainst  < 0.8) goalsAdj += 1;
-  else if (tipForm.avgGoalsAgainst > 2.0) goalsAdj -= 1;
-
-  // Opposition form penalty/boost
-  let oppAdj = 0;
-  if (oppForm) {
-    if (oppForm.formScore < 0.25) oppAdj = +1;  // opponent in collapse
-    else if (oppForm.formScore > 0.75) oppAdj = -1; // opponent in top form
-  }
-
-  adj = Math.max(-5, Math.min(5, formAdj + goalsAdj + oppAdj));
-  return Math.min(95, Math.max(75, baseConf + adj));
+// ── H. FRACTIONAL KELLY STAKE ─────────────────────────────────
+// Full Kelly: f = (bp - q) / b
+//   b = decimal odds - 1 (net odds)
+//   p = model probability of winning
+//   q = 1 - p (probability of losing)
+//
+// Full Kelly is too aggressive for single-game bets due to model
+// uncertainty. We use 0.25 Kelly (quarter-Kelly) which is standard
+// practice for sports betting with uncertain probability estimates.
+//
+// Result is clamped to 0.5u–3.0u to match the site's stake display
+// and protect the bank from edge-case over-sizing.
+function kellyStake(modelProb, decimalOdds, fraction = 0.25) {
+  const b = decimalOdds - 1;
+  if (b <= 0 || modelProb <= 0 || modelProb >= 1) return 1.0;
+  const q    = 1 - modelProb;
+  const full = (b * modelProb - q) / b;
+  if (full <= 0) return 0; // negative Kelly = no bet
+  const sized = full * fraction;
+  // Map to site's unit display: 0.5u, 1u, 1.5u, 2u, 2.5u, 3u
+  if (sized >= 0.20) return 3.0;
+  if (sized >= 0.14) return 2.5;
+  if (sized >= 0.10) return 2.0;
+  if (sized >= 0.07) return 1.5;
+  if (sized >= 0.04) return 1.0;
+  return 0.5;
 }
 
-// ── G. MARKET-AWARE NOTES BUILDER ────────────────────────────
-// [CHANGED] Notes are now market-specific — "win prob" only for win bets.
-// ── G. FOOTBALL NOTES BUILDER ────────────────────────────────
-// Generates structured model diagnostics for football tips only.
+// ── I. CONFIDENCE SCORE ───────────────────────────────────────
+// Confidence reflects how much we trust this tip, combining:
+//   1. Edge size (primary) — how much the model disagrees with market
+//   2. Form quality signal (secondary) — is recent form consistent?
+//   3. Data quality — full season stats vs form-only fallback
+//
+// Explicit bands, no modulo, linear interpolation within each band.
+// Clamped 75–95 (never claim certainty, never publish below threshold).
+function confidenceFromEdge(edgePct, formQuality, hasFullStats) {
+  // Edge bands: edge is the main signal
+  let base, bandFloor, bandCeil;
+  if      (edgePct >= 18) { base = 91; bandFloor = 18; bandCeil = 25; }
+  else if (edgePct >= 14) { base = 87; bandFloor = 14; bandCeil = 18; }
+  else if (edgePct >= 10) { base = 83; bandFloor = 10; bandCeil = 14; }
+  else if (edgePct >= 7)  { base = 79; bandFloor = 7;  bandCeil = 10; }
+  else                    { base = 75; bandFloor = 5;  bandCeil = 7;  }
+
+  // Interpolate within band
+  const progress = Math.min(1, (edgePct - bandFloor) / (bandCeil - bandFloor));
+  const fromEdge = base + Math.round(progress * 3);
+
+  // Form quality adjustment: -3 to +3
+  // formQuality is 0–1 (1 = all recent wins, 0 = all losses)
+  const formAdj = Math.round((formQuality - 0.5) * 6);
+
+  // Data quality: if we're using form-only fallback (no season stats), reduce confidence
+  const dataAdj = hasFullStats ? 0 : -3;
+
+  return Math.min(95, Math.max(75, fromEdge + formAdj + dataAdj));
+}
+
+// ── J. MARKET-AWARE FORM ADJUSTMENT ──────────────────────────
+// Returns a form quality signal (0–1) for use in confidence calculation.
+// This is NOT added directly to confidence — it feeds confidenceFromEdge
+// as the formQuality parameter so the relationship is transparent.
+//
+// For win bets: uses the tipping team's recent form score.
+// For draw:     uses average form of both teams (lower = more volatile = draw more likely, but we penalise).
+// For over 2.5: uses combined recent scoring rate.
+function getFormQuality(hf, af, market) {
+  if (!hf && !af) return 0.5; // neutral if no data
+
+  if (market === 'home') {
+    return hf ? hf.formScore : 0.5;
+  }
+  if (market === 'away') {
+    return af ? af.formScore : 0.5;
+  }
+  if (market === 'draw') {
+    // Draw quality: both teams in mid-table form suggests draws
+    // We return 0.5 as neutral — draws are model-driven not form-driven
+    return 0.5;
+  }
+  if (market === 'over25') {
+    // Use combined recent scoring rate normalised to 0–1
+    const hScore = hf ? Math.min(1, hf.avgGoalsFor / 2.5) : 0.5;
+    const aScore = af ? Math.min(1, af.avgGoalsFor / 2.5) : 0.5;
+    return (hScore + aScore) / 2;
+  }
+  return 0.5;
+}
+
+// ── K. NOTES BUILDER ─────────────────────────────────────────
+// Full model diagnostics for Supabase notes field.
 // Format: xG: H vs A | Fair odds: X.XX | Book: X.XX (Bookie) | Edge: +X.X% | Model: XX.X% <market> probability
-// Location: called from analyseFootballFixture() just before the tip object is returned.
-// Non-football notes are handled separately in analyseH2H / analyseTotals — unchanged.
-// Fallback: if lambdaHome/lambdaAway are undefined (e.g. stats fetch failed), returns generic text safely.
-function buildFootballNotes({ market, modelProb, fairPrice, bookOdds, bookmaker, edgePct, lambdaHome, lambdaAway }) {
-  // Safety fallback — if model data is missing return generic text
+function buildFootballNotes({ market, modelProb, fairPrice, bookOdds, bookmaker, edgePct, lambdaHome, lambdaAway, bookMargin, h2hRecord }) {
   if (lambdaHome == null || lambdaAway == null || modelProb == null) {
     return `Book: ${bookOdds} (${bookmaker || 'Multiple'}) | Edge: +${(edgePct || 0).toFixed(1)}%`;
   }
-
-  // Market-specific probability suffix — matches required format exactly
   const probSuffix = {
     home:   'home win probability',
     away:   'away win probability',
@@ -591,19 +759,20 @@ function buildFootballNotes({ market, modelProb, fairPrice, bookOdds, bookmaker,
     over25: 'over 2.5 probability',
   }[market] || 'win probability';
 
-  // Required field order: xG | Fair odds | Book | Edge | Model
-  return [
+  const parts = [
     `xG: ${lambdaHome.toFixed(2)} vs ${lambdaAway.toFixed(2)}`,
     `Fair odds: ${fairPrice}`,
     `Book: ${bookOdds} (${bookmaker})`,
     `Edge: +${edgePct.toFixed(1)}%`,
     `Model: ${(modelProb * 100).toFixed(1)}% ${probSuffix}`,
-  ].join(' | ');
+  ];
+  if (bookMargin != null) parts.push(`Mkt margin: ${bookMargin}%`);
+  if (h2hRecord)          parts.push(`H2H: ${h2hRecord}`);
+  return parts.join(' | ');
 }
 
 // Appends form strings to existing notes (used by applyFormToPendingTips)
 function appendFormToNotes(hf, af, existingNotes = '') {
-  // Don't double-append if already present
   if (existingNotes.includes('Home form:')) return existingNotes;
   const extras = [];
   if (hf) extras.push(`Home form: ${hf.formString}`);
@@ -611,11 +780,21 @@ function appendFormToNotes(hf, af, existingNotes = '') {
   return extras.length ? existingNotes + ' | ' + extras.join(' | ') : existingNotes;
 }
 
-// ── H. MAIN FOOTBALL FIXTURE ANALYSER ────────────────────────
-// Called once per fixture in generateTips() for football only.
-// Returns a tip object or null.
-// [CHANGED] Dynamic season, 0-8 matrix, edge-based confidence,
-// market-aware form adj, market-aware notes.
+// ── L. MAIN FOOTBALL FIXTURE ANALYSER ────────────────────────
+// Entry point called from generateTips() for every football fixture.
+// Returns a tip object (same shape as the rest of the engine) or null.
+//
+// Decision flow:
+//   1. Fetch season stats → calculate attack/defence strengths
+//   2. Apply H2H modifier to λ values
+//   3. Build Dixon-Coles corrected score matrix
+//   4. Derive outcome probabilities
+//   5. Strip bookmaker margin → get true implied probabilities
+//   6. Calculate real edge per market
+//   7. Filter: only tip if edge ≥ MIN_EDGE_PCT
+//   8. Size stake with fractional Kelly
+//   9. Build confidence score
+//  10. Return tip or null
 async function analyseFootballFixture(event, sport) {
   try {
     const leagueId = sport.leagueId;
@@ -624,138 +803,169 @@ async function analyseFootballFixture(event, sport) {
     const leagueAvg = getLeagueAvg(leagueId);
     const { homeGoals: lgHome, awayGoals: lgAway } = leagueAvg;
 
-    // Fetch season stats for both teams
+    // ── 1. Season stats ─────────────────────────────────────
     const [homeStats, awayStats] = await Promise.all([
       fetchTeamSeasonStats(event.home_team, leagueId),
       fetchTeamSeasonStats(event.away_team, leagueId),
     ]);
 
-    // Fall back to form cache if season stats unavailable
-    // (e.g. early season with < 3 games played)
+    // Form data from morning fetch (may be null if budget expired)
     const hf = formCache[`${event.home_team}_${leagueId}`] || null;
     const af = formCache[`${event.away_team}_${leagueId}`] || null;
 
     let lambdaHome, lambdaAway;
+    let hasFullStats = false;
 
     if (homeStats && awayStats) {
-      // ── Attack / Defence strengths from season stats ────
-      const homeAvgScored   = homeStats.homeScored   / homeStats.homeGames;
-      const homeAvgConceded = homeStats.homeConceded / homeStats.homeGames;
-      const awayAvgScored   = awayStats.awayScored   / awayStats.awayGames;
-      const awayAvgConceded = awayStats.awayConceded / awayStats.awayGames;
+      hasFullStats = true;
+      // Attack strength = team avg scored ÷ league avg (home or away context)
+      const homeAvgScoredH  = homeStats.homeScored   / homeStats.homeGames;
+      const homeAvgConcH    = homeStats.homeConceded  / homeStats.homeGames;
+      const awayAvgScoredA  = awayStats.awayScored    / awayStats.awayGames;
+      const awayAvgConcA    = awayStats.awayConceded  / awayStats.awayGames;
 
-      const homeAttack = homeAvgScored   / lgHome;
-      const homeDef    = homeAvgConceded / lgAway;
-      const awayAttack = awayAvgScored   / lgAway;
-      const awayDef    = awayAvgConceded / lgHome;
+      const homeAttack = homeAvgScoredH / lgHome;
+      const homeDef    = homeAvgConcH   / lgAway;
+      const awayAttack = awayAvgScoredA / lgAway;
+      const awayDef    = awayAvgConcA   / lgHome;
 
       lambdaHome = homeAttack * awayDef   * lgHome;
       lambdaAway = awayAttack * homeDef   * lgAway;
+
     } else if (hf && af) {
-      // Fallback: use form data averages as λ proxies
-      // Less accurate than season stats but better than refusing to tip
-      lambdaHome = (hf.avgGoalsFor  + af.avgGoalsAgainst) / 2;
-      lambdaAway = (af.avgGoalsFor  + hf.avgGoalsAgainst) / 2;
-      console.log(`  ⚠️ Using form-data fallback λ for ${event.home_team} vs ${event.away_team}`);
+      // Fallback: use last-5 form averages as λ proxies.
+      // Less precise but usable. Confidence penalised via hasFullStats=false.
+      lambdaHome = (hf.avgGoalsFor + af.avgGoalsAgainst) / 2;
+      lambdaAway = (af.avgGoalsFor + hf.avgGoalsAgainst) / 2;
+      console.log(`  ⚠️ Form-fallback λ: ${event.home_team} vs ${event.away_team}`);
     } else {
-      // No data — cannot price this fixture
+      // No data available — refuse to price
       return null;
     }
 
-    // Clamp λ to realistic range (prevents extreme outlier fixtures)
-    const lH = Math.max(0.30, Math.min(4.50, lambdaHome));
-    const lA = Math.max(0.30, Math.min(4.50, lambdaAway));
+    // ── 2. H2H modifier ─────────────────────────────────────
+    // Get team IDs for H2H lookup — prefer stats cache, fall back to formCache
+    const homeId = homeStats?.teamId || formCache[`${event.home_team}_${leagueId}`]?.teamId || null;
+    const awayId = awayStats?.teamId || formCache[`${event.away_team}_${leagueId}`]?.teamId || null;
+    const h2h    = await fetchH2HModifier(homeId, awayId);
 
-    // Build score matrix (0..8 each side, renormalised)
+    // Apply H2H modifier to lambdas
+    lambdaHome = lambdaHome * (1 + h2h.homeMod);
+    lambdaAway = lambdaAway * (1 + h2h.awayMod);
+
+    // Clamp to realistic range
+    const lH = Math.max(0.25, Math.min(5.0, lambdaHome));
+    const lA = Math.max(0.25, Math.min(5.0, lambdaAway));
+
+    // ── 3. Score matrix with Dixon-Coles correction ─────────
     const matrix = buildScoreMatrix(lH, lA);
+
+    // ── 4. Outcome probabilities ─────────────────────────────
     const { homeWin, draw, awayWin, over25 } = calcOutcomes(matrix);
 
-    // Fair odds
-    const fairHome  = fairOdds(homeWin);
-    const fairDraw  = fairOdds(draw);
-    const fairAway  = fairOdds(awayWin);
-    const fair25    = fairOdds(over25);
+    // ── 5. Margin-stripped market data ───────────────────────
+    const market = extractMarketData(event);
+    if (!market) return null; // need at least one complete 1X2 book
 
-    // Best bookmaker prices
-    const best = extractBestOdds(event);
+    // ── 6. Edge calculation (against margin-stripped prices) ──
+    // For over 2.5 we use raw implied probability (only one side priced)
+    const over25IP = market.over25Odds > 0 ? 1 / market.over25Odds : 0;
 
-    // ── Evaluate each market for edge ──────────────────────
     const candidates = [];
 
     // Home win
-    if (best.home >= 1.30 && best.home <= 6.0) {
-      const edgePct = (homeWin - 1/best.home) * 100;
-      if (edgePct >= MIN_EDGE_PCT) {
-        const formAdj = footballFormAdj(0, hf, af, { isHome: true, isDraw: false, isOver: false, isUnder: false });
-        const conf    = confidenceFromEdge(edgePct, formAdj);
-        if (conf >= MIN_CONFIDENCE) candidates.push({
-          market: 'home', edgePct, modelProb: homeWin, fairPrice: fairHome,
-          bookOdds: best.home, bookmaker: best.homeBook,
-          selection: `${event.home_team} Win`, conf, formAdj,
-        });
+    if (market.homeOdds >= 1.25 && market.homeOdds <= 6.5 && market.trueHome > 0) {
+      const edge = calcEdge(homeWin, market.trueHome);
+      if (edge >= MIN_EDGE_PCT) {
+        const kelly  = kellyStake(homeWin, market.homeOdds);
+        if (kelly > 0) {
+          const fq   = getFormQuality(hf, af, 'home');
+          const conf = confidenceFromEdge(edge, fq, hasFullStats);
+          if (conf >= MIN_CONFIDENCE) candidates.push({
+            market: 'home', edge, modelProb: homeWin,
+            fairPrice: fairOdds(homeWin), bookOdds: market.homeOdds,
+            bookmaker: market.homeBook, stake: kelly, conf,
+            selection: `${event.home_team} Win`,
+          });
+        }
       }
     }
 
     // Away win
-    if (best.away >= 1.30 && best.away <= 6.0) {
-      const edgePct = (awayWin - 1/best.away) * 100;
-      if (edgePct >= MIN_EDGE_PCT) {
-        const formAdj = footballFormAdj(0, hf, af, { isHome: false, isDraw: false, isOver: false, isUnder: false });
-        const conf    = confidenceFromEdge(edgePct, formAdj);
-        if (conf >= MIN_CONFIDENCE) candidates.push({
-          market: 'away', edgePct, modelProb: awayWin, fairPrice: fairAway,
-          bookOdds: best.away, bookmaker: best.awayBook,
-          selection: `${event.away_team} Win`, conf, formAdj,
-        });
+    if (market.awayOdds >= 1.25 && market.awayOdds <= 6.5 && market.trueAway > 0) {
+      const edge = calcEdge(awayWin, market.trueAway);
+      if (edge >= MIN_EDGE_PCT) {
+        const kelly = kellyStake(awayWin, market.awayOdds);
+        if (kelly > 0) {
+          const fq   = getFormQuality(hf, af, 'away');
+          const conf = confidenceFromEdge(edge, fq, hasFullStats);
+          if (conf >= MIN_CONFIDENCE) candidates.push({
+            market: 'away', edge, modelProb: awayWin,
+            fairPrice: fairOdds(awayWin), bookOdds: market.awayOdds,
+            bookmaker: market.awayBook, stake: kelly, conf,
+            selection: `${event.away_team} Win`,
+          });
+        }
       }
     }
 
-    // Draw — require higher threshold: draws are noisy and margin-sensitive
-    if (best.draw >= 2.60 && draw > 0.24) {
-      const edgePct = (draw - 1/best.draw) * 100;
-      if (edgePct >= MIN_EDGE_PCT + 3) { // +3% extra hurdle for draws
-        const formAdj = footballFormAdj(0, hf, af, { isHome: false, isDraw: true, isOver: false, isUnder: false });
-        const conf    = confidenceFromEdge(edgePct, formAdj);
-        if (conf >= MIN_CONFIDENCE) candidates.push({
-          market: 'draw', edgePct, modelProb: draw, fairPrice: fairDraw,
-          bookOdds: best.draw, bookmaker: best.drawBook,
-          selection: 'Draw', conf, formAdj,
-        });
+    // Draw — extra hurdle (+3%): draws are genuinely harder to price
+    if (market.drawOdds >= 2.50 && draw > 0.22 && market.trueDraw > 0) {
+      const edge = calcEdge(draw, market.trueDraw);
+      if (edge >= MIN_EDGE_PCT + 3) {
+        const kelly = kellyStake(draw, market.drawOdds);
+        if (kelly > 0) {
+          const fq   = getFormQuality(hf, af, 'draw');
+          const conf = confidenceFromEdge(edge, fq, hasFullStats);
+          if (conf >= MIN_CONFIDENCE) candidates.push({
+            market: 'draw', edge, modelProb: draw,
+            fairPrice: fairOdds(draw), bookOdds: market.drawOdds,
+            bookmaker: market.drawBook, stake: kelly, conf,
+            selection: 'Draw',
+          });
+        }
       }
     }
 
-    // Over 2.5
-    if (best.over25 >= 1.45 && best.over25 <= 2.40) {
-      const edgePct = (over25 - 1/best.over25) * 100;
-      if (edgePct >= MIN_EDGE_PCT) {
-        const formAdj = footballFormAdj(0, hf, af, { isHome: false, isDraw: false, isOver: true, isUnder: false });
-        const conf    = confidenceFromEdge(edgePct, formAdj);
-        if (conf >= MIN_CONFIDENCE) candidates.push({
-          market: 'over25', edgePct, modelProb: over25, fairPrice: fair25,
-          bookOdds: best.over25, bookmaker: best.over25Book,
-          selection: 'Over 2.5', conf, formAdj,
-        });
+    // Over 2.5 — use raw implied probability (single-side market, no 3-way margin)
+    if (market.over25Odds >= 1.45 && market.over25Odds <= 2.50 && over25IP > 0) {
+      const edge = calcEdge(over25, over25IP);
+      if (edge >= MIN_EDGE_PCT) {
+        const kelly = kellyStake(over25, market.over25Odds);
+        if (kelly > 0) {
+          const fq   = getFormQuality(hf, af, 'over25');
+          const conf = confidenceFromEdge(edge, fq, hasFullStats);
+          if (conf >= MIN_CONFIDENCE) candidates.push({
+            market: 'over25', edge, modelProb: over25,
+            fairPrice: fairOdds(over25), bookOdds: market.over25Odds,
+            bookmaker: market.over25Book, stake: kelly, conf,
+            selection: 'Over 2.5',
+          });
+        }
       }
     }
 
     if (!candidates.length) return null;
 
-    // Pick highest-edge candidate (not highest confidence — edge is the signal)
-    const pick = candidates.reduce((a, b) => a.edgePct >= b.edgePct ? a : b);
+    // Pick highest-edge candidate — edge is the primary signal
+    const pick = candidates.reduce((a, b) => a.edge >= b.edge ? a : b);
 
-    // Build tip object
-    const stake = pick.conf >= 90 ? 3.0 : pick.conf >= 82 ? 2.0 : 1.5;
-    // Build structured model notes (football only).
-    // Format: xG: H vs A | Fair odds: X.XX | Book: X.XX (Bookie) | Edge: +X.X% | Model: XX.X% <market> probability
+    // H2H record string for notes
+    const h2hStr = (h2h.total >= 3)
+      ? `${h2h.homeWins}W-${h2h.draws}D-${h2h.awayWins}L (last ${h2h.total})`
+      : null;
+
     const notes = buildFootballNotes({
-      market:     pick.market,
-      modelProb:  pick.modelProb,
-      fairPrice:  pick.fairPrice,
-      bookOdds:   pick.bookOdds,
-      bookmaker:  pick.bookmaker,
-      edgePct:    pick.edgePct,
-      lambdaHome: lH,
-      lambdaAway: lA,
+      market:      pick.market,
+      modelProb:   pick.modelProb,
+      fairPrice:   pick.fairPrice,
+      bookOdds:    pick.bookOdds,
+      bookmaker:   pick.bookmaker,
+      edgePct:     pick.edge,
+      lambdaHome:  lH,
+      lambdaAway:  lA,
+      bookMargin:  market.avgMargin,
+      h2hRecord:   h2hStr,
     });
 
     return {
@@ -768,7 +978,7 @@ async function analyseFootballFixture(event, sport) {
       selection:  pick.selection,
       market:     pick.market === 'over25' ? 'totals' : 'h2h',
       odds:       parseFloat(pick.bookOdds.toFixed(2)),
-      stake,
+      stake:      pick.stake,
       confidence: pick.conf,
       tier:       'pro',
       status:     'pending',
@@ -781,6 +991,557 @@ async function analyseFootballFixture(event, sport) {
     return null;
   }
 }
+
+
+// ═══════════════════════════════════════════════════════════════
+// US SPORTS MODELS — NBA + NHL
+// ═══════════════════════════════════════════════════════════════
+// Both models use the same key as API-Football (API-Sports family).
+// Each API has its own independent 100 req/day budget.
+// NFL and MLB continue using market consensus — their data
+// structures don't lend themselves to a simple scoring model
+// without player-level data, which costs too many API calls.
+//
+// NBA MODEL:
+//   Uses offensive/defensive rating from team season stats.
+//   Pace-adjusted expected score per team.
+//   Margin-stripped edge calculation + fractional Kelly staking.
+//
+// NHL MODEL:
+//   Uses goals-for and goals-against per game (season average).
+//   Simple Poisson model (hockey scores < 10, 0..7 matrix sufficient).
+//   Margin-stripped edge + fractional Kelly.
+//
+// INJURY CACHE:
+//   Fetches NBA + NHL injuries once per day from BallDontLie.
+//   If key player (starter) is injured, a confidence penalty applies.
+//   Fetched at 06:00 alongside form data.
+// ═══════════════════════════════════════════════════════════════
+
+const API_BASKETBALL_BASE = 'https://v2.nba.api-sports.io';
+const API_HOCKEY_BASE     = 'https://v1.hockey.api-sports.io';
+const BDL_BASE            = 'https://api.balldontlie.io';
+
+// These counters are independent of the football budget counter.
+// Each API-Sports API has its own 100/day limit.
+let nbaBudget  = { date: '', used: 0, limit: 80 };
+let nhlBudget  = { date: '', used: 0, limit: 80 };
+let bdlBudget  = { date: '', used: 0, limit: 150 }; // BDL free tier is generous
+
+function checkNBABudget(n = 1) {
+  const today = new Date().toISOString().split('T')[0];
+  if (nbaBudget.date !== today) { nbaBudget.date = today; nbaBudget.used = 0; }
+  if (nbaBudget.used + n > nbaBudget.limit) return false;
+  nbaBudget.used += n; return true;
+}
+function checkNHLBudget(n = 1) {
+  const today = new Date().toISOString().split('T')[0];
+  if (nhlBudget.date !== today) { nhlBudget.date = today; nhlBudget.used = 0; }
+  if (nhlBudget.used + n > nhlBudget.limit) return false;
+  nhlBudget.used += n; return true;
+}
+function checkBDLBudget(n = 1) {
+  const today = new Date().toISOString().split('T')[0];
+  if (bdlBudget.date !== today) { bdlBudget.date = today; bdlBudget.used = 0; }
+  if (bdlBudget.used + n > bdlBudget.limit) return false;
+  bdlBudget.used += n; return true;
+}
+
+// ── INJURY CACHE ──────────────────────────────────────────────
+// Stores injured players per team: { 'TeamName': ['Player1', 'Player2'] }
+// Fetched once at 06:00 UK. Used to apply confidence penalties.
+const injuryCache = { nba: {}, nhl: {} };
+let injuryCacheFetched = { nba: '', nhl: '' };
+
+// BallDontLie NBA injuries — free tier, no auth required for basic endpoints
+// Returns list of current game-time-decision or out players
+async function fetchNBAInjuries(BDL_API_KEY) {
+  const today = new Date().toISOString().split('T')[0];
+  if (injuryCacheFetched.nba === today) return;
+  if (!checkBDLBudget(1)) return;
+  try {
+    const res = await fetch(`${BDL_BASE}/v1/player_injuries`, {
+      headers: BDL_API_KEY ? { 'Authorization': BDL_API_KEY } : {}
+    });
+    if (!res.ok) return;
+    const data = await res.json();
+    const injuries = data.data || [];
+    const cache = {};
+    for (const inj of injuries) {
+      const team = inj.team?.full_name || inj.team?.name;
+      const player = inj.player ? `${inj.player.first_name} ${inj.player.last_name}` : null;
+      if (team && player) {
+        if (!cache[team]) cache[team] = [];
+        cache[team].push(player);
+      }
+    }
+    injuryCache.nba = cache;
+    injuryCacheFetched.nba = today;
+    const total = Object.values(cache).reduce((s,a) => s + a.length, 0);
+    console.log(`🏥 NBA injuries fetched: ${total} players across ${Object.keys(cache).length} teams`);
+  } catch(e) { console.error('NBA injury fetch error:', e.message); }
+}
+
+async function fetchNHLInjuries(BDL_API_KEY) {
+  const today = new Date().toISOString().split('T')[0];
+  if (injuryCacheFetched.nhl === today) return;
+  if (!checkBDLBudget(1)) return;
+  try {
+    const res = await fetch(`${BDL_BASE}/nhl/v1/player_injuries`, {
+      headers: BDL_API_KEY ? { 'Authorization': BDL_API_KEY } : {}
+    });
+    if (!res.ok) return;
+    const data = await res.json();
+    const injuries = data.data || [];
+    const cache = {};
+    for (const inj of injuries) {
+      const team = inj.team?.full_name;
+      const player = inj.player?.full_name;
+      if (team && player) {
+        if (!cache[team]) cache[team] = [];
+        cache[team].push(player);
+      }
+    }
+    injuryCache.nhl = cache;
+    injuryCacheFetched.nhl = today;
+    const total = Object.values(cache).reduce((s,a) => s + a.length, 0);
+    console.log(`🏥 NHL injuries fetched: ${total} players across ${Object.keys(cache).length} teams`);
+  } catch(e) { console.error('NHL injury fetch error:', e.message); }
+}
+
+// Returns how many known injured players a team has (0 = clean bill of health)
+function injuryCount(sport, teamName) {
+  const cache = injuryCache[sport.toLowerCase()] || {};
+  // Try exact match then partial
+  for (const [team, players] of Object.entries(cache)) {
+    if (nameMatch(team, teamName)) return players.length;
+  }
+  return 0;
+}
+
+// Injury confidence penalty: each injured player reduces confidence slightly
+// Capped at -5 total to avoid over-weighting uncertainty
+function injuryPenalty(homeTeam, awayTeam, sport) {
+  const hInj = injuryCount(sport, homeTeam);
+  const aInj = injuryCount(sport, awayTeam);
+  return Math.min(5, (hInj + aInj));
+}
+
+// ── NBA TEAM STATS CACHE ──────────────────────────────────────
+// Keyed by teamName_season.
+// Fetches offensive rating, defensive rating, pace from API-NBA.
+const nbaTeamCache = {};
+
+async function fetchNBATeamStats(teamName) {
+  const season = seasonFor();
+  const cacheKey = `${teamName}_${season}`;
+  if (nbaTeamCache[cacheKey]) return nbaTeamCache[cacheKey];
+  if (!checkNBABudget(2)) { console.log(`⚠️ NBA budget: skipping ${teamName}`); return null; }
+
+  try {
+    // Step 1: find team ID
+    const tr = await fetch(
+      `${API_BASKETBALL_BASE}/teams?name=${encodeURIComponent(teamName)}&league=12&season=${season}`,
+      { headers: { 'x-apisports-key': API_FOOTBALL_KEY } }
+    );
+    if (!tr.ok) return null;
+    const td = await tr.json();
+    const team = td.response?.[0];
+    if (!team?.id) return null;
+
+    // Step 2: team statistics for current season (league 12 = NBA)
+    const sr = await fetch(
+      `${API_BASKETBALL_BASE}/teams/statistics?id=${team.id}&season=${season}`,
+      { headers: { 'x-apisports-key': API_FOOTBALL_KEY } }
+    );
+    if (!sr.ok) return null;
+    const sd = await sr.json();
+    const stats = sd.response?.[0];
+    if (!stats) return null;
+
+    // API-NBA returns per-game averages directly
+    const games = stats.games?.played || 1;
+    const result = {
+      teamId:       team.id,
+      gamesPlayed:  games,
+      // Points scored and allowed per game
+      ptsFor:       parseFloat(stats.points?.for?.average?.all   || stats.points?.for?.average?.['in'] || 110),
+      ptsAgainst:   parseFloat(stats.points?.against?.average?.all || stats.points?.against?.average?.['in'] || 110),
+    };
+
+    // Require at least 8 games for reliable stats
+    if (result.gamesPlayed < 8) {
+      console.log(`  ⚠️ NBA ${teamName}: only ${result.gamesPlayed} games — skipping model`);
+      return null;
+    }
+
+    nbaTeamCache[cacheKey] = result;
+    console.log(`  🏀 NBA ${teamName}: ${result.ptsFor.toFixed(1)} pts/gm, ${result.ptsAgainst.toFixed(1)} allowed`);
+    return result;
+  } catch(e) { console.error(`NBA team stats error (${teamName}):`, e.message); return null; }
+}
+
+// ── NBA GAME MODEL ────────────────────────────────────────────
+// Expected score approach: uses offensive/defensive strength.
+// NBA home court advantage is ~3.5 points on average.
+// We model expected total points and expected margin, then convert
+// to win probability using a normal distribution approximation.
+// NBA game-to-game variance (std dev) is ~12 points.
+const NBA_HOME_ADVANTAGE  = 3.5;  // points
+const NBA_LEAGUE_AVG_PTS  = 113;  // both teams average pts per game
+const NBA_SCORE_STD_DEV   = 12.0; // standard deviation of margin
+
+// Normal CDF approximation (Abramowitz & Stegun)
+function normalCDF(x) {
+  const t = 1 / (1 + 0.2315419 * Math.abs(x));
+  const d = 0.3989423 * Math.exp(-x * x / 2);
+  const p = d * t * (0.3193815 + t * (-0.3565638 + t * (1.7814779 + t * (-1.8212560 + t * 1.3302744))));
+  return x >= 0 ? 1 - p : p;
+}
+
+// Win probability given expected margin and std dev
+function winProbFromMargin(expectedMargin, stdDev = NBA_SCORE_STD_DEV) {
+  return normalCDF(expectedMargin / stdDev);
+}
+
+async function analyseNBAFixture(event, sport) {
+  try {
+    const [homeStats, awayStats] = await Promise.all([
+      fetchNBATeamStats(event.home_team),
+      fetchNBATeamStats(event.away_team),
+    ]);
+    if (!homeStats || !awayStats) return null;
+
+    // Offensive strength = team pts/gm ÷ league avg
+    // Defensive strength = team pts-allowed/gm ÷ league avg
+    const homeOff = homeStats.ptsFor     / NBA_LEAGUE_AVG_PTS;
+    const homeDef = homeStats.ptsAgainst / NBA_LEAGUE_AVG_PTS;
+    const awayOff = awayStats.ptsFor     / NBA_LEAGUE_AVG_PTS;
+    const awayDef = awayStats.ptsAgainst / NBA_LEAGUE_AVG_PTS;
+
+    // Expected points scored by each team
+    const homeExpected = homeOff * awayDef * NBA_LEAGUE_AVG_PTS + NBA_HOME_ADVANTAGE;
+    const awayExpected = awayOff * homeDef * NBA_LEAGUE_AVG_PTS;
+
+    const expectedMargin = homeExpected - awayExpected; // positive = home favoured
+
+    // Win probabilities
+    const homeWinP = winProbFromMargin(expectedMargin);
+    const awayWinP = 1 - homeWinP;
+
+    // Expected total
+    const expectedTotal = homeExpected + awayExpected;
+
+    // Best bookmaker odds (with margin stripping)
+    const market = extractMarketData(event);
+    if (!market) return null;
+
+    // Over/Under using normal distribution on total
+    // P(total > line) requires std dev of total ≈ sqrt(2) * single-team std dev
+    const totalStdDev = NBA_SCORE_STD_DEV * Math.sqrt(2);
+
+    const candidates = [];
+
+    // Home win
+    if (market.homeOdds >= 1.25 && market.homeOdds <= 5.0 && market.trueHome > 0) {
+      const edge = calcEdge(homeWinP, market.trueHome);
+      if (edge >= MIN_EDGE_PCT) {
+        const injPen = injuryPenalty(event.home_team, event.away_team, 'nba');
+        const conf   = Math.min(92, Math.max(75, Math.round(75 + (edge - 5) * 1.5) - injPen));
+        if (conf >= MIN_CONFIDENCE) {
+          const stake = kellyStake(homeWinP, market.homeOdds);
+          if (stake > 0) candidates.push({
+            selection: `${event.home_team} Win`, market: 'home', edge,
+            modelProb: homeWinP, bookOdds: market.homeOdds, bookmaker: market.homeBook,
+            stake, conf,
+            notes: `Expected: ${homeExpected.toFixed(1)}-${awayExpected.toFixed(1)} | Model: ${(homeWinP*100).toFixed(1)}% home win | Fair: ${fairOdds(homeWinP)} | Book: ${market.homeOdds} (${market.homeBook}) | Edge: +${edge.toFixed(1)}%${injPen > 0 ? ` | ⚠️ ${injPen} injuries` : ''}`,
+          });
+        }
+      }
+    }
+
+    // Away win
+    if (market.awayOdds >= 1.25 && market.awayOdds <= 5.0 && market.trueAway > 0) {
+      const edge = calcEdge(awayWinP, market.trueAway);
+      if (edge >= MIN_EDGE_PCT) {
+        const injPen = injuryPenalty(event.home_team, event.away_team, 'nba');
+        const conf   = Math.min(92, Math.max(75, Math.round(75 + (edge - 5) * 1.5) - injPen));
+        if (conf >= MIN_CONFIDENCE) {
+          const stake = kellyStake(awayWinP, market.awayOdds);
+          if (stake > 0) candidates.push({
+            selection: `${event.away_team} Win`, market: 'away', edge,
+            modelProb: awayWinP, bookOdds: market.awayOdds, bookmaker: market.awayBook,
+            stake, conf,
+            notes: `Expected: ${homeExpected.toFixed(1)}-${awayExpected.toFixed(1)} | Model: ${(awayWinP*100).toFixed(1)}% away win | Fair: ${fairOdds(awayWinP)} | Book: ${market.awayOdds} (${market.awayBook}) | Edge: +${edge.toFixed(1)}%${injPen > 0 ? ` | ⚠️ ${injPen} injuries` : ''}`,
+          });
+        }
+      }
+    }
+
+    // Totals — using normal distribution on expected total
+    const totalsBooks = event.bookmakers.map(b => b.markets?.find(m => m.key === 'totals')).filter(Boolean);
+    if (totalsBooks.length >= 2) {
+      const overOdds = [], underOdds = [];
+      let line = null;
+      for (const b of totalsBooks) {
+        for (const o of b.outcomes) {
+          if (o.name === 'Over')  { overOdds.push(o.price); line = o.point; }
+          if (o.name === 'Under') { underOdds.push(o.price); }
+        }
+      }
+      if (line && overOdds.length && underOdds.length) {
+        const overP  = normalCDF((expectedTotal - line) / totalStdDev);
+        const underP = 1 - overP;
+        const bestOver  = Math.max(...overOdds);
+        const bestUnder = Math.max(...underOdds);
+        const overIP    = 1 / (overOdds.reduce((a,b)=>a+b,0)/overOdds.length);
+        const underIP   = 1 / (underOdds.reduce((a,b)=>a+b,0)/underOdds.length);
+
+        const overEdge  = calcEdge(overP,  overIP);
+        const underEdge = calcEdge(underP, underIP);
+
+        if (overEdge >= MIN_EDGE_PCT && bestOver >= 1.50 && bestOver <= 2.30) {
+          const conf  = Math.min(90, Math.max(75, Math.round(75 + (overEdge - 5) * 1.2)));
+          const stake = kellyStake(overP, bestOver);
+          if (stake > 0 && conf >= MIN_CONFIDENCE) candidates.push({
+            selection: `Over ${line}`, market: 'over', edge: overEdge,
+            modelProb: overP, bookOdds: bestOver,
+            bookmaker: event.bookmakers[0]?.title || 'Multiple', stake, conf,
+            notes: `Expected total: ${expectedTotal.toFixed(1)} | Line: ${line} | Model: ${(overP*100).toFixed(1)}% over | Edge: +${overEdge.toFixed(1)}%`,
+          });
+        }
+        if (underEdge >= MIN_EDGE_PCT && bestUnder >= 1.50 && bestUnder <= 2.30) {
+          const conf  = Math.min(90, Math.max(75, Math.round(75 + (underEdge - 5) * 1.2)));
+          const stake = kellyStake(underP, bestUnder);
+          if (stake > 0 && conf >= MIN_CONFIDENCE) candidates.push({
+            selection: `Under ${line}`, market: 'under', edge: underEdge,
+            modelProb: underP, bookOdds: bestUnder,
+            bookmaker: event.bookmakers[0]?.title || 'Multiple', stake, conf,
+            notes: `Expected total: ${expectedTotal.toFixed(1)} | Line: ${line} | Model: ${(underP*100).toFixed(1)}% under | Edge: +${underEdge.toFixed(1)}%`,
+          });
+        }
+      }
+    }
+
+    if (!candidates.length) return null;
+    const pick = candidates.reduce((a, b) => a.edge >= b.edge ? a : b);
+
+    return {
+      tip_ref:    generateTipRef('Basketball'),
+      sport:      'Basketball',
+      league:     sport.league,
+      home_team:  event.home_team,
+      away_team:  event.away_team,
+      event_time: event.commence_time,
+      selection:  pick.selection,
+      market:     pick.market.includes('ver') ? 'totals' : 'h2h',
+      odds:       parseFloat(pick.bookOdds.toFixed(2)),
+      stake:      pick.stake,
+      confidence: pick.conf,
+      tier:       'pro',
+      status:     'pending',
+      bookmaker:  pick.bookmaker,
+      notes:      pick.notes,
+    };
+  } catch(e) {
+    console.error(`NBA model error [${event.home_team} vs ${event.away_team}]:`, e.message);
+    return null;
+  }
+}
+
+// ── NHL TEAM STATS CACHE ──────────────────────────────────────
+const nhlTeamCache = {};
+
+async function fetchNHLTeamStats(teamName) {
+  const season = seasonFor();
+  const cacheKey = `${teamName}_${season}`;
+  if (nhlTeamCache[cacheKey]) return nhlTeamCache[cacheKey];
+  if (!checkNHLBudget(2)) { console.log(`⚠️ NHL budget: skipping ${teamName}`); return null; }
+
+  try {
+    // Find team
+    const tr = await fetch(
+      `${API_HOCKEY_BASE}/teams?name=${encodeURIComponent(teamName)}&league=57&season=${season}`,
+      { headers: { 'x-apisports-key': API_FOOTBALL_KEY } }
+    );
+    if (!tr.ok) return null;
+    const td = await tr.json();
+    const team = td.response?.[0];
+    if (!team?.id) return null;
+
+    // Team statistics (league 57 = NHL)
+    const sr = await fetch(
+      `${API_HOCKEY_BASE}/teams/statistics?id=${team.id}&season=${season}`,
+      { headers: { 'x-apisports-key': API_FOOTBALL_KEY } }
+    );
+    if (!sr.ok) return null;
+    const sd = await sr.json();
+    const stats = sd.response?.[0];
+    if (!stats) return null;
+
+    const games = stats.games?.played || 1;
+    if (games < 8) {
+      console.log(`  ⚠️ NHL ${teamName}: only ${games} games`);
+      return null;
+    }
+
+    const result = {
+      teamId:      team.id,
+      gamesPlayed: games,
+      goalsFor:    parseFloat(stats.goals?.for?.total?.all   || 0) / games,
+      goalsAgainst: parseFloat(stats.goals?.against?.total?.all || 0) / games,
+    };
+
+    nhlTeamCache[cacheKey] = result;
+    console.log(`  🏒 NHL ${teamName}: ${result.goalsFor.toFixed(2)} GF/gm, ${result.goalsAgainst.toFixed(2)} GA/gm`);
+    return result;
+  } catch(e) { console.error(`NHL team stats error (${teamName}):`, e.message); return null; }
+}
+
+// ── NHL GAME MODEL ────────────────────────────────────────────
+// Uses Poisson model on goals scored/allowed.
+// NHL home advantage ≈ 0.2 extra goals per game.
+// Score matrix 0..7 (very rare to score more in NHL).
+const NHL_HOME_ADVANTAGE  = 0.20;
+const NHL_LEAGUE_AVG_GF   = 3.10; // goals per game per team, recent seasons
+const NHL_MATRIX_MAX      = 7;
+
+async function analyseNHLFixture(event, sport) {
+  try {
+    const [homeStats, awayStats] = await Promise.all([
+      fetchNHLTeamStats(event.home_team),
+      fetchNHLTeamStats(event.away_team),
+    ]);
+    if (!homeStats || !awayStats) return null;
+
+    // Attack/defence strengths relative to league average
+    const homeAttack = homeStats.goalsFor     / NHL_LEAGUE_AVG_GF;
+    const homeDef    = homeStats.goalsAgainst / NHL_LEAGUE_AVG_GF;
+    const awayAttack = awayStats.goalsFor     / NHL_LEAGUE_AVG_GF;
+    const awayDef    = awayStats.goalsAgainst / NHL_LEAGUE_AVG_GF;
+
+    // Expected goals (lambda) with home advantage
+    let lH = homeAttack * awayDef * NHL_LEAGUE_AVG_GF + NHL_HOME_ADVANTAGE;
+    let lA = awayAttack * homeDef * NHL_LEAGUE_AVG_GF;
+    lH = Math.max(0.5, Math.min(6.0, lH));
+    lA = Math.max(0.5, Math.min(6.0, lA));
+
+    // Score matrix using standard Poisson (no DC correction for hockey)
+    const N = NHL_MATRIX_MAX;
+    const matrix = [];
+    let total = 0;
+    for (let h = 0; h <= N; h++) {
+      matrix[h] = [];
+      for (let a = 0; a <= N; a++) {
+        const p = poisson(lH, h) * poisson(lA, a);
+        matrix[h][a] = p;
+        total += p;
+      }
+    }
+    // Renormalise
+    if (total > 0) {
+      for (let h = 0; h <= N; h++)
+        for (let a = 0; a <= N; a++)
+          matrix[h][a] /= total;
+    }
+
+    // Outcome probabilities
+    let homeWin = 0, awayWin = 0, draw = 0, over55 = 0;
+    for (let h = 0; h <= N; h++) {
+      for (let a = 0; a <= N; a++) {
+        const p = matrix[h][a];
+        if (h > a)        homeWin += p;
+        else if (h < a)   awayWin += p;
+        else              draw    += p;
+        if (h + a > 5.5)  over55  += p;
+      }
+    }
+
+    // In NHL, regulation draws go to OT/shootout — roughly 50/50
+    // Adjust for regulation result markets (some books price reg draw separately)
+    // For H2H moneyline markets, include OT so: home = homeWin + draw*0.5, away = awayWin + draw*0.5
+    const homeWinML = homeWin + draw * 0.5;
+    const awayWinML = awayWin + draw * 0.5;
+
+    const market = extractMarketData(event);
+    if (!market) return null;
+
+    const candidates = [];
+    const injPen = injuryPenalty(event.home_team, event.away_team, 'nhl');
+
+    // Home win (moneyline incl OT)
+    if (market.homeOdds >= 1.25 && market.homeOdds <= 4.5 && market.trueHome > 0) {
+      const edge = calcEdge(homeWinML, market.trueHome);
+      if (edge >= MIN_EDGE_PCT) {
+        const conf  = Math.min(92, Math.max(75, Math.round(75 + (edge - 5) * 1.5) - injPen));
+        const stake = kellyStake(homeWinML, market.homeOdds);
+        if (stake > 0 && conf >= MIN_CONFIDENCE) candidates.push({
+          selection: `${event.home_team} Win`, market: 'home', edge,
+          modelProb: homeWinML, bookOdds: market.homeOdds, bookmaker: market.homeBook,
+          stake, conf,
+          notes: `xG: ${lH.toFixed(2)} vs ${lA.toFixed(2)} | Model: ${(homeWinML*100).toFixed(1)}% home win (incl OT) | Fair: ${fairOdds(homeWinML)} | Book: ${market.homeOdds} (${market.homeBook}) | Edge: +${edge.toFixed(1)}%${injPen > 0 ? ` | ⚠️ ${injPen} injuries` : ''}`,
+        });
+      }
+    }
+
+    // Away win (moneyline incl OT)
+    if (market.awayOdds >= 1.25 && market.awayOdds <= 4.5 && market.trueAway > 0) {
+      const edge = calcEdge(awayWinML, market.trueAway);
+      if (edge >= MIN_EDGE_PCT) {
+        const conf  = Math.min(92, Math.max(75, Math.round(75 + (edge - 5) * 1.5) - injPen));
+        const stake = kellyStake(awayWinML, market.awayOdds);
+        if (stake > 0 && conf >= MIN_CONFIDENCE) candidates.push({
+          selection: `${event.away_team} Win`, market: 'away', edge,
+          modelProb: awayWinML, bookOdds: market.awayOdds, bookmaker: market.awayBook,
+          stake, conf,
+          notes: `xG: ${lH.toFixed(2)} vs ${lA.toFixed(2)} | Model: ${(awayWinML*100).toFixed(1)}% away win (incl OT) | Fair: ${fairOdds(awayWinML)} | Book: ${market.awayOdds} (${market.awayBook}) | Edge: +${edge.toFixed(1)}%${injPen > 0 ? ` | ⚠️ ${injPen} injuries` : ''}`,
+        });
+      }
+    }
+
+    // Over 5.5 goals
+    if (market.over25Odds >= 1.50 && market.over25Odds <= 2.40) {
+      const over55IP = 1 / market.over25Odds;
+      const edge = calcEdge(over55, over55IP);
+      if (edge >= MIN_EDGE_PCT) {
+        const conf  = Math.min(90, Math.max(75, Math.round(75 + (edge - 5) * 1.2)));
+        const stake = kellyStake(over55, market.over25Odds);
+        if (stake > 0 && conf >= MIN_CONFIDENCE) candidates.push({
+          selection: 'Over 5.5', market: 'over55', edge,
+          modelProb: over55, bookOdds: market.over25Odds, bookmaker: market.over25Book,
+          stake, conf,
+          notes: `xG: ${lH.toFixed(2)} vs ${lA.toFixed(2)} | Model: ${(over55*100).toFixed(1)}% over 5.5 | Edge: +${edge.toFixed(1)}%`,
+        });
+      }
+    }
+
+    if (!candidates.length) return null;
+    const pick = candidates.reduce((a, b) => a.edge >= b.edge ? a : b);
+
+    return {
+      tip_ref:    generateTipRef('Ice Hockey'),
+      sport:      'Ice Hockey',
+      league:     sport.league,
+      home_team:  event.home_team,
+      away_team:  event.away_team,
+      event_time: event.commence_time,
+      selection:  pick.selection,
+      market:     pick.market.includes('ver') ? 'totals' : 'h2h',
+      odds:       parseFloat(pick.bookOdds.toFixed(2)),
+      stake:      pick.stake,
+      confidence: pick.conf,
+      tier:       'pro',
+      status:     'pending',
+      bookmaker:  pick.bookmaker,
+      notes:      pick.notes,
+    };
+  } catch(e) {
+    console.error(`NHL model error [${event.home_team} vs ${event.away_team}]:`, e.message);
+    return null;
+  }
+}
+
+
 
 // ═══════════════════════════════════════════════════════════════
 // ODDS FETCHING
@@ -891,14 +1652,34 @@ async function generateTips(events, sport) {
     const candidates = [];
 
     if (sport.name === 'Football') {
-      // ── Football: Poisson xG model ────────────────────────
+      // ── Football: Dixon-Coles Poisson xG model ───────────
       const tip = await analyseFootballFixture(event, sport);
       if (tip) candidates.push(tip);
+    } else if (sport.name === 'Basketball') {
+      // ── NBA: pace-adjusted scoring model ─────────────────
+      // Falls back to market consensus if stats unavailable
+      const tip = await analyseNBAFixture(event, sport);
+      if (tip) {
+        candidates.push(tip);
+      } else {
+        const h2h = event.bookmakers.map(b => b.markets?.find(m => m.key === 'h2h')).filter(Boolean);
+        if (h2h.length >= 2) { const t = analyseH2H(event, h2h, sport); if (t) candidates.push(t); }
+      }
+    } else if (sport.name === 'Ice Hockey') {
+      // ── NHL: Poisson goals model ──────────────────────────
+      // Falls back to market consensus if stats unavailable
+      const tip = await analyseNHLFixture(event, sport);
+      if (tip) {
+        candidates.push(tip);
+      } else {
+        const h2h = event.bookmakers.map(b => b.markets?.find(m => m.key === 'h2h')).filter(Boolean);
+        if (h2h.length >= 2) { const t = analyseH2H(event, h2h, sport); if (t) candidates.push(t); }
+      }
     } else {
-      // ── Non-football: market consensus (unchanged) ────────
+      // ── NFL / MLB / Other: market consensus ───────────────
       const h2h    = event.bookmakers.map(b => b.markets?.find(m => m.key === 'h2h')).filter(Boolean);
       const totals = event.bookmakers.map(b => b.markets?.find(m => m.key === 'totals')).filter(Boolean);
-      if (h2h.length    >= 2) { const t = analyseH2H(event, h2h, sport);    if (t) candidates.push(t); }
+      if (h2h.length    >= 2) { const t = analyseH2H(event, h2h, sport);     if (t) candidates.push(t); }
       if (totals.length >= 2) { const t = analyseTotals(event, totals, sport); if (t) candidates.push(t); }
     }
 
@@ -1483,7 +2264,7 @@ function startScheduler() {
 // ═══════════════════════════════════════════════════════════════
 
 (async () => {
-  console.log(`\n🟢 The Tipster Engine v4 starting... Season: ${seasonFor()}`);
+  console.log(`\n🟢 The Tipster Engine v6 starting... Season: ${seasonFor()}`);
   await runEngine();
   await settleResults();
   setInterval(runEngine, 15 * 60 * 1000);
@@ -1505,7 +2286,7 @@ http.createServer(async (req, res) => {
 
   if (url.pathname === '/') {
     res.writeHead(200, { ...cors, 'Content-Type': 'text/plain' });
-    res.end(`The Tipster Engine v4 | Season: ${seasonFor()}`); return;
+    res.end(`The Tipster Engine v6 | Season: ${seasonFor()}`); return;
   }
 
   const adminKey = url.searchParams.get('key');
