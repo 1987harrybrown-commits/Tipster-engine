@@ -1024,8 +1024,8 @@ const BDL_BASE            = 'https://api.balldontlie.io';
 
 // These counters are independent of the football budget counter.
 // Each API-Sports API has its own 100/day limit.
-let nbaBudget  = { date: '', used: 0, limit: 80 };
-let nhlBudget  = { date: '', used: 0, limit: 80 };
+let nbaBudget  = { date: '', used: 0, limit: 85 }; // NBA: ~30 teams × 2 calls
+let nhlBudget  = { date: '', used: 0, limit: 90 }; // NHL: ~32 teams × 2 calls
 let bdlBudget  = { date: '', used: 0, limit: 150 }; // BDL free tier is generous
 
 function checkNBABudget(n = 1) {
@@ -1139,15 +1139,22 @@ async function fetchNBATeamStats(teamName) {
   if (!checkNBABudget(2)) { console.log(`⚠️ NBA budget: skipping ${teamName}`); return null; }
 
   try {
-    // Step 1: find team ID
-    const tr = await fetch(
-      `${API_BASKETBALL_BASE}/teams?name=${encodeURIComponent(teamName)}&league=12&season=${season}`,
-      { headers: { 'x-apisports-key': API_FOOTBALL_KEY } }
-    );
-    if (!tr.ok) return null;
-    const td = await tr.json();
-    const team = td.response?.[0];
-    if (!team?.id) return null;
+    // Step 1: find team ID — use permanent cache to save API calls
+    let teamId = permanentTeamIds[`${teamName}_nba`] || null;
+    if (!teamId) {
+      const tr = await fetch(
+        `${API_BASKETBALL_BASE}/teams?name=${encodeURIComponent(teamName)}&league=12&season=${season}`,
+        { headers: { 'x-apisports-key': API_FOOTBALL_KEY } }
+      );
+      if (!tr.ok) return null;
+      const td = await tr.json();
+      const team = td.response?.[0];
+      if (!team?.id) return null;
+      teamId = team.id;
+      permanentTeamIds[`${teamName}_nba`] = teamId;
+    } else {
+      checkNBABudget(-1); // refund the budget check — no call needed
+    }
 
     // Step 2: team statistics for current season (league 12 = NBA)
     const sr = await fetch(
@@ -1349,6 +1356,12 @@ async function analyseNBAFixture(event, sport) {
   }
 }
 
+// ── PERMANENT TEAM ID CACHE ──────────────────────────────────
+// Team ID lookups (name → API id) are cached for the process lifetime.
+// This saves 1 API call per team per day — critical for NHL with 32 teams.
+// Stats (the second call) still refresh daily via the keyed cache.
+const permanentTeamIds = {}; // key: 'teamName_sport' → teamId
+
 // ── NHL TEAM STATS CACHE ──────────────────────────────────────
 const nhlTeamCache = {};
 
@@ -1359,15 +1372,22 @@ async function fetchNHLTeamStats(teamName) {
   if (!checkNHLBudget(2)) { console.log(`⚠️ NHL budget: skipping ${teamName}`); return null; }
 
   try {
-    // Find team
-    const tr = await fetch(
-      `${API_HOCKEY_BASE}/teams?name=${encodeURIComponent(teamName)}&league=57&season=${season}`,
-      { headers: { 'x-apisports-key': API_FOOTBALL_KEY } }
-    );
-    if (!tr.ok) return null;
-    const td = await tr.json();
-    const team = td.response?.[0];
-    if (!team?.id) return null;
+    // Find team ID — use permanent cache to save API calls
+    let teamId = permanentTeamIds[`${teamName}_nhl`] || null;
+    if (!teamId) {
+      const tr = await fetch(
+        `${API_HOCKEY_BASE}/teams?name=${encodeURIComponent(teamName)}&league=57&season=${season}`,
+        { headers: { 'x-apisports-key': API_FOOTBALL_KEY } }
+      );
+      if (!tr.ok) return null;
+      const td = await tr.json();
+      const team = td.response?.[0];
+      if (!team?.id) return null;
+      teamId = team.id;
+      permanentTeamIds[`${teamName}_nhl`] = teamId;
+    } else {
+      checkNHLBudget(-1); // refund the budget check — no call needed
+    }
 
     // Team statistics (league 57 = NHL)
     const sr = await fetch(
