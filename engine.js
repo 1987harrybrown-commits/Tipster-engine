@@ -1740,70 +1740,7 @@ async function saveTips(tips) {
 // [CHANGED] Uses seasonFor() — no hardcoded season.
 // ═══════════════════════════════════════════════════════════════
 
-const fixtureCache = {}, fixtureCacheTime = {};
 
-async function fetchFootballFixtures(leagueId) {
-  const now = Date.now();
-  if (fixtureCache[leagueId] && now - fixtureCacheTime[leagueId] < 2 * 3600000) return fixtureCache[leagueId];
-  try {
-    const from = new Date(now - 4 * 86400000).toISOString().split('T')[0];
-    const to   = new Date().toISOString().split('T')[0];
-
-    // Try three seasons to handle any mid-season scenario.
-    // Current season (e.g. 2025) covers Aug 2025 onward.
-    // Season-1 (e.g. 2024) covers Aug 2024 - May 2025.
-    // We also try without a date range as fallback in case the
-    // free plan restricts date-filtered queries on CL.
-    const currentSeason = seasonFor(leagueId);
-    let fixtures = [];
-
-    // Pass 1: try current season with date range
-    for (const season of [currentSeason, currentSeason - 1]) {
-      const res = await fetch(
-        `${API_FOOTBALL_BASE}/fixtures?league=${leagueId}&season=${season}&from=${from}&to=${to}&status=FT`,
-        { headers: { 'x-apisports-key': API_FOOTBALL_KEY } }
-      );
-      if (!res.ok) continue;
-      const data = await res.json();
-      if (data.errors && Object.keys(data.errors).length) continue;
-      const batch = data.response || [];
-      if (batch.length > 0) { fixtures = batch; break; }
-    }
-
-    // Pass 2: if still empty, try without date range (last=10 recent FT games)
-    // This catches cases where the free plan blocks date-filtered CL queries
-    if (!fixtures.length) {
-      for (const season of [currentSeason, currentSeason - 1]) {
-        const res = await fetch(
-          `${API_FOOTBALL_BASE}/fixtures?league=${leagueId}&season=${season}&status=FT&last=20`,
-          { headers: { 'x-apisports-key': API_FOOTBALL_KEY } }
-        );
-        if (!res.ok) continue;
-        const data = await res.json();
-        if (data.errors && Object.keys(data.errors).length) continue;
-        const batch = data.response || [];
-        if (batch.length > 0) {
-          // Filter to only games played in the last 4 days
-          const cutoff = now - 4 * 86400000;
-          fixtures = batch.filter(f => new Date(f.fixture.date).getTime() >= cutoff);
-          if (fixtures.length > 0) break;
-        }
-      }
-    }
-
-    // Deduplicate by fixture ID
-    const seen = new Set();
-    fixtures = fixtures.filter(f => {
-      if (seen.has(f.fixture.id)) return false;
-      seen.add(f.fixture.id); return true;
-    });
-
-    console.log(`Settler: league ${leagueId} — ${fixtures.length} recent FT fixtures found`);
-    fixtureCache[leagueId] = fixtures;
-    fixtureCacheTime[leagueId] = now;
-    return fixtures;
-  } catch(e) { console.error('Fixture fetch error:', e.message); return []; }
-}
 
 async function settleResults() {
   const { data: pending } = await supabase.from('tips').select('*').eq('status','pending').lt('event_time', new Date().toISOString());
@@ -1825,18 +1762,26 @@ async function settleResults() {
       let homeScore = null, awayScore = null;
 
       if (tip.sport === 'Football') {
+        // Use Odds API scores endpoint for football settlement.
+        // Works for all leagues including Champions League with no season restrictions.
+        // No API-Football budget consumed — 1 Odds API credit per call, cached per sport.
         const sport = SPORTS.find(s => s.league === tip.league);
-        if (!sport?.leagueId) continue;
-        const fixtures = await fetchFootballFixtures(sport.leagueId);
-        const f = fixtures.find(f => {
-          const h = f.teams?.home?.name || '', a = f.teams?.away?.name || '';
-          return (nameMatch(h, tip.home_team) && nameMatch(a, tip.away_team)) ||
-                 (nameMatch(h, tip.away_team) && nameMatch(a, tip.home_team));
-        });
-        if (!f) { console.log(`⏳ No result: ${tip.home_team} vs ${tip.away_team}`); continue; }
-        const hh = nameMatch(f.teams.home.name, tip.home_team);
-        homeScore = hh ? f.goals.home : f.goals.away;
-        awayScore = hh ? f.goals.away : f.goals.home;
+        if (!sport) continue;
+        try {
+          const res = await fetch(`${ODDS_BASE}/sports/${sport.key}/scores/?apiKey=${ODDS_API_KEY}&daysFrom=3`);
+          if (!res.ok) { console.log(`⏳ Scores API error ${res.status}: ${tip.home_team} vs ${tip.away_team}`); continue; }
+          const scores = await res.json();
+          const match = scores.find(s => s.completed && (
+            (nameMatch(s.home_team, tip.home_team) && nameMatch(s.away_team, tip.away_team)) ||
+            (nameMatch(s.home_team, tip.away_team) && nameMatch(s.away_team, tip.home_team))
+          ));
+          if (!match?.scores) { console.log(`⏳ No result yet: ${tip.home_team} vs ${tip.away_team}`); continue; }
+          const hh = nameMatch(match.home_team, tip.home_team);
+          const hs = parseFloat(match.scores.find(s => nameMatch(s.name, match.home_team))?.score || 0);
+          const as2 = parseFloat(match.scores.find(s => nameMatch(s.name, match.away_team))?.score || 0);
+          homeScore = hh ? hs : as2;
+          awayScore = hh ? as2 : hs;
+        } catch(e) { console.error(`Scores fetch error:`, e.message); continue; }
 
       } else if (['Basketball','Ice Hockey','NFL','Baseball'].includes(tip.sport)) {
         const sport = SPORTS.find(s => s.name === tip.sport && s.league === tip.league);
