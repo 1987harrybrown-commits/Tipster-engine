@@ -1749,16 +1749,14 @@ async function fetchFootballFixtures(leagueId) {
     const from = new Date(now - 3 * 86400000).toISOString().split('T')[0];
     const to   = new Date().toISOString().split('T')[0];
 
-    // Try current season first, then fall back to previous season.
-    // This handles mid-season deployment where tips were generated in
-    // season N but the date has rolled past July into a new year.
-    // e.g. CL tips from Feb 2025 stored as season=2024, but today
-    // seasonFor() returns 2025 — so we must also check 2024.
+    // Try current season first, then ALWAYS fall back to previous season if empty.
+    // Settler uses its own direct fetch — NOT shared with the tip model budget.
+    // This is critical: CL tips from season=2024 must settle even when
+    // seasonFor() returns 2025 after the July rollover.
     const seasons = [seasonFor(leagueId), seasonFor(leagueId) - 1];
     let fixtures = [];
 
     for (const season of seasons) {
-      if (!budgetCheck(1)) break;
       const res = await fetch(
         `${API_FOOTBALL_BASE}/fixtures?league=${leagueId}&season=${season}&from=${from}&to=${to}&status=FT`,
         { headers: { 'x-apisports-key': API_FOOTBALL_KEY } }
@@ -1768,10 +1766,10 @@ async function fetchFootballFixtures(leagueId) {
       if (data.errors && Object.keys(data.errors).length) continue;
       const batch = data.response || [];
       fixtures = fixtures.concat(batch);
-      if (batch.length > 0) break; // found results — no need to check prior season
+      if (batch.length > 0) break; // found results in this season — stop
     }
 
-    // Deduplicate by fixture ID (in case of overlap)
+    // Deduplicate by fixture ID
     const seen = new Set();
     fixtures = fixtures.filter(f => {
       if (seen.has(f.fixture.id)) return false;
@@ -1914,7 +1912,7 @@ async function updateStatsCache() {
 // ═══════════════════════════════════════════════════════════════
 
 async function runEngine() {
-  console.log(`\n🚀 Engine v4 — ${new Date().toLocaleString('en-GB', { timeZone: 'Europe/London' })}`);
+  console.log(`\n🚀 Engine v6 — ${new Date().toLocaleString('en-GB', { timeZone: 'Europe/London' })}`);
   console.log('═'.repeat(52));
   let all = [];
   for (const sport of SPORTS) {
