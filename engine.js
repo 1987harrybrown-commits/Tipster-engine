@@ -1731,23 +1731,45 @@ async function saveTips(tips) {
   for (const tip of tips) {
     try {
       const date = new Date(tip.event_time).toISOString().split('T')[0];
-      const { data: existing } = await supabase.from('tips').select('tip_ref, confidence, odds')
+      const { data: existing } = await supabase.from('tips').select('tip_ref, confidence, odds, best_odds, bookmaker')
         .eq('home_team', tip.home_team).eq('away_team', tip.away_team)
         .gte('event_time', `${date}T00:00:00Z`).lte('event_time', `${date}T23:59:59Z`)
         .eq('status', 'pending').maybeSingle();
 
       if (existing) {
-        if (tip.confidence > existing.confidence + 2 || tip.odds > existing.odds + 0.05) {
+        // Always refresh odds and bookmaker — lines move every 15 minutes.
+        // Also update confidence, stake and notes if the model reprices.
+        // Only skip if literally nothing has changed (within tiny float tolerance).
+        const oddsDiff = Math.abs(tip.odds - existing.odds);
+        const confDiff = Math.abs(tip.confidence - existing.confidence);
+        const bookChanged = tip.bookmaker !== existing.bookmaker;
+
+        // Track the best (highest) odds seen for this tip across all refreshes.
+        // Settlement P&L uses best_odds so ROI reflects the most favourable
+        // price a subscriber could have taken, not just the final price.
+        const currentBest = parseFloat(existing.best_odds || existing.odds || 0);
+        const newBest = Math.max(currentBest, tip.odds);
+        const bestOddsImproved = newBest > currentBest + 0.001;
+
+        if (oddsDiff > 0.01 || confDiff > 1 || bookChanged || bestOddsImproved) {
           await supabase.from('tips').update({
-            selection: tip.selection, market: tip.market, odds: tip.odds,
-            confidence: tip.confidence, stake: tip.stake, bookmaker: tip.bookmaker, notes: tip.notes,
+            odds:       tip.odds,
+            best_odds:  newBest,
+            bookmaker:  tip.bookmaker,
+            confidence: tip.confidence,
+            stake:      tip.stake,
+            selection:  tip.selection,
+            market:     tip.market,
+            notes:      tip.notes,
           }).eq('tip_ref', existing.tip_ref);
           updated++;
         } else { skipped++; }
         continue;
       }
 
-      const { error } = await supabase.from('tips').insert(tip);
+      // Set best_odds = starting odds on first insert
+      const tipWithBest = { ...tip, best_odds: tip.odds };
+      const { error } = await supabase.from('tips').insert(tipWithBest);
       if (error) { if (error.code === '23505') skipped++; else console.error('Insert error:', error.message); }
       else saved++;
     } catch(e) { console.error('saveTips error:', e.message); }
@@ -1838,7 +1860,13 @@ async function settleResults() {
         won = homeScore > 0 && awayScore > 0;
       }
 
-      const pl = won ? parseFloat(((tip.odds - 1) * tip.stake).toFixed(2)) : parseFloat((-tip.stake).toFixed(2));
+      // Use best_odds for P&L — reflects the highest price seen during the tip's
+      // lifetime, which is the most favourable price subscribers could have taken.
+      // Falls back to tip.odds if best_odds not yet stored (legacy tips).
+      const settlementOdds = parseFloat(tip.best_odds || tip.odds);
+      const pl = won
+        ? parseFloat(((settlementOdds - 1) * tip.stake).toFixed(2))
+        : parseFloat((-tip.stake).toFixed(2));
 
       const { data: already } = await supabase.from('results_history').select('id').eq('tip_ref', tip.tip_ref).maybeSingle();
       if (already) {
@@ -1852,14 +1880,20 @@ async function settleResults() {
       await supabase.from('tips').update({ status: won ? 'won' : 'lost', profit_loss: pl, result_updated_at: new Date().toISOString() }).eq('tip_ref', tip.tip_ref);
 
       await supabase.from('results_history').insert({
-        tip_ref: tip.tip_ref, sport: tip.sport,
-        event: `${tip.home_team} vs ${tip.away_team}`,
-        selection: tip.selection, odds: tip.odds, stake: tip.stake,
-        tier: tip.tier || 'pro', result: won ? 'WON' : 'LOST',
-        profit_loss: pl, running_pl: runningPL, settled_at: new Date().toISOString(),
+        tip_ref:    tip.tip_ref,
+        sport:      tip.sport,
+        event:      `${tip.home_team} vs ${tip.away_team}`,
+        selection:  tip.selection,
+        odds:       settlementOdds,   // best odds seen — used for P&L
+        stake:      tip.stake,
+        tier:       tip.tier || 'pro',
+        result:     won ? 'WON' : 'LOST',
+        profit_loss: pl,
+        running_pl:  runningPL,
+        settled_at:  new Date().toISOString(),
       });
 
-      console.log(`${won ? '✅ WON' : '❌ LOST'}: [${tip.tip_ref}] ${tip.home_team} vs ${tip.away_team} — ${tip.selection} @ ${tip.odds} (${pl >= 0 ? '+' : ''}${pl}u)`);
+      console.log(`${won ? '✅ WON' : '❌ LOST'}: [${tip.tip_ref}] ${tip.home_team} vs ${tip.away_team} — ${tip.selection} @ ${settlementOdds}${settlementOdds > tip.odds ? ' (best: '+settlementOdds+' vs current: '+tip.odds+')' : ''} (${pl >= 0 ? '+' : ''}${pl}u)`);
       count++;
       await updateStatsCache();
 
