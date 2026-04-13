@@ -2066,7 +2066,7 @@ async function updateStatsCache() {
 // ═══════════════════════════════════════════════════════════════
 
 async function runEngine() {
-  console.log(`\n🚀 Engine v7 — ${new Date().toLocaleString('en-GB', { timeZone: 'Europe/London' })}`);
+  console.log(`\n🚀 Engine v7.1 — ${new Date().toLocaleString('en-GB', { timeZone: 'Europe/London' })}`);
   console.log('═'.repeat(52));
   let all = [];
   for (const sport of SPORTS) {
@@ -2471,7 +2471,7 @@ http.createServer(async (req, res) => {
 
   if (url.pathname === '/') {
     res.writeHead(200, { ...cors, 'Content-Type': 'text/plain' });
-    res.end(`The Tipster Engine v7 | Season: ${seasonFor()}`); return;
+    res.end(`The Tipster Engine v7.1 | Season: ${seasonFor()}`); return;
   }
 
   const adminKey = url.searchParams.get('key');
