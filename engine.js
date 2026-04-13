@@ -1851,6 +1851,14 @@ async function generateTips(events, sport) {
 async function saveTips(tips) {
   if (!tips.length) return;
   let saved = 0, updated = 0, skipped = 0;
+  // Hard block — never write Baseball or NFL to database regardless of source
+  const BLOCKED_SPORTS = ['Baseball', 'NFL'];
+  const filtered = tips.filter(t => !BLOCKED_SPORTS.includes(t.sport));
+  if (filtered.length !== tips.length) {
+    console.log(`🚫 Blocked ${tips.length - filtered.length} tips from removed sports`);
+  }
+  tips = filtered;
+  if (!tips.length) return;
 
   for (const tip of tips) {
     try {
@@ -2441,7 +2449,7 @@ function startScheduler() {
 // ═══════════════════════════════════════════════════════════════
 
 (async () => {
-  console.log(`\n🟢 The Tipster Engine v7 (Strict Rules) starting... Season: ${seasonFor()}`);
+  console.log(`\n🟢 The Tipster Engine v7.1 (Baseball Hard Block) starting... Season: ${seasonFor()}`);
   await runEngine();
   await settleResults();
   setInterval(runEngine, 15 * 60 * 1000);
