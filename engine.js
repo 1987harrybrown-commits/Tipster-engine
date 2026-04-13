@@ -1,5 +1,5 @@
 // ============================================================
-// THE TIPSTER EDGE — Engine v6
+// THE TIPSTER EDGE — Engine v7 (Strict Rules Edition)
 // ============================================================
 // Schedule:
 //   Odds fetch     → every 15 minutes
@@ -8,11 +8,14 @@
 //   Stats cache    → recalculates on each settlement
 //   Emails         → Pro 07:00, Free 08:30, Saturday 08:00 UK
 //
-// Football tips use a Poisson xG model (built inline below).
-// NBA + NHL use stats-based scoring models (API-Sports Basketball/Hockey).
-// NFL and MLB use market consensus (insufficient free API data).
-// Tip IDs: sport-prefixed 10-char alphanumeric ref e.g. FB-A3X9K2
-// Min confidence: 75%
+// STRICT RULES ENGINE — target ROI: 30%+
+//   Sports:  Ice Hockey (primary), Basketball (primary), Football (secondary)
+//   Markets: H2H win markets + Overs (secondary, stricter rules)
+//   Removed: Baseball, NFL, Unders, all props
+//   Odds:    1.40–2.20 core | 2.21–2.50 elite only | reject outside
+//   Edge:    H2H ≥ 8% | Overs ≥ 12% | Elite grade requires ≥ 10% (H2H) / 14% (Overs)
+//   Grades:  A+ (2–2.5u) | A (1.5u) | below A = no bet
+//   Line:    Reject if odds moved ≥ 0.10 against; allow if improved
 // ============================================================
 
 const { createClient } = require('@supabase/supabase-js');
@@ -41,14 +44,26 @@ const SPORTS = [
   { key: 'soccer_france_ligue_one',   name: 'Football',   league: 'Ligue 1',          leagueId: 61  },
   { key: 'soccer_uefa_champs_league', name: 'Football',   league: 'Champions League', leagueId: 2   },
   { key: 'basketball_nba',            name: 'Basketball', league: 'NBA' },
-  { key: 'americanfootball_nfl',      name: 'NFL',        league: 'NFL' },
-  { key: 'baseball_mlb',              name: 'Baseball',   league: 'MLB' },
+  // REMOVED: americanfootball_nfl — insufficient model data
+  // REMOVED: baseball_mlb — permanently excluded, no edge
   { key: 'icehockey_nhl',             name: 'Ice Hockey', league: 'NHL' },
 ];
 
-const MIN_CONFIDENCE  = 75;
-const MIN_EDGE_PCT    = 5;    // minimum model edge % to tip a football market
-const MATRIX_MAX_GOALS = 8;  // score matrix built 0..8 each side
+// ── STRICT RULES ENGINE CONSTANTS ────────────────────────────
+// These constants define the hard-rule filter applied to ALL tips
+// before they are saved. If a tip fails any rule, it is silently dropped.
+const MIN_CONFIDENCE    = 78;   // minimum confidence to publish
+const MIN_EDGE_PCT      = 8;    // H2H minimum edge %
+const OVERS_MIN_EDGE    = 12;   // Overs minimum edge % (stricter than H2H)
+const ELITE_H2H_EDGE    = 10;   // H2H edge required for A+ grade
+const ELITE_OVERS_EDGE  = 14;   // Overs edge required for A+ grade
+const ODDS_MIN          = 1.40; // reject below this
+const ODDS_CORE_MAX     = 2.20; // core range ceiling
+const ODDS_ELITE_MAX    = 2.50; // absolute ceiling (elite selections only)
+const LINE_MOVE_REJECT  = 0.10; // reject if odds moved this much AGAINST selection
+const MATRIX_MAX_GOALS  = 8;   // score matrix built 0..8 each side
+// Football is SECONDARY — applies stricter edge (+2%) relative to H2H minimum
+const FOOTBALL_EDGE_PREMIUM = 2;
 
 // ─── UNIQUE TIP ID ────────────────────────────────────────────
 function generateTipRef(sport) {
@@ -674,12 +689,13 @@ function kellyStake(modelProb, decimalOdds, fraction = 0.25) {
   const full = (b * modelProb - q) / b;
   if (full <= 0) return 0; // negative Kelly = no bet
   const sized = full * fraction;
-  // Map to site's unit display: 0.5u, 1u, 1.5u, 2u, 2.5u, 3u
-  if (sized >= 0.20) return 3.0;
-  if (sized >= 0.14) return 2.5;
-  if (sized >= 0.10) return 2.0;
-  if (sized >= 0.07) return 1.5;
-  if (sized >= 0.04) return 1.0;
+  // Tightened thresholds — only size up when Kelly genuinely justifies it.
+  // Marginal-edge tips get 0.5u. Strong edge needed for 2u+.
+  if (sized >= 0.25) return 3.0;
+  if (sized >= 0.18) return 2.5;
+  if (sized >= 0.13) return 2.0;
+  if (sized >= 0.09) return 1.5;
+  if (sized >= 0.06) return 1.0;
   return 0.5;
 }
 
@@ -912,7 +928,7 @@ async function analyseFootballFixture(event, sport) {
     // Draw — extra hurdle (+3%): draws are genuinely harder to price
     if (market.drawOdds >= 2.50 && draw > 0.22 && market.trueDraw > 0) {
       const edge = calcEdge(draw, market.trueDraw);
-      if (edge >= MIN_EDGE_PCT + 3) {
+      if (edge >= MIN_EDGE_PCT + 5) { // +5% extra hurdle — draws are noisiest market
         const kelly = kellyStake(draw, market.drawOdds);
         if (kelly > 0) {
           const fq   = getFormQuality(hf, af, 'draw');
@@ -1655,6 +1671,110 @@ function analyseTotals(event, books, sport) {
   } catch(e) { return null; }
 }
 
+
+// ═══════════════════════════════════════════════════════════════
+// STRICT RULES ENGINE — v7
+// ═══════════════════════════════════════════════════════════════
+// Every tip candidate passes through this filter before being saved.
+// If any rule fails, the tip is silently dropped — no output, no log.
+// Rules are applied in this order:
+//   1. Sport allowed
+//   2. Market allowed
+//   3. Odds range
+//   4. Edge threshold (market + sport specific)
+//   5. Line movement check
+//   6. Grade assignment (A+ or A only — below A = reject)
+//   7. Stake assignment from grade
+//
+// EXACT THRESHOLDS (not to be changed without documented evidence):
+//   H2H edge:      ≥ 8%  (Football: ≥ 10% due to secondary status)
+//   Overs edge:    ≥ 12% (Football overs: not allowed)
+//   Elite H2H:     ≥ 10% (Football: ≥ 12%)
+//   Elite Overs:   ≥ 14%
+//   Odds min:      1.40
+//   Odds core max: 2.20
+//   Odds elite max:2.50 (only A+ grade can reach this band)
+//   Line move:     reject if odds dropped ≥ 0.10 vs opening price stored in best_odds
+// ═══════════════════════════════════════════════════════════════
+
+function applyStrictRules(tip, existingBestOdds = null) {
+  // ── Rule 1: Sport must be allowed ──────────────────────────
+  const ALLOWED_SPORTS = ['Ice Hockey', 'Basketball', 'Football'];
+  if (!ALLOWED_SPORTS.includes(tip.sport)) return null;
+
+  // ── Rule 2: Market must be allowed ─────────────────────────
+  // H2H (win) always allowed for approved sports.
+  // Totals (overs) allowed for Ice Hockey and Basketball only.
+  // Football: H2H only. No totals. No unders.
+  const isH2H    = tip.market === 'h2h';
+  const isTotals = tip.market === 'totals';
+  const isOver   = isTotals && (tip.selection||'').toLowerCase().startsWith('over');
+  const isUnder  = isTotals && (tip.selection||'').toLowerCase().startsWith('under');
+  const isFootball = tip.sport === 'Football';
+
+  if (!isH2H && !isTotals) return null;           // unknown market
+  if (isUnder) return null;                        // Unders: banned
+  if (isFootball && isTotals) return null;         // Football overs: banned
+  if (isTotals && isFootball) return null;         // belt and braces
+
+  // ── Rule 3: Odds range ─────────────────────────────────────
+  const odds = parseFloat(tip.odds || 0);
+  if (odds < ODDS_MIN) return null;               // below 1.40: reject
+  if (odds > ODDS_ELITE_MAX) return null;         // above 2.50: reject always
+
+  // ── Rule 4: Edge threshold (sport + market specific) ───────
+  const edge = parseFloat(tip.confidence || 0) - (1 / odds) * 100;
+
+  // Football is secondary — requires higher edge than primary sports
+  const h2hMin    = isFootball ? MIN_EDGE_PCT + FOOTBALL_EDGE_PREMIUM : MIN_EDGE_PCT;
+  const eliteH2H  = isFootball ? ELITE_H2H_EDGE + FOOTBALL_EDGE_PREMIUM : ELITE_H2H_EDGE;
+
+  if (isH2H && edge < h2hMin) return null;
+  if (isOver && edge < OVERS_MIN_EDGE) return null;
+
+  // ── Rule 5: Line movement check ────────────────────────────
+  // If we have a stored best_odds (highest price seen), and current odds
+  // have dropped materially below that, the market has moved against us.
+  // This is a sharp signal that we are on the wrong side.
+  if (existingBestOdds && existingBestOdds > 0) {
+    const lineMove = existingBestOdds - odds; // positive = odds shortened (bad)
+    if (lineMove >= LINE_MOVE_REJECT) return null; // moved ≥ 0.10 against: reject
+  }
+
+  // ── Rule 6: Odds band restriction for elite range ──────────
+  // 2.21–2.50 is only accessible to A+ grade selections.
+  // Determine grade first, then enforce band restriction.
+  let grade;
+  if (isH2H) {
+    grade = edge >= eliteH2H ? 'A+' : edge >= h2hMin ? 'A' : null;
+  } else {
+    // Overs
+    grade = edge >= ELITE_OVERS_EDGE ? 'A+' : edge >= OVERS_MIN_EDGE ? 'A' : null;
+  }
+
+  if (!grade) return null;                        // below A: reject
+  if (odds > ODDS_CORE_MAX && grade !== 'A+') return null; // 2.21–2.50: A+ only
+
+  // ── Rule 7: Stake from grade ───────────────────────────────
+  // A+ in elite odds band (2.21–2.50): 2u (slightly reduced for higher variance)
+  // A+ in core odds band (1.40–2.20):  2.5u
+  // A:                                 1.5u
+  let stake;
+  if (grade === 'A+') {
+    stake = odds > ODDS_CORE_MAX ? 2.0 : 2.5;
+  } else {
+    stake = 1.5;
+  }
+
+  // ── Output: attach grade and corrected stake ────────────────
+  return {
+    ...tip,
+    stake,
+    confidence: tip.confidence, // unchanged — model probability stays
+    notes: (tip.notes || '') + ` | Grade: ${grade} | Edge: +${edge.toFixed(1)}%`,
+  };
+}
+
 // ═══════════════════════════════════════════════════════════════
 // TIP GENERATION — ONE tip per game
 // [CHANGED] Football goes through analyseFootballFixture.
@@ -1715,7 +1835,11 @@ async function generateTips(events, sport) {
     }
 
     if (!candidates.length) continue;
-    tips.push(candidates.reduce((a,b) => a.confidence >= b.confidence ? a : b));
+    // Pick highest-confidence candidate, then apply strict rules filter.
+    // If the winner fails any rule, the game produces no tip — silent drop.
+    const best = candidates.reduce((a,b) => a.confidence >= b.confidence ? a : b);
+    const approved = applyStrictRules(best);
+    if (approved) tips.push(approved);
   }
   return tips;
 }
@@ -1825,7 +1949,7 @@ async function settleResults() {
           awayScore = hh ? as2 : hs;
         } catch(e) { console.error(`Scores fetch error:`, e.message); continue; }
 
-      } else if (['Basketball','Ice Hockey','NFL','Baseball'].includes(tip.sport)) {
+      } else if (['Basketball','Ice Hockey'].includes(tip.sport)) { // NFL and Baseball removed
         const sport = SPORTS.find(s => s.name === tip.sport && s.league === tip.league);
         if (!sport) continue;
         const res = await fetch(`${ODDS_BASE}/sports/${sport.key}/scores/?apiKey=${ODDS_API_KEY}&daysFrom=3`);
@@ -1934,7 +2058,7 @@ async function updateStatsCache() {
 // ═══════════════════════════════════════════════════════════════
 
 async function runEngine() {
-  console.log(`\n🚀 Engine v6 — ${new Date().toLocaleString('en-GB', { timeZone: 'Europe/London' })}`);
+  console.log(`\n🚀 Engine v7 — ${new Date().toLocaleString('en-GB', { timeZone: 'Europe/London' })}`);
   console.log('═'.repeat(52));
   let all = [];
   for (const sport of SPORTS) {
@@ -2317,7 +2441,7 @@ function startScheduler() {
 // ═══════════════════════════════════════════════════════════════
 
 (async () => {
-  console.log(`\n🟢 The Tipster Engine v6 starting... Season: ${seasonFor()}`);
+  console.log(`\n🟢 The Tipster Engine v7 (Strict Rules) starting... Season: ${seasonFor()}`);
   await runEngine();
   await settleResults();
   setInterval(runEngine, 15 * 60 * 1000);
@@ -2339,7 +2463,7 @@ http.createServer(async (req, res) => {
 
   if (url.pathname === '/') {
     res.writeHead(200, { ...cors, 'Content-Type': 'text/plain' });
-    res.end(`The Tipster Engine v6 | Season: ${seasonFor()}`); return;
+    res.end(`The Tipster Engine v7 | Season: ${seasonFor()}`); return;
   }
 
   const adminKey = url.searchParams.get('key');
