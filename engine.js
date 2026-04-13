@@ -2551,34 +2551,41 @@ http.createServer(async (req, res) => {
     return;
   }
 
+  if (url.pathname === '/verify-pro' && req.method === 'POST') {
+    let body = '';
+    req.on('data', c => { body += c.toString(); });
+    req.on('end', async () => {
+      try {
+        const { userId } = JSON.parse(body);
+        if (!userId) { res.writeHead(400, cors); res.end('Missing userId'); return; }
+        const { data: user } = await supabase
+          .from('users')
+          .select('stripe_customer_id, stripe_subscription_id, subscription_status')
+          .eq('id', userId)
+          .single();
+        if (!user?.stripe_subscription_id) {
+          res.writeHead(200, { ...cors, 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ isPro: false })); return;
+        }
+        const sub = await stripeRequest(`/subscriptions/${user.stripe_subscription_id}`);
+        const isPro = sub && (sub.status === 'active' || sub.status === 'trialing');
+        // Correct database if out of sync
+        if (!isPro && user.subscription_status === 'pro') {
+          await supabase.from('users').update({ subscription_status: 'free' }).eq('id', userId);
+          console.log(`🔒 Auto-corrected Pro→Free for user ${userId} (Stripe: ${sub?.status})`);
+        }
+        res.writeHead(200, { ...cors, 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ isPro: !!isPro }));
+      } catch(e) {
+        res.writeHead(500, cors);
+        res.end(JSON.stringify({ error: e.message }));
+      }
+    });
+    return;
+  }
+
   res.writeHead(404); res.end('Not found');
 
 }).listen(process.env.PORT || 3000, () => {
   console.log(`🟢 HTTP server on port ${process.env.PORT || 3000}`);
 });
-// Add to the HTTP server routes
-if (url.pathname === '/verify-pro' && req.method === 'POST') {
-  const { userId } = body;
-  const { data: user } = await supabase
-    .from('users')
-    .select('stripe_customer_id, stripe_subscription_id')
-    .eq('id', userId)
-    .single();
-  
-  if (!user?.stripe_subscription_id) {
-    res.end(JSON.stringify({ isPro: false })); return;
-  }
-  
-  // Check live Stripe subscription status
-  const sub = await stripeRequest(`/subscriptions/${user.stripe_subscription_id}`);
-  const isPro = sub.status === 'active' || sub.status === 'trialing';
-  
-  // Correct the database if it's wrong
-  if (!isPro && user.subscription_status === 'pro') {
-    await supabase.from('users').update({ subscription_status: 'free' })
-      .eq('id', userId);
-  }
-  
-  res.end(JSON.stringify({ isPro }));
-  return;
-}
