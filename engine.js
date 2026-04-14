@@ -2022,7 +2022,7 @@ async function settleResults() {
         result:     won ? 'WON' : 'LOST',
         profit_loss: pl,
         running_pl:  runningPL,
-        settled_at:  new Date().toISOString(),
+        settled_at:  tip.event_time,
       });
 
       console.log(`${won ? '✅ WON' : '❌ LOST'}: [${tip.tip_ref}] ${tip.home_team} vs ${tip.away_team} — ${tip.selection} @ ${settlementOdds}${settlementOdds > tip.odds ? ' (best: '+settlementOdds+' vs current: '+tip.odds+')' : ''} (${pl >= 0 ? '+' : ''}${pl}u)`);
