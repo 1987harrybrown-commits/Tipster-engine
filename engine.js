@@ -2033,6 +2033,7 @@ async function settleResults() {
     } catch(e) { console.error(`Settle error [${tip.tip_ref}]:`, e.message); }
   }
   console.log(`🏁 Settled ${count} tips.`);
+  await settleDailyAccas();
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -2251,6 +2252,128 @@ async function getSaturdayAcca() {
   return { selections: sels, combinedOdds: sels.reduce((a,s) => a * parseFloat(s.odds), 1), reasoning: `${sels.length} high-confidence selections from today's card. All carry 72%+ model confidence. Recommended 0.5u each-way.` };
 }
 
+// ═══════════════════════════════════════════════════════════════
+// DAILY ACCA GENERATOR
+// Runs at 07:00 UK. Finds sport with most 84%+ confidence tips,
+// builds acca, saves to daily_accas table. Admin-only for now.
+// Rules:
+//   Min confidence: 84%
+//   Sport: whichever has most 84%+ tips today
+//   Skip if only 1 qualifying tip
+//   Stake: 2 legs = 2u, 3 legs = 2u, 4+ legs = 1u
+//   Combined odds: multiply all leg odds
+//   Result settled separately by settleDailyAccas()
+// ═══════════════════════════════════════════════════════════════
+
+async function generateDailyAcca() {
+  const today = new Date().toLocaleDateString('en-CA', { timeZone: 'Europe/London' });
+  console.log(`🎯 Generating daily acca for ${today}...`);
+
+  // Check if already generated today
+  const { data: existing } = await supabase.from('daily_accas').select('id').eq('date', today).maybeSingle();
+  if (existing) { console.log('🎯 Acca already generated today.'); return; }
+
+  // Get all pending tips with 84%+ confidence for today
+  const ukStart = new Date(`${today}T00:00:00`);
+  const ukEnd   = new Date(`${today}T23:59:59`);
+  const { data: tips } = await supabase.from('tips').select('*')
+    .eq('status', 'pending')
+    .gte('confidence', 84)
+    .gte('event_time', ukStart.toISOString())
+    .lte('event_time', ukEnd.toISOString())
+    .order('confidence', { ascending: false });
+
+  if (!tips || tips.length === 0) { console.log('🎯 No tips at 84%+ today — skipping acca.'); return; }
+
+  // Group by sport, find sport with most qualifying tips
+  const bySport = {};
+  for (const t of tips) {
+    if (!bySport[t.sport]) bySport[t.sport] = [];
+    bySport[t.sport].push(t);
+  }
+  const topSport = Object.entries(bySport).sort((a,b) => b[1].length - a[1].length)[0];
+  const [sport, legs] = topSport;
+
+  // Skip if only 1 qualifying tip
+  if (legs.length < 2) { console.log(`🎯 Only ${legs.length} tip(s) at 84%+ for ${sport} — skipping.`); return; }
+
+  // Calculate combined odds (multiply all leg odds)
+  const combinedOdds = legs.reduce((acc, t) => acc * parseFloat(t.odds), 1);
+
+  // Stake: 2-3 legs = 2u, 4+ legs = 1u
+  const stake = legs.length >= 4 ? 1 : 2;
+
+  // Build selections array
+  const selections = legs.map(t => ({
+    tip_ref:   t.tip_ref,
+    match:     `${t.home_team} vs ${t.away_team}`,
+    selection: t.selection,
+    odds:      parseFloat(t.odds),
+    league:    t.league,
+    confidence: t.confidence,
+    event_time: t.event_time,
+  }));
+
+  // Save to daily_accas table
+  const { error } = await supabase.from('daily_accas').insert({
+    date:          today,
+    sport,
+    legs:          legs.length,
+    selections,
+    combined_odds: parseFloat(combinedOdds.toFixed(4)),
+    stake,
+    result:        'PENDING',
+    profit_loss:   null,
+  });
+
+  if (error) { console.error('🎯 Acca insert error:', error.message); return; }
+  console.log(`🎯 Daily acca saved: ${legs.length} legs, ${sport}, combined odds ${combinedOdds.toFixed(2)}, stake ${stake}u`);
+}
+
+// ═══════════════════════════════════════════════════════════════
+// DAILY ACCA SETTLER
+// Called inside settleResults loop. Checks pending accas and
+// settles them once all legs have a result.
+// ═══════════════════════════════════════════════════════════════
+
+async function settleDailyAccas() {
+  const { data: pending } = await supabase.from('daily_accas').select('*').eq('result', 'PENDING');
+  if (!pending?.length) return;
+
+  for (const acca of pending) {
+    const tipRefs = acca.selections.map(s => s.tip_ref);
+
+    // Fetch current status of all legs
+    const { data: tips } = await supabase.from('tips').select('tip_ref, status').in('tip_ref', tipRefs);
+    if (!tips || tips.length !== tipRefs.length) continue;
+
+    const statuses = tips.map(t => t.status);
+
+    // If any leg is still pending, skip for now
+    if (statuses.includes('pending')) continue;
+
+    // If any leg is void, mark acca as void
+    if (statuses.includes('void')) {
+      await supabase.from('daily_accas').update({ result: 'VOID', profit_loss: 0 }).eq('id', acca.id);
+      console.log(`🎯 Acca ${acca.date} VOID (leg voided)`);
+      continue;
+    }
+
+    // All legs settled — check if all won
+    const allWon = statuses.every(s => s === 'won');
+    const pl = allWon
+      ? parseFloat(((acca.combined_odds - 1) * acca.stake).toFixed(2))
+      : parseFloat((-acca.stake).toFixed(2));
+
+    await supabase.from('daily_accas').update({
+      result:      allWon ? 'WON' : 'LOST',
+      profit_loss: pl,
+    }).eq('id', acca.id);
+
+    console.log(`🎯 Acca ${acca.date} ${allWon ? 'WON' : 'LOST'} ${pl >= 0 ? '+' : ''}${pl}u`);
+  }
+}
+
 async function sendProEmails() {
   console.log('📧 Pro dispatch 07:00...');
   const tips = await getTodaysTips(15);
@@ -2419,7 +2542,7 @@ async function handleStripeWebhook(event) {
 // SCHEDULER — UNCHANGED
 // ═══════════════════════════════════════════════════════════════
 
-let lastProDate = '', lastFreeDate = '', lastSatDate = '', lastFormDate2 = '';
+let lastProDate = '', lastFreeDate = '', lastSatDate = '', lastFormDate2 = '', lastAccaDate = '';
 
 function startScheduler() {
   setInterval(async () => {
@@ -2430,7 +2553,7 @@ function startScheduler() {
     const isSat = uk.getDay() === 6;
 
     if (h === 6  && m === 0  && lastFormDate2 !== today) { lastFormDate2 = today; await fetchAllFormData(); }
-    if (h === 7  && m === 0  && lastProDate   !== today) { lastProDate   = today; await sendProEmails();    }
+    if (h === 7  && m === 0  && lastProDate   !== today) { lastProDate   = today; await sendProEmails(); await generateDailyAcca(); }
     if (h === 8  && m === 30 && lastFreeDate  !== today) { lastFreeDate  = today; await sendDailyEmails(); }
     if (isSat && h === 8 && m === 0 && lastSatDate !== today) { lastSatDate = today; await sendSaturdayEmails(); }
   }, 60 * 1000);
@@ -2494,6 +2617,13 @@ http.createServer(async (req, res) => {
   if (url.pathname === '/admin/send-saturday') {
     if (adminKey !== process.env.ADMIN_KEY) { res.writeHead(403); res.end('Forbidden'); return; }
     sendSaturdayEmails();
+    res.writeHead(200, { ...cors, 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ started: true })); return;
+  }
+
+  if (url.pathname === '/admin/generate-acca') {
+    if (adminKey !== process.env.ADMIN_KEY) { res.writeHead(403); res.end('Forbidden'); return; }
+    generateDailyAcca();
     res.writeHead(200, { ...cors, 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ started: true })); return;
   }
