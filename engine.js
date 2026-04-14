@@ -689,12 +689,11 @@ function kellyStake(modelProb, decimalOdds, fraction = 0.25) {
   const full = (b * modelProb - q) / b;
   if (full <= 0) return 0; // negative Kelly = no bet
   const sized = full * fraction;
-  // Tightened thresholds — only size up when Kelly genuinely justifies it.
-  // Marginal-edge tips get 0.5u. Strong edge needed for 2u+.
-  if (sized >= 0.25) return 3.0;
-  if (sized >= 0.18) return 2.5;
-  if (sized >= 0.13) return 2.0;
-  if (sized >= 0.09) return 1.5;
+  // Spread thresholds to produce genuine variation across tip quality
+  if (sized >= 0.40) return 3.0;
+  if (sized >= 0.28) return 2.5;
+  if (sized >= 0.18) return 2.0;
+  if (sized >= 0.11) return 1.5;
   if (sized >= 0.06) return 1.0;
   return 0.5;
 }
@@ -2039,7 +2038,7 @@ async function settleResults() {
         result:     won ? 'WON' : 'LOST',
         profit_loss: pl,
         running_pl:  runningPL,
-        settled_at:  (() => { const d = new Date(tip.event_time); const ukDate = d.toLocaleDateString('en-CA', { timeZone: 'Europe/London' }); return ukDate + 'T00:00:00.000Z'; })(),
+        settled_at:  (() => { const d = new Date(); const ukDate = d.toLocaleDateString('en-CA', { timeZone: 'Europe/London' }); return ukDate + 'T00:00:00.000Z'; })(),
         confidence:  tip.confidence || 0,
       });
 
@@ -2447,8 +2446,7 @@ function startScheduler() {
     const isSat = uk.getDay() === 6;
 
     if (h === 6  && m === 0  && lastFormDate2 !== today) { lastFormDate2 = today; await fetchAllFormData(); }
-    if (h === 7  && m === 0  && lastProDate   !== today) { lastProDate   = today; await sendProEmails();    }
-    if (h === 8  && m === 30 && lastFreeDate  !== today) { lastFreeDate  = today; await sendDailyEmails(); }
+    if (h === 7  && m === 0  && lastProDate   !== today) { lastProDate   = today; await sendProEmails(); await generateDailyAcca(); }
     if (isSat && h === 8 && m === 0 && lastSatDate !== today) { lastSatDate = today; await sendSaturdayEmails(); }
   }, 60 * 1000);
 
@@ -2456,8 +2454,8 @@ function startScheduler() {
 
   console.log('⏰ Scheduler active:');
   console.log('   06:00 UK — Form data fetch');
-  console.log('   07:00 UK — Pro emails');
-  console.log('   08:30 UK — Free emails');
+  console.log('   07:00 UK — Pro emails + daily acca');
+  console.log('   08:00 UK Sat — Saturday acca (all members)');
   console.log('   Every 60 min — Settler');
   console.log('   Every 15 min — Odds + tips');
 }
