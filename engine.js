@@ -2022,7 +2022,7 @@ async function settleResults() {
         result:     won ? 'WON' : 'LOST',
         profit_loss: pl,
         running_pl:  runningPL,
-        settled_at:  tip.event_time,
+        settled_at:  (() => { const d = new Date(tip.event_time); const ukDate = d.toLocaleDateString('en-CA', { timeZone: 'Europe/London' }); return ukDate + 'T00:00:00.000Z'; })(),
         confidence:  tip.confidence || 0,
       });
 
