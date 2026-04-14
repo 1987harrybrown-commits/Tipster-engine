@@ -689,11 +689,12 @@ function kellyStake(modelProb, decimalOdds, fraction = 0.25) {
   const full = (b * modelProb - q) / b;
   if (full <= 0) return 0; // negative Kelly = no bet
   const sized = full * fraction;
-  // Spread thresholds to produce genuine variation across tip quality
-  if (sized >= 0.40) return 3.0;
-  if (sized >= 0.28) return 2.5;
-  if (sized >= 0.18) return 2.0;
-  if (sized >= 0.11) return 1.5;
+  // Tightened thresholds — only size up when Kelly genuinely justifies it.
+  // Marginal-edge tips get 0.5u. Strong edge needed for 2u+.
+  if (sized >= 0.25) return 3.0;
+  if (sized >= 0.18) return 2.5;
+  if (sized >= 0.13) return 2.0;
+  if (sized >= 0.09) return 1.5;
   if (sized >= 0.06) return 1.0;
   return 0.5;
 }
@@ -1862,7 +1863,7 @@ async function saveTips(tips) {
   for (const tip of tips) {
     try {
       const date = new Date(tip.event_time).toISOString().split('T')[0];
-      const { data: existing } = await supabase.from('tips').select('tip_ref, confidence, odds, best_odds, bookmaker')
+      const { data: existing } = await supabase.from('tips').select('id, tip_ref, confidence, odds, best_odds, bookmaker')
         .eq('home_team', tip.home_team).eq('away_team', tip.away_team)
         .gte('event_time', `${date}T00:00:00Z`).lte('event_time', `${date}T23:59:59Z`)
         .eq('status', 'pending').maybeSingle();
@@ -1883,6 +1884,10 @@ async function saveTips(tips) {
         const bestOddsImproved = newBest > currentBest + 0.001;
 
         if (oddsDiff > 0.01 || confDiff > 1 || bookChanged || bestOddsImproved) {
+          // Use id for update in case tip_ref is NULL on legacy rows
+          const updateKey = existing.tip_ref ? { tip_ref: existing.tip_ref } : { id: existing.id };
+          const updateField = existing.tip_ref ? 'tip_ref' : 'id';
+          const updateVal = existing.tip_ref || existing.id;
           await supabase.from('tips').update({
             odds:       tip.odds,
             best_odds:  newBest,
@@ -1892,7 +1897,9 @@ async function saveTips(tips) {
             selection:  tip.selection,
             market:     tip.market,
             notes:      tip.notes,
-          }).eq('tip_ref', existing.tip_ref);
+            // Backfill tip_ref if missing
+            ...(existing.tip_ref ? {} : { tip_ref: tip.tip_ref }),
+          }).eq(updateField, updateVal);
           updated++;
         } else { skipped++; }
         continue;
@@ -1918,6 +1925,17 @@ async function saveTips(tips) {
 async function settleResults() {
   const { data: pending } = await supabase.from('tips').select('*').eq('status','pending').lt('event_time', new Date().toISOString());
   if (!pending?.length) { console.log('🏁 Nothing to settle.'); return; }
+
+  // Backfill any NULL tip_refs before settling
+  const nullRefs = pending.filter(t => !t.tip_ref);
+  for (const t of nullRefs) {
+    const prefixes = { 'Football':'FB','Basketball':'BB','Ice Hockey':'IH' };
+    const prefix = prefixes[t.sport] || 'TT';
+    const ref = `${prefix}-${Date.now().toString(36).toUpperCase().slice(-4)}${Math.random().toString(36).toUpperCase().slice(-4)}`;
+    await supabase.from('tips').update({ tip_ref: ref }).eq('id', t.id);
+    t.tip_ref = ref;
+  }
+
   console.log(`🏁 Settling ${pending.length} tips...`);
 
   const now = Date.now();
@@ -2021,7 +2039,7 @@ async function settleResults() {
         result:     won ? 'WON' : 'LOST',
         profit_loss: pl,
         running_pl:  runningPL,
-        settled_at:  (() => { const d = new Date(); const ukDate = d.toLocaleDateString('en-CA', { timeZone: 'Europe/London' }); return ukDate + 'T00:00:00.000Z'; })(),
+        settled_at:  (() => { const d = new Date(tip.event_time); const ukDate = d.toLocaleDateString('en-CA', { timeZone: 'Europe/London' }); return ukDate + 'T00:00:00.000Z'; })(),
         confidence:  tip.confidence || 0,
       });
 
