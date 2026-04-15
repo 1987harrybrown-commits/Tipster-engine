@@ -1754,16 +1754,28 @@ function applyStrictRules(tip, existingBestOdds = null) {
   if (!grade) return null;                        // below A: reject
   if (odds > ODDS_CORE_MAX && grade !== 'A+') return null; // 2.21–2.50: A+ only
 
-  // ── Rule 7: Stake from grade ───────────────────────────────
-  // A+ in elite odds band (2.21–2.50): 2u (slightly reduced for higher variance)
-  // A+ in core odds band (1.40–2.20):  2.5u
-  // A:                                 1.5u
+  // ── Rule 7: Stake from confidence + grade ─────────────────
+  // Confidence gates first — certainty must justify risk.
+  // Grade then rewards edge on higher-confidence selections.
+  //
+  // < 80% confidence:           1u  (publication floor, protect bank)
+  // 80–84%, A grade:            1.5u
+  // 80–84%, A+:                 2u
+  // ≥ 85%, A grade:             1.5u (grade A capped — edge not elite)
+  // ≥ 85%, A+:                  2.5u
+  //
+  // Elite odds band (2.21–2.50) reduces A+ by 0.5u for higher variance.
+  const conf = parseFloat(tip.confidence || 0);
   let stake;
-  if (grade === 'A+') {
-    stake = odds > ODDS_CORE_MAX ? 2.0 : 2.5;
+  if (conf < 80) {
+    stake = 1.0;
+  } else if (conf < 85) {
+    stake = grade === 'A+' ? 2.0 : 1.5;
   } else {
-    stake = 1.5;
+    stake = grade === 'A+' ? 2.5 : 1.5;
   }
+  // Elite odds band variance reduction
+  if (odds > ODDS_CORE_MAX && stake > 1.0) stake -= 0.5;
 
   // ── Output: attach grade and corrected stake ────────────────
   return {
