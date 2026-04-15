@@ -2215,6 +2215,47 @@ The Tipster · Tips for informational purposes only · 18+ only · Bet responsib
 </table></td></tr></table></body></html>`;
 }
 
+function buildWelcomeEmail({ userId, firstName }) {
+  const g = firstName || 'there';
+  const content = `
+<p style="font-family:monospace;font-size:10px;text-transform:uppercase;letter-spacing:3px;color:#f0b429;margin:0 0 10px;">Pro Member</p>
+<h1 style="font-size:22px;font-weight:800;color:#dde6f0;margin:0 0 6px;">Welcome to Pro, ${g}.</h1>
+<p style="font-size:13px;color:#4a5a70;line-height:1.7;margin:0 0 24px;">Your account is active. Tomorrow at 07:00 UK you'll receive your first full card.</p>
+
+<table width="100%" cellpadding="0" cellspacing="0" style="background:#111620;border-radius:7px;margin-bottom:20px;">
+<tr><td style="padding:18px 20px;">
+<p style="font-family:monospace;font-size:9px;text-transform:uppercase;letter-spacing:2px;color:#f0b429;margin:0 0 12px;">How it works</p>
+<p style="font-size:13px;color:#dde6f0;line-height:1.7;margin:0 0 10px;">Every 15 minutes the engine scans odds across leading UK bookmakers. It runs each fixture through a statistical model — Dixon-Coles Poisson for football, pace-adjusted scoring for NBA, Poisson goals model for NHL — and looks for one thing: where the bookmaker has mispriced the probability of an outcome.</p>
+<p style="font-size:13px;color:#dde6f0;line-height:1.7;margin:0;">When it finds a genuine edge — where our model probability is meaningfully higher than the bookmaker's implied probability — it generates a tip. No gut feel. No opinions. Pure maths.</p>
+</td></tr>
+</table>
+
+<table width="100%" cellpadding="0" cellspacing="0" style="background:#111620;border-radius:7px;margin-bottom:20px;">
+<tr><td style="padding:18px 20px;">
+<p style="font-family:monospace;font-size:9px;text-transform:uppercase;letter-spacing:2px;color:#18e07a;margin:0 0 12px;">What you receive every morning at 07:00</p>
+<p style="font-size:13px;color:#dde6f0;line-height:1.7;margin:0 0 8px;">✦ The full tip card — every selection the engine has approved</p>
+<p style="font-size:13px;color:#dde6f0;line-height:1.7;margin:0 0 8px;">✦ Value edge % — how much the model disagrees with the bookmaker</p>
+<p style="font-size:13px;color:#dde6f0;line-height:1.7;margin:0 0 8px;">✦ Stake recommendation — sized by the Kelly criterion (A+ or A grade only)</p>
+<p style="font-size:13px;color:#dde6f0;line-height:1.7;margin:0;">✦ Confidence score — how certain the model is on each selection</p>
+</td></tr>
+</table>
+
+<table width="100%" cellpadding="0" cellspacing="0" style="background:#0c0f15;border:1px solid rgba(240,180,41,0.25);border-radius:7px;margin-bottom:20px;">
+<tr><td style="padding:18px 20px;">
+<p style="font-family:monospace;font-size:9px;text-transform:uppercase;letter-spacing:2px;color:#f0b429;margin:0 0 12px;">The discipline section — please read this</p>
+<p style="font-size:13px;color:#dde6f0;line-height:1.7;margin:0 0 10px;">The edge is real but it plays out over hundreds of bets — not dozens. A 61% win rate means roughly 4 in every 10 tips lose. Losing runs of 5, 6, even 7 in a row are normal and expected. That is not the model failing. That is variance.</p>
+<p style="font-size:13px;color:#dde6f0;line-height:1.7;margin:0 0 10px;">The three rules that separate profitable bettors from everyone else:</p>
+<p style="font-size:13px;color:#dde6f0;line-height:1.7;margin:0 0 6px;"><span style="color:#f0b429;font-weight:700;">1. Follow the stakes.</span> The stake recommendation exists for a reason. Doubling up after a loss or skipping a low-stakes tip destroys the mathematical edge over time.</p>
+<p style="font-size:13px;color:#dde6f0;line-height:1.7;margin:0 0 6px;"><span style="color:#f0b429;font-weight:700;">2. Think in weeks, not days.</span> A bad Tuesday means nothing. A bad month is worth reviewing. Judge the service on 30-day and 90-day windows.</p>
+<p style="font-size:13px;color:#dde6f0;line-height:1.7;margin:0;"><span style="color:#f0b429;font-weight:700;">3. Never chase.</span> If you've had a losing day, tomorrow's card is the same as any other day. The model doesn't know you lost. Bet accordingly.</p>
+</td></tr>
+</table>
+
+<div style="text-align:center;margin-bottom:8px;"><a href="${SITE_URL}/#tips" style="display:inline-block;background:#f0b429;color:#07090d;font-size:13px;font-weight:700;padding:13px 32px;border-radius:5px;text-decoration:none;">View Today's Tips</a></div>
+<p style="font-size:11px;color:#4a5a70;text-align:center;margin:12px 0 0;">Your first Pro email arrives tomorrow at 07:00 UK.</p>`;
+  return emailBase(content, userId);
+}
+
 function buildProEmail({ tip, allTips, userId, firstName }) {
   const g = firstName || 'there';
   const edge = (parseFloat(tip.confidence||0) - (1/parseFloat(tip.odds||1))*100).toFixed(1);
@@ -2385,6 +2426,8 @@ async function sendTestEmail(to, type) {
     const acca = await getSaturdayAcca();
     if (!acca) return { success: false, error: 'No acca' };
     return { success: !!(await sendEmail({ to, subject: '[TEST] Saturday Acca', html: buildSaturdayEmail({ ...acca, userId: 'test' }), type: 'test' })) };
+  } else if (type === 'welcome_pro') {
+    return { success: !!(await sendEmail({ to, subject: '[TEST] Welcome to The Tipster Pro', html: buildWelcomeEmail({ userId: 'test', firstName: 'Test' }), type: 'test' })) };
   } else if (type === 'pro_daily') {
     const tips = await getTodaysTips(15);
     if (!tips.length) return { success: false, error: 'No tips' };
@@ -2474,11 +2517,7 @@ async function handleStripeWebhook(event) {
       await supabase.from('users').update({ subscription_status:'pro', stripe_customer_id: s.customer, stripe_subscription_id: s.subscription }).eq('id', uid);
       console.log('Upgraded to Pro:', uid);
       const { data: u } = await supabase.from('users').select('email,first_name').eq('id', uid).single();
-      if (u) await sendEmail({ to: u.email, subject: 'Welcome to The Tipster Pro', html: emailBase(`
-<p style="font-family:monospace;font-size:10px;text-transform:uppercase;letter-spacing:3px;color:#f0b429;margin:0 0 10px;">Pro Member</p>
-<h1 style="font-size:22px;font-weight:800;color:#dde6f0;margin:0 0 8px;">Welcome to Pro, ${u.first_name||'there'}.</h1>
-<p style="font-size:13px;color:#4a5a70;line-height:1.7;margin:0 0 20px;">Your account is now active. Tomorrow at 07:00 you'll receive the full card — every tip, every value edge, every stake recommendation.</p>
-<div style="text-align:center;"><a href="https://thetipsteredge.com" style="display:inline-block;background:#f0b429;color:#07090d;font-size:13px;font-weight:700;padding:12px 28px;border-radius:5px;text-decoration:none;">View Today's Tips</a></div>`, uid), type: 'welcome_pro' });
+      if (u) await sendEmail({ to: u.email, subject: `Welcome to The Tipster Pro, ${u.first_name||'there'}`, html: buildWelcomeEmail({ userId: uid, firstName: u.first_name }), type: 'welcome_pro' });
       break;
     }
     case 'customer.subscription.updated': {
