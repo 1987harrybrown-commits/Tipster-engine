@@ -2049,6 +2049,64 @@ async function settleResults() {
     } catch(e) { console.error(`Settle error [${tip.tip_ref}]:`, e.message); }
   }
   console.log(`🏁 Settled ${count} tips.`);
+
+  // ── Settle pending daily accas ──────────────────────────────
+  // Won only if ALL active legs won. Lost if ANY leg lost.
+  // Void legs are excluded — acca continues on remaining legs.
+  // Stays pending if any active leg is still unsettled.
+  try {
+    const { data: pendingAccas } = await supabase
+      .from('daily_accas')
+      .select('*')
+      .eq('result', 'pending');
+
+    for (const acca of (pendingAccas || [])) {
+      const tipRefs = (acca.selections || []).map(s => s.tip_ref).filter(Boolean);
+      if (!tipRefs.length) continue;
+
+      const { data: legTips } = await supabase
+        .from('tips')
+        .select('tip_ref, status, odds, best_odds')
+        .in('tip_ref', tipRefs);
+
+      if (!legTips || legTips.length < tipRefs.length) continue; // not all legs found yet
+
+      const allSettled = legTips.every(t => ['won','lost','void'].includes(t.status));
+      if (!allSettled) continue; // still waiting on at least one result
+
+      // Exclude void legs — acca continues on remaining active legs
+      const activeLegs = legTips.filter(t => t.status !== 'void');
+
+      if (!activeLegs.length) {
+        // All legs voided — mark acca void, no P&L
+        await supabase.from('daily_accas')
+          .update({ result: 'VOID', profit_loss: 0 })
+          .eq('id', acca.id);
+        console.log(`📋 Acca ${acca.date} VOID (all legs voided)`);
+        continue;
+      }
+
+      const allWon = activeLegs.every(t => t.status === 'won');
+      const result = allWon ? 'WON' : 'LOST';
+
+      let pl;
+      if (allWon) {
+        // Use best_odds per leg for the combined return
+        const combinedBest = activeLegs.reduce((acc, t) => acc * parseFloat(t.best_odds || t.odds), 1);
+        pl = parseFloat(((combinedBest - 1) * parseFloat(acca.stake || 1)).toFixed(2));
+      } else {
+        pl = parseFloat((-parseFloat(acca.stake || 1)).toFixed(2));
+      }
+
+      await supabase.from('daily_accas')
+        .update({ result, profit_loss: pl })
+        .eq('id', acca.id);
+
+      console.log(`📋 Acca ${acca.date} settled: ${result} (${pl >= 0 ? '+' : ''}${pl}u)`);
+    }
+  } catch(e) {
+    console.error('Acca settlement error:', e.message);
+  }
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -2432,6 +2490,91 @@ async function handleStripeWebhook(event) {
 }
 
 // ═══════════════════════════════════════════════════════════════
+// DAILY ACCA GENERATOR — Admin use only
+// Auto-runs at 07:00 UK. Also triggered via /admin/generate-acca.
+// Selects top tips with confidence ≥ 84%, min 3 legs, max 5.
+// Stored in daily_accas for admin tracking and settlement.
+// No emails sent — admin page only.
+// ═══════════════════════════════════════════════════════════════
+
+async function generateDailyAcca() {
+  try {
+    const today = new Date().toLocaleDateString('en-CA', { timeZone: 'Europe/London' });
+
+    // Don't overwrite if one already exists for today
+    const { data: existing } = await supabase
+      .from('daily_accas')
+      .select('id')
+      .eq('date', today)
+      .maybeSingle();
+    if (existing) {
+      console.log('📋 Daily acca: already generated for today.');
+      return { skipped: true };
+    }
+
+    const s = today + 'T00:00:00Z';
+    const e = today + 'T23:59:59Z';
+
+    const { data: tips } = await supabase
+      .from('tips')
+      .select('*')
+      .eq('status', 'pending')
+      .gte('event_time', s)
+      .lte('event_time', e)
+      .gte('confidence', 84)
+      .order('confidence', { ascending: false })
+      .limit(5);
+
+    if (!tips || tips.length < 3) {
+      console.log(`📋 Daily acca: only ${tips?.length || 0} qualifying tips (need ≥3 at 84%+).`);
+      return { generated: false, reason: 'insufficient_tips' };
+    }
+
+    const legs = tips.slice(0, 5);
+
+    // Determine sport label
+    const sportCounts = legs.reduce((acc, t) => { acc[t.sport] = (acc[t.sport] || 0) + 1; return acc; }, {});
+    const dominantSport = Object.entries(sportCounts).sort((a, b) => b[1] - a[1])[0][0];
+    const sportLabel = Object.keys(sportCounts).length > 1 ? 'Mixed' : dominantSport;
+
+    const combinedOdds = parseFloat(
+      legs.reduce((acc, t) => acc * parseFloat(t.odds), 1).toFixed(4)
+    );
+
+    const selections = legs.map(t => ({
+      match:      `${t.home_team} vs ${t.away_team}`,
+      selection:  t.selection,
+      odds:       t.odds,
+      tip_ref:    t.tip_ref,
+      confidence: t.confidence,
+    }));
+
+    const { error } = await supabase.from('daily_accas').insert({
+      date:          today,
+      sport:         sportLabel,
+      legs:          legs.length,
+      selections,
+      combined_odds: combinedOdds,
+      stake:         1,
+      result:        'pending',
+      profit_loss:   null,
+    });
+
+    if (error) {
+      console.error('Daily acca insert error:', error.message);
+      return { generated: false, error: error.message };
+    }
+
+    console.log(`📋 Daily acca generated: ${legs.length} legs @ ${combinedOdds} combined odds`);
+    return { generated: true, legs: legs.length, combinedOdds };
+
+  } catch(e) {
+    console.error('generateDailyAcca error:', e.message);
+    return { generated: false, error: e.message };
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
 // SCHEDULER — UNCHANGED
 // ═══════════════════════════════════════════════════════════════
 
@@ -2491,6 +2634,14 @@ http.createServer(async (req, res) => {
   }
 
   const adminKey = url.searchParams.get('key');
+
+  if (url.pathname === '/admin/generate-acca') {
+    if (adminKey !== process.env.ADMIN_KEY) { res.writeHead(403); res.end('Forbidden'); return; }
+    const result = await generateDailyAcca();
+    res.writeHead(200, { ...cors, 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ started: true, ...result }));
+    return;
+  }
 
   if (url.pathname === '/admin/test-email') {
     if (adminKey !== process.env.ADMIN_KEY) { res.writeHead(403); res.end('Forbidden'); return; }
