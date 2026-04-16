@@ -1806,7 +1806,7 @@ async function generateTips(events, sport) {
     if (sport.name === 'Football') {
       // ── Football lab: log all markets for research ────────
       // Runs silently alongside main engine, zero extra API calls
-      await runFootballLab(supabase, [event], sport);
+      await runFootballLab(supabase, [event], sport, teamStatsCache, seasonFor(sport.leagueId));
 
       // ── Football: Dixon-Coles Poisson xG model ───────────
       // Falls back to market consensus if model has no data or no edge found.
