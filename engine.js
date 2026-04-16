@@ -2550,53 +2550,49 @@ async function handleStripeWebhook(event) {
 
 async function tagDailyBestBet() {
   try {
-    // Tag best bet for TOMORROW — runs every 15 min cycle.
-    // Once tagged, never changes. First tip in = locked in.
-    // Also tags today if not yet tagged (catches any gaps).
+    // Tag best bet for TOMORROW ONLY — runs at 06:00 UK.
+    // Once tagged, never changes.
+    // Only ever one day ahead — no further.
     const now = new Date();
-    const targets = [];
-
-    // Tomorrow in UK time
     const ukTomorrow = new Date(now.getTime() + 86400000)
       .toLocaleDateString('en-CA', { timeZone: 'Europe/London' });
-    targets.push(ukTomorrow);
 
-    // Today in UK time (safety net)
-    const ukToday = now.toLocaleDateString('en-CA', { timeZone: 'Europe/London' });
-    targets.push(ukToday);
+    const s = ukTomorrow + 'T00:00:00Z';
+    const e = ukTomorrow + 'T23:59:59Z';
 
-    for (const ukDate of targets) {
-      const s = ukDate + 'T00:00:00Z';
-      const e = ukDate + 'T23:59:59Z';
+    // Skip if already tagged for tomorrow
+    const { data: existing } = await supabase
+      .from('tips')
+      .select('id')
+      .eq('is_best_bet', true)
+      .gte('event_time', s)
+      .lte('event_time', e)
+      .maybeSingle();
 
-      // Skip if already tagged for this date
-      const { data: existing } = await supabase
-        .from('tips')
-        .select('id')
-        .eq('is_best_bet', true)
-        .gte('event_time', s)
-        .lte('event_time', e)
-        .maybeSingle();
-
-      if (existing) continue;
-
-      // Find highest confidence pending tip for this date
-      const { data: tips } = await supabase
-        .from('tips')
-        .select('id, tip_ref, home_team, away_team, confidence, odds')
-        .eq('status', 'pending')
-        .gte('event_time', s)
-        .lte('event_time', e)
-        .order('confidence', { ascending: false })
-        .order('odds', { ascending: false })
-        .limit(1);
-
-      if (!tips?.length) continue;
-
-      const best = tips[0];
-      await supabase.from('tips').update({ is_best_bet: true }).eq('id', best.id);
-      console.log(`🏆 Best bet tagged [${ukDate}]: [${best.tip_ref}] ${best.home_team} vs ${best.away_team} (${best.confidence}% conf)`);
+    if (existing) {
+      console.log(`🏆 Best bet already tagged for ${ukTomorrow}.`);
+      return;
     }
+
+    // Find highest confidence pending tip for tomorrow
+    const { data: tips } = await supabase
+      .from('tips')
+      .select('id, tip_ref, home_team, away_team, confidence, odds')
+      .eq('status', 'pending')
+      .gte('event_time', s)
+      .lte('event_time', e)
+      .order('confidence', { ascending: false })
+      .order('odds', { ascending: false })
+      .limit(1);
+
+    if (!tips?.length) {
+      console.log(`🏆 No pending tips yet for ${ukTomorrow}.`);
+      return;
+    }
+
+    const best = tips[0];
+    await supabase.from('tips').update({ is_best_bet: true }).eq('id', best.id);
+    console.log(`🏆 Best bet tagged [${ukTomorrow}]: [${best.tip_ref}] ${best.home_team} vs ${best.away_team} (${best.confidence}% conf)`);
 
   } catch(e) {
     console.error('tagDailyBestBet error:', e.message);
