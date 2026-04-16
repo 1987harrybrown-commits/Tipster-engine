@@ -28,7 +28,7 @@ const SUPABASE_URL         = 'https://eyhlzzaaxrwisrtwyoyh.supabase.co';
 const SUPABASE_SERVICE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImV5aGx6emFheHJ3aXNydHd5b3loIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3MzM3OTI3NywiZXhwIjoyMDg4OTU1Mjc3fQ.9Lry94K4qWWYzh0yd4zcgEaGvb8myeAzxrSHtcBSQus';
 const ODDS_API_KEY         = 'cd4587438ed62cce94274935545c86a3';
 const ODDS_BASE            = 'https://api.the-odds-api.com/v4';
-const API_FOOTBALL_KEY     = 'f53281f35e7871081ebf83478b556b84';
+const API_FOOTBALL_KEY     = process.env.API_FOOTBALL_KEY || '';
 const API_FOOTBALL_BASE    = 'https://v3.football.api-sports.io';
 // API-Sports Basketball + Hockey use same key, separate endpoints + separate 100/day budgets
 // BallDontLie: free tier for NBA/NHL injuries — sign up at app.balldontlie.io
