@@ -2541,6 +2541,69 @@ async function handleStripeWebhook(event) {
 }
 
 // ═══════════════════════════════════════════════════════════════
+// BEST BET TAGGER
+// Runs at 07:00 UK alongside Pro emails.
+// Tags the highest confidence pending tip for today as is_best_bet.
+// Only one tip per day can be tagged. Never changes after tagging.
+// This is the authoritative best bet for streak calculation.
+// ═══════════════════════════════════════════════════════════════
+
+async function tagDailyBestBet() {
+  try {
+    // Tag best bet for TOMORROW — runs every 15 min cycle.
+    // Once tagged, never changes. First tip in = locked in.
+    // Also tags today if not yet tagged (catches any gaps).
+    const now = new Date();
+    const targets = [];
+
+    // Tomorrow in UK time
+    const ukTomorrow = new Date(now.getTime() + 86400000)
+      .toLocaleDateString('en-CA', { timeZone: 'Europe/London' });
+    targets.push(ukTomorrow);
+
+    // Today in UK time (safety net)
+    const ukToday = now.toLocaleDateString('en-CA', { timeZone: 'Europe/London' });
+    targets.push(ukToday);
+
+    for (const ukDate of targets) {
+      const s = ukDate + 'T00:00:00Z';
+      const e = ukDate + 'T23:59:59Z';
+
+      // Skip if already tagged for this date
+      const { data: existing } = await supabase
+        .from('tips')
+        .select('id')
+        .eq('is_best_bet', true)
+        .gte('event_time', s)
+        .lte('event_time', e)
+        .maybeSingle();
+
+      if (existing) continue;
+
+      // Find highest confidence pending tip for this date
+      const { data: tips } = await supabase
+        .from('tips')
+        .select('id, tip_ref, home_team, away_team, confidence, odds')
+        .eq('status', 'pending')
+        .gte('event_time', s)
+        .lte('event_time', e)
+        .order('confidence', { ascending: false })
+        .order('odds', { ascending: false })
+        .limit(1);
+
+      if (!tips?.length) continue;
+
+      const best = tips[0];
+      await supabase.from('tips').update({ is_best_bet: true }).eq('id', best.id);
+      console.log(`🏆 Best bet tagged [${ukDate}]: [${best.tip_ref}] ${best.home_team} vs ${best.away_team} (${best.confidence}% conf)`);
+    }
+
+  } catch(e) {
+    console.error('tagDailyBestBet error:', e.message);
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
 // DAILY ACCA GENERATOR — Admin use only
 // Auto-runs at 07:00 UK. Also triggered via /admin/generate-acca.
 // Selects top tips with confidence ≥ 84%, min 3 legs, max 5.
@@ -2639,8 +2702,8 @@ function startScheduler() {
     const today = uk.toDateString();
     const isSat = uk.getDay() === 6;
 
-    if (h === 6  && m === 0  && lastFormDate2 !== today) { lastFormDate2 = today; await fetchAllFormData(); }
-    if (h === 7  && m === 0  && lastProDate   !== today) { lastProDate   = today; await sendProEmails(); await generateDailyAcca(); }
+    if (h === 6  && m === 0  && lastFormDate2 !== today) { lastFormDate2 = today; await fetchAllFormData(); await tagDailyBestBet(); }
+    if (h === 7  && m === 0  && lastProDate   !== today) { lastProDate   = today; await tagDailyBestBet(); await sendProEmails(); await generateDailyAcca(); }
     if (isSat && h === 8 && m === 0 && lastSatDate !== today) { lastSatDate = today; await sendSaturdayEmails(); }
   }, 60 * 1000);
 
