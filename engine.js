@@ -19,6 +19,7 @@
 // ============================================================
 
 const { createClient } = require('@supabase/supabase-js');
+const { runFootballLab, settleFootballLab } = require('./football_lab');
 const fetch = (...args) => import('node-fetch').then(({ default: f }) => f(...args));
 const crypto = require('crypto');
 
@@ -1803,6 +1804,10 @@ async function generateTips(events, sport) {
     const candidates = [];
 
     if (sport.name === 'Football') {
+      // ── Football lab: log all markets for research ────────
+      // Runs silently alongside main engine, zero extra API calls
+      await runFootballLab(supabase, [event], sport);
+
       // ── Football: Dixon-Coles Poisson xG model ───────────
       // Falls back to market consensus if model has no data or no edge found.
       // This keeps football tips flowing even when API budget is exhausted
@@ -2061,6 +2066,7 @@ async function settleResults() {
     } catch(e) { console.error(`Settle error [${tip.tip_ref}]:`, e.message); }
   }
   console.log(`🏁 Settled ${count} tips.`);
+  await settleFootballLab(supabase, ODDS_BASE, ODDS_API_KEY);
 
   // ── Settle pending daily accas ──────────────────────────────
   // Won only if ALL active legs won. Lost if ANY leg lost.
