@@ -1,16 +1,25 @@
 // ================================================================
-// FOOTBALL LAB — Experimental market tracker
+// FOOTBALL LAB v2 — Proper Dixon-Coles model using real team stats
 // ================================================================
-// Tracks H2H and Over/Under markets across all football fixtures.
-// Completely independent from main tips engine.
-// Writes only to football_lab table in Supabase.
-// Zero additional API calls — reuses events already fetched.
+// Uses teamStatsCache from main engine — zero extra API calls.
+// Only logs fixtures where both teams have season stats.
+// Minimum edge filters applied to keep data meaningful.
 // ================================================================
 
-// ── LEAGUE AVERAGES FALLBACK ─────────────────────────────────
-// Used when no team stats available (free plan limitation).
-// Simple but sufficient for market pattern discovery.
-const LAB_LEAGUE_AVG = { homeGoals: 1.55, awayGoals: 1.18 };
+// ── LEAGUE AVERAGES (mirrors engine.js) ─────────────────────
+const LAB_LEAGUE_AVERAGES = {
+  39:  { homeGoals: 1.53, awayGoals: 1.21 }, // Premier League
+  140: { homeGoals: 1.57, awayGoals: 1.14 }, // La Liga
+  78:  { homeGoals: 1.68, awayGoals: 1.25 }, // Bundesliga
+  135: { homeGoals: 1.49, awayGoals: 1.12 }, // Serie A
+  61:  { homeGoals: 1.51, awayGoals: 1.18 }, // Ligue 1
+  2:   { homeGoals: 1.64, awayGoals: 1.22 }, // Champions League
+};
+const LAB_AVG_FALLBACK = { homeGoals: 1.55, awayGoals: 1.18 };
+
+// Minimum edge to log — below this = no meaningful value
+const MIN_H2H_EDGE   = 3;  // %
+const MIN_TOTAL_EDGE = 5;  // %
 
 // ── HELPERS ──────────────────────────────────────────────────
 
@@ -22,8 +31,7 @@ function labPoisson(lambda, k) {
 }
 
 function labBuildMatrix(lH, lA) {
-  const N = 8;
-  const RHO = 0.10;
+  const N = 8, RHO = 0.10;
   const matrix = [];
   let total = 0;
   for (let h = 0; h <= N; h++) {
@@ -31,7 +39,7 @@ function labBuildMatrix(lH, lA) {
     for (let a = 0; a <= N; a++) {
       const raw = labPoisson(lH, h) * labPoisson(lA, a);
       let tau = 1;
-      if (h === 0 && a === 0) tau = 1 - lH * lA * RHO;
+      if      (h === 0 && a === 0) tau = 1 - lH * lA * RHO;
       else if (h === 1 && a === 0) tau = 1 + lA * RHO;
       else if (h === 0 && a === 1) tau = 1 + lH * RHO;
       else if (h === 1 && a === 1) tau = 1 - RHO;
@@ -39,11 +47,10 @@ function labBuildMatrix(lH, lA) {
       total += matrix[h][a];
     }
   }
-  if (total > 0) {
+  if (total > 0)
     for (let h = 0; h <= N; h++)
       for (let a = 0; a <= N; a++)
         matrix[h][a] /= total;
-  }
   return matrix;
 }
 
@@ -82,37 +89,80 @@ function nameMatch(a, b) {
   return ac === bc || ac.includes(bc) || bc.includes(ac);
 }
 
+// ── LAMBDA CALCULATION ────────────────────────────────────────
+// Uses real team season stats from the shared cache.
+// Returns null if either team has insufficient data.
+function calcLambdas(homeTeam, awayTeam, leagueId, season, teamStatsCache) {
+  const leagueAvg = LAB_LEAGUE_AVERAGES[leagueId] || LAB_AVG_FALLBACK;
+  const { homeGoals: lgHome, awayGoals: lgAway } = leagueAvg;
+
+  const homeKey = `stats_${homeTeam}_${leagueId}_${season}`;
+  const awayKey = `stats_${awayTeam}_${leagueId}_${season}`;
+
+  const homeStats = teamStatsCache[homeKey];
+  const awayStats = teamStatsCache[awayKey];
+
+  // Require real stats for both teams — no flat fallback
+  if (!homeStats || !awayStats) return null;
+  if (homeStats.homeGames < 4 || awayStats.awayGames < 4) return null;
+
+  // Attack/defence strengths (same formula as main engine)
+  const homeAvgScoredH = homeStats.homeScored   / homeStats.homeGames;
+  const homeAvgConcH   = homeStats.homeConceded  / homeStats.homeGames;
+  const awayAvgScoredA = awayStats.awayScored    / awayStats.awayGames;
+  const awayAvgConcA   = awayStats.awayConceded  / awayStats.awayGames;
+
+  const homeAttack = homeAvgScoredH / lgHome;
+  const homeDef    = homeAvgConcH   / lgAway;
+  const awayAttack = awayAvgScoredA / lgAway;
+  const awayDef    = awayAvgConcA   / lgHome;
+
+  const lH = Math.max(0.25, Math.min(5.0, homeAttack * awayDef * lgHome));
+  const lA = Math.max(0.25, Math.min(5.0, awayAttack * homeDef * lgAway));
+
+  return { lH, lA };
+}
+
 // ── MAIN LAB FUNCTION ─────────────────────────────────────────
-// Called from generateTips() with already-fetched events.
-// Zero extra API calls.
 
-async function runFootballLab(supabase, events, sport) {
-  if (!events?.length) return;
+async function runFootballLab(supabase, events, sport, teamStatsCache, season) {
+  if (!events?.length || sport.name !== 'Football') return;
+  if (!sport.leagueId) return;
 
-  // Only process football events
-  if (sport.name !== 'Football') return;
-
-  let inserted = 0, skipped = 0;
+  let inserted = 0, skipped = 0, noStats = 0;
 
   for (const event of events) {
     try {
       const hours = (new Date(event.commence_time) - new Date()) / 3600000;
-      if (hours < 0 || hours > 72) continue; // only upcoming within 72hrs
+      if (hours < 0 || hours > 72) continue;
       if (!event.bookmakers?.length) continue;
 
       const fixtureId = event.id;
-      const date = new Date(event.commence_time).toISOString().split('T')[0];
 
-      // Check if already logged for this fixture
+      // Skip if already logged
       const { data: existing } = await supabase
         .from('football_lab')
         .select('id')
         .eq('fixture_id', fixtureId)
         .maybeSingle();
-
       if (existing) { skipped++; continue; }
 
-      // ── Extract H2H odds ─────────────────────────────────
+      // ── Calculate λ using real team stats ────────────────
+      const lambdas = calcLambdas(
+        event.home_team,
+        event.away_team,
+        sport.leagueId,
+        season,
+        teamStatsCache
+      );
+
+      if (!lambdas) { noStats++; continue; } // skip — no real data
+
+      const { lH, lA } = lambdas;
+      const matrix = labBuildMatrix(lH, lA);
+      const probs  = labCalcOutcomes(matrix);
+
+      // ── Extract best odds ────────────────────────────────
       let bestHome = 0, bestDraw = 0, bestAway = 0;
       let homeBook = '', drawBook = '', awayBook = '';
       let bestOver25 = 0, bestUnder25 = 0;
@@ -131,29 +181,23 @@ async function runFootballLab(supabase, events, sport) {
             }
           }
         }
-
         const totals = book.markets?.find(m => m.key === 'totals');
         if (totals) {
           for (const o of totals.outcomes) {
             const pt = o.point || 0;
-            if (o.name === 'Over'  && Math.abs(pt - 2.5) < 0.01 && o.price > bestOver25)  bestOver25  = o.price;
-            if (o.name === 'Under' && Math.abs(pt - 2.5) < 0.01 && o.price > bestUnder25) bestUnder25 = o.price;
-            if (o.name === 'Over'  && Math.abs(pt - 3.5) < 0.01 && o.price > bestOver35)  bestOver35  = o.price;
-            if (o.name === 'Under' && Math.abs(pt - 3.5) < 0.01 && o.price > bestUnder35) bestUnder35 = o.price;
+            if (o.name === 'Over'  && Math.abs(pt - 2.5) < 0.01 && o.price > bestOver25)  { bestOver25  = o.price; }
+            if (o.name === 'Under' && Math.abs(pt - 2.5) < 0.01 && o.price > bestUnder25) { bestUnder25 = o.price; }
+            if (o.name === 'Over'  && Math.abs(pt - 3.5) < 0.01 && o.price > bestOver35)  { bestOver35  = o.price; }
+            if (o.name === 'Under' && Math.abs(pt - 3.5) < 0.01 && o.price > bestUnder35) { bestUnder35 = o.price; }
           }
         }
       }
 
-      if (!bestHome || !bestDraw || !bestAway) continue; // need full 1X2
+      if (!bestHome || !bestDraw || !bestAway) continue;
 
-      // ── Model probabilities (league average λ) ───────────
-      const lH = LAB_LEAGUE_AVG.homeGoals;
-      const lA = LAB_LEAGUE_AVG.awayGoals;
-      const matrix  = labBuildMatrix(lH, lA);
-      const probs   = labCalcOutcomes(matrix);
       const trueOdds = stripMargin(bestHome, bestDraw, bestAway);
+      const date = new Date(event.commence_time).toISOString().split('T')[0];
 
-      // ── Build rows ───────────────────────────────────────
       const base = {
         fixture_id:  fixtureId,
         date,
@@ -167,56 +211,64 @@ async function runFootballLab(supabase, events, sport) {
         settled_at:  null,
       };
 
-      const rows = [
-        // H2H markets
-        {
-          ...base,
-          market:     'h2h_home',
-          selection:  `${event.home_team} Win`,
-          odds:       parseFloat(bestHome.toFixed(2)),
-          model_prob: parseFloat(probs.homeWin.toFixed(4)),
-          edge_pct:   parseFloat(((probs.homeWin - trueOdds.trueHome) * 100).toFixed(2)),
-          notes:      `Book: ${homeBook} | λ: ${lH.toFixed(2)} vs ${lA.toFixed(2)}`,
-        },
-        {
-          ...base,
-          market:     'h2h_draw',
-          selection:  'Draw',
-          odds:       parseFloat(bestDraw.toFixed(2)),
-          model_prob: parseFloat(probs.draw.toFixed(4)),
-          edge_pct:   parseFloat(((probs.draw - trueOdds.trueDraw) * 100).toFixed(2)),
-          notes:      `Book: ${drawBook} | λ: ${lH.toFixed(2)} vs ${lA.toFixed(2)}`,
-        },
-        {
-          ...base,
-          market:     'h2h_away',
-          selection:  `${event.away_team} Win`,
-          odds:       parseFloat(bestAway.toFixed(2)),
-          model_prob: parseFloat(probs.awayWin.toFixed(4)),
-          edge_pct:   parseFloat(((probs.awayWin - trueOdds.trueAway) * 100).toFixed(2)),
-          notes:      `Book: ${awayBook} | λ: ${lH.toFixed(2)} vs ${lA.toFixed(2)}`,
-        },
-      ];
+      const modelNotes = `xG: ${lH.toFixed(2)} vs ${lA.toFixed(2)}`;
+      const rows = [];
 
-      // Over/Under 2.5
+      // ── H2H markets (min 3% edge) ────────────────────────
+      const homeEdge = parseFloat(((probs.homeWin - trueOdds.trueHome) * 100).toFixed(2));
+      const drawEdge = parseFloat(((probs.draw    - trueOdds.trueDraw) * 100).toFixed(2));
+      const awayEdge = parseFloat(((probs.awayWin - trueOdds.trueAway) * 100).toFixed(2));
+
+      if (Math.abs(homeEdge) >= MIN_H2H_EDGE) rows.push({
+        ...base, market: 'h2h_home', selection: `${event.home_team} Win`,
+        odds: parseFloat(bestHome.toFixed(2)), model_prob: parseFloat(probs.homeWin.toFixed(4)),
+        edge_pct: homeEdge, notes: `${modelNotes} | Book: ${homeBook}`,
+      });
+
+      if (Math.abs(drawEdge) >= MIN_H2H_EDGE) rows.push({
+        ...base, market: 'h2h_draw', selection: 'Draw',
+        odds: parseFloat(bestDraw.toFixed(2)), model_prob: parseFloat(probs.draw.toFixed(4)),
+        edge_pct: drawEdge, notes: `${modelNotes} | Book: ${drawBook}`,
+      });
+
+      if (Math.abs(awayEdge) >= MIN_H2H_EDGE) rows.push({
+        ...base, market: 'h2h_away', selection: `${event.away_team} Win`,
+        odds: parseFloat(bestAway.toFixed(2)), model_prob: parseFloat(probs.awayWin.toFixed(4)),
+        edge_pct: awayEdge, notes: `${modelNotes} | Book: ${awayBook}`,
+      });
+
+      // ── Over/Under markets (min 5% edge) ─────────────────
       if (bestOver25 && bestUnder25) {
-        const over25IP  = 1 / bestOver25;
-        const under25IP = 1 / bestUnder25;
-        rows.push(
-          { ...base, market: 'over25',  selection: 'Over 2.5',  odds: parseFloat(bestOver25.toFixed(2)),  model_prob: parseFloat(probs.over25.toFixed(4)),  edge_pct: parseFloat(((probs.over25  - over25IP)  * 100).toFixed(2)), notes: `λ: ${lH.toFixed(2)} vs ${lA.toFixed(2)}` },
-          { ...base, market: 'under25', selection: 'Under 2.5', odds: parseFloat(bestUnder25.toFixed(2)), model_prob: parseFloat(probs.under25.toFixed(4)), edge_pct: parseFloat(((probs.under25 - under25IP) * 100).toFixed(2)), notes: `λ: ${lH.toFixed(2)} vs ${lA.toFixed(2)}` }
-        );
+        const o25Edge = parseFloat(((probs.over25  - 1/bestOver25)  * 100).toFixed(2));
+        const u25Edge = parseFloat(((probs.under25 - 1/bestUnder25) * 100).toFixed(2));
+        if (Math.abs(o25Edge) >= MIN_TOTAL_EDGE) rows.push({
+          ...base, market: 'over25', selection: 'Over 2.5',
+          odds: parseFloat(bestOver25.toFixed(2)), model_prob: parseFloat(probs.over25.toFixed(4)),
+          edge_pct: o25Edge, notes: modelNotes,
+        });
+        if (Math.abs(u25Edge) >= MIN_TOTAL_EDGE) rows.push({
+          ...base, market: 'under25', selection: 'Under 2.5',
+          odds: parseFloat(bestUnder25.toFixed(2)), model_prob: parseFloat(probs.under25.toFixed(4)),
+          edge_pct: u25Edge, notes: modelNotes,
+        });
       }
 
-      // Over/Under 3.5
       if (bestOver35 && bestUnder35) {
-        const over35IP  = 1 / bestOver35;
-        const under35IP = 1 / bestUnder35;
-        rows.push(
-          { ...base, market: 'over35',  selection: 'Over 3.5',  odds: parseFloat(bestOver35.toFixed(2)),  model_prob: parseFloat(probs.over35.toFixed(4)),  edge_pct: parseFloat(((probs.over35  - over35IP)  * 100).toFixed(2)), notes: `λ: ${lH.toFixed(2)} vs ${lA.toFixed(2)}` },
-          { ...base, market: 'under35', selection: 'Under 3.5', odds: parseFloat(bestUnder35.toFixed(2)), model_prob: parseFloat(probs.under35.toFixed(4)), edge_pct: parseFloat(((probs.under35 - under35IP) * 100).toFixed(2)), notes: `λ: ${lH.toFixed(2)} vs ${lA.toFixed(2)}` }
-        );
+        const o35Edge = parseFloat(((probs.over35  - 1/bestOver35)  * 100).toFixed(2));
+        const u35Edge = parseFloat(((probs.under35 - 1/bestUnder35) * 100).toFixed(2));
+        if (Math.abs(o35Edge) >= MIN_TOTAL_EDGE) rows.push({
+          ...base, market: 'over35', selection: 'Over 3.5',
+          odds: parseFloat(bestOver35.toFixed(2)), model_prob: parseFloat(probs.over35.toFixed(4)),
+          edge_pct: o35Edge, notes: modelNotes,
+        });
+        if (Math.abs(u35Edge) >= MIN_TOTAL_EDGE) rows.push({
+          ...base, market: 'under35', selection: 'Under 3.5',
+          odds: parseFloat(bestUnder35.toFixed(2)), model_prob: parseFloat(probs.under35.toFixed(4)),
+          edge_pct: u35Edge, notes: modelNotes,
+        });
       }
+
+      if (!rows.length) { skipped++; continue; }
 
       const { error } = await supabase.from('football_lab').insert(rows);
       if (error) {
@@ -230,14 +282,12 @@ async function runFootballLab(supabase, events, sport) {
     }
   }
 
-  if (inserted > 0) {
-    console.log(`⚽ Football lab: ${inserted} fixtures logged, ${skipped} skipped (${sport.league})`);
+  if (inserted > 0 || noStats > 0) {
+    console.log(`⚽ Lab [${sport.league}]: ${inserted} logged, ${noStats} skipped (no stats), ${skipped} already exist`);
   }
 }
 
 // ── SETTLEMENT ────────────────────────────────────────────────
-// Called from settleResults(). Uses Odds API scores endpoint.
-// Settles all pending football_lab rows once fixture is complete.
 
 async function settleFootballLab(supabase, ODDS_BASE, ODDS_API_KEY) {
   try {
@@ -249,14 +299,12 @@ async function settleFootballLab(supabase, ODDS_BASE, ODDS_API_KEY) {
 
     if (!pending?.length) return;
 
-    // Group by league to minimise API calls
     const byLeague = {};
     for (const row of pending) {
       if (!byLeague[row.league]) byLeague[row.league] = [];
       byLeague[row.league].push(row);
     }
 
-    // Map league name to sport key
     const leagueKeyMap = {
       'Premier League':   'soccer_epl',
       'La Liga':          'soccer_spain_la_liga',
@@ -266,15 +314,13 @@ async function settleFootballLab(supabase, ODDS_BASE, ODDS_API_KEY) {
       'Champions League': 'soccer_uefa_champs_league',
     };
 
-    const scoreCache = {}; // cache per sport key to avoid duplicate calls
-
+    const scoreCache = {};
     let settled = 0;
 
     for (const [league, rows] of Object.entries(byLeague)) {
       const sportKey = leagueKeyMap[league];
       if (!sportKey) continue;
 
-      // Fetch scores (cached per sport key)
       if (!scoreCache[sportKey]) {
         try {
           const res = await fetch(`${ODDS_BASE}/sports/${sportKey}/scores/?apiKey=${ODDS_API_KEY}&daysFrom=3`);
@@ -284,8 +330,6 @@ async function settleFootballLab(supabase, ODDS_BASE, ODDS_API_KEY) {
       }
 
       const scores = scoreCache[sportKey];
-
-      // Group rows by fixture
       const byFixture = {};
       for (const row of rows) {
         if (!byFixture[row.fixture_id]) byFixture[row.fixture_id] = [];
@@ -294,24 +338,20 @@ async function settleFootballLab(supabase, ODDS_BASE, ODDS_API_KEY) {
 
       for (const [fixtureId, fixtureRows] of Object.entries(byFixture)) {
         const first = fixtureRows[0];
-
-        // Find matching completed score
         const match = scores.find(s => s.completed && (
           (nameMatch(s.home_team, first.home_team) && nameMatch(s.away_team, first.away_team)) ||
           (nameMatch(s.home_team, first.away_team) && nameMatch(s.away_team, first.home_team))
         ));
-
         if (!match?.scores) continue;
 
         const hh = nameMatch(match.home_team, first.home_team);
-        const hs = parseFloat(match.scores.find(s => nameMatch(s.name, match.home_team))?.score || 0);
+        const hs  = parseFloat(match.scores.find(s => nameMatch(s.name, match.home_team))?.score || 0);
         const as2 = parseFloat(match.scores.find(s => nameMatch(s.name, match.away_team))?.score || 0);
         const homeScore = hh ? hs : as2;
         const awayScore = hh ? as2 : hs;
         const total = homeScore + awayScore;
         const settledAt = new Date().toLocaleDateString('en-CA', { timeZone: 'Europe/London' }) + 'T12:00:00.000Z';
 
-        // Settle each market row
         for (const row of fixtureRows) {
           let won = false;
           switch(row.market) {
@@ -324,24 +364,19 @@ async function settleFootballLab(supabase, ODDS_BASE, ODDS_API_KEY) {
             case 'under35':   won = total < 3.5; break;
             default: continue;
           }
-
           const pl = won
             ? parseFloat(((row.odds - 1) * row.stake).toFixed(2))
             : parseFloat((-row.stake).toFixed(2));
 
           await supabase.from('football_lab').update({
-            result:      won ? 'WON' : 'LOST',
-            profit_loss: pl,
-            settled_at:  settledAt,
+            result: won ? 'WON' : 'LOST', profit_loss: pl, settled_at: settledAt,
           }).eq('id', row.id);
-
           settled++;
         }
       }
     }
 
     if (settled > 0) console.log(`⚽ Football lab: settled ${settled} rows`);
-
   } catch(e) {
     console.error('⚽ Lab settlement error:', e.message);
   }
