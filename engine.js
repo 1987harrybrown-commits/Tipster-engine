@@ -1939,7 +1939,19 @@ async function saveTips(tips) {
 
 
 async function settleResults() {
-  const { data: pending } = await supabase.from('tips').select('*').eq('status','pending').lt('event_time', new Date().toISOString());
+  // Fetch pending tips AND any settled tips missing from results_history
+  const { data: pendingTips } = await supabase.from('tips').select('*').eq('status','pending').lt('event_time', new Date().toISOString());
+  
+  // Also catch tips that settled in tips table but never made it to results_history
+  const { data: missingFromHistory } = await supabase.from('tips')
+    .select('*')
+    .in('status', ['won', 'lost'])
+    .lt('event_time', new Date().toISOString())
+    .not('tip_ref', 'in', 
+      `(${(await supabase.from('results_history').select('tip_ref')).data?.map(r => `'${r.tip_ref}'`).join(',') || "''"})` 
+    );
+
+  const pending = [...(pendingTips || []), ...(missingFromHistory || [])];
   if (!pending?.length) { console.log('🏁 Nothing to settle.'); return; }
 
   // Backfill any NULL tip_refs before settling
@@ -2034,15 +2046,15 @@ async function settleResults() {
         : parseFloat((-tip.stake).toFixed(2));
 
       const { data: already } = await supabase.from('results_history').select('id').eq('tip_ref', tip.tip_ref).maybeSingle();
-      if (already) {
-        await supabase.from('tips').update({ status: won ? 'won' : 'lost' }).eq('tip_ref', tip.tip_ref);
-        continue;
-      }
+      
+      // Always update tips status regardless of results_history state
+      await supabase.from('tips').update({ status: won ? 'won' : 'lost', profit_loss: pl, result_updated_at: new Date().toISOString() }).eq('tip_ref', tip.tip_ref);
+
+      // If already in results_history, skip insert — but still updated tips above
+      if (already) continue;
 
       const { data: last } = await supabase.from('results_history').select('running_pl').order('settled_at', { ascending: false }).limit(1).maybeSingle();
       const runningPL = parseFloat(((last?.running_pl || 0) + pl).toFixed(2));
-
-      await supabase.from('tips').update({ status: won ? 'won' : 'lost', profit_loss: pl, result_updated_at: new Date().toISOString() }).eq('tip_ref', tip.tip_ref);
 
       await supabase.from('results_history').insert({
         tip_ref:    tip.tip_ref,
