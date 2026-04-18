@@ -2752,7 +2752,7 @@ function startScheduler() {
 const http = require('http');
 http.createServer(async (req, res) => {
   const url  = new URL(req.url, 'http://localhost');
-  const cors = { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Methods': 'GET, POST, OPTIONS', 'Access-Control-Allow-Headers': 'Content-Type' };
+  const cors = { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Methods': 'GET, POST, OPTIONS', 'Access-Control-Allow-Headers': 'Content-Type, Authorization' };
 
   if (req.method === 'OPTIONS') { res.writeHead(204, cors); res.end(); return; }
 
