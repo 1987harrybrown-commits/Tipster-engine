@@ -25,7 +25,7 @@ const crypto = require('crypto');
 
 // ─── CREDENTIALS ─────────────────────────────────────────────
 const SUPABASE_URL         = process.env.SUPABASE_URL || 'https://eyhlzzaaxrwisrtwyoyh.supabase.co';
-const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY || '';
+const SUPABASE_SERVICE_KEY = process.env.SUPA_SERVICE_KEY || '';
 const ODDS_API_KEY         = 'cd4587438ed62cce94274935545c86a3';
 const ODDS_BASE            = 'https://api.the-odds-api.com/v4';
 const API_FOOTBALL_KEY     = process.env.API_FOOTBALL_KEY || '';
@@ -34,8 +34,6 @@ const API_FOOTBALL_BASE    = 'https://v3.football.api-sports.io';
 // BallDontLie: free tier for NBA/NHL injuries — sign up at app.balldontlie.io
 const BDL_API_KEY          = process.env.BDL_API_KEY || ''; // add to Render env vars
 
-// Debug env var loading — remove after confirmed working
-console.log('🔑 SUPABASE_SERVICE_KEY present:', !!process.env.SUPABASE_SERVICE_KEY, 'length:', (process.env.SUPABASE_SERVICE_KEY||'').length);
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
 
 // ─── SPORTS CONFIG ────────────────────────────────────────────
