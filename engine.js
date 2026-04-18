@@ -2854,6 +2854,72 @@ http.createServer(async (req, res) => {
     return;
   }
 
+  if (url.pathname === '/tips' && req.method === 'GET') {
+    try {
+      // Verify user session via Authorization header
+      const authHeader = req.headers['authorization'] || '';
+      const token = authHeader.replace('Bearer ', '').trim();
+
+      let isPro = false;
+
+      if (token) {
+        // Validate the JWT with Supabase and get user
+        const { data: { user }, error: authErr } = await supabase.auth.getUser(token);
+        if (!authErr && user) {
+          const { data: profile } = await supabase
+            .from('users')
+            .select('subscription_status, stripe_subscription_id')
+            .eq('id', user.id)
+            .single();
+          // Double-check against Stripe to prevent DB manipulation bypass
+          if (profile?.stripe_subscription_id) {
+            const sub = await stripeRequest(`/subscriptions/${profile.stripe_subscription_id}`);
+            isPro = sub && (sub.status === 'active' || sub.status === 'trialing');
+          }
+        }
+      }
+
+      // Fetch tips from DB
+      const today = new Date(); today.setHours(0,0,0,0);
+      const tom = new Date(today); tom.setDate(tom.getDate() + 3);
+
+      const { data: allTips } = await supabase
+        .from('tips')
+        .select('*')
+        .gte('event_time', today.toISOString())
+        .lte('event_time', tom.toISOString())
+        .eq('status', 'pending')
+        .order('confidence', { ascending: false })
+        .limit(50);
+
+      const tips = (allTips || []).map((tip, i) => {
+        // Free users get first 3 tips with full data, rest are locked stubs
+        const isFree = !isPro;
+        const isLocked = isFree && i >= 3;
+        if (isLocked) {
+          // Return stub — enough to render the card but no actionable data
+          return {
+            tip_ref:    tip.tip_ref,
+            sport:      tip.sport,
+            league:     tip.league,
+            home_team:  tip.home_team,
+            away_team:  tip.away_team,
+            event_time: tip.event_time,
+            tier:       tip.tier,
+            locked:     true,
+          };
+        }
+        return { ...tip, locked: false };
+      });
+
+      res.writeHead(200, { ...cors, 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ tips, isPro })); return;
+    } catch(e) {
+      console.error('Tips endpoint error:', e.message);
+      res.writeHead(500, cors); res.end('Server error'); return;
+    }
+  }
+
   if (url.pathname === '/verify-pro' && req.method === 'POST') {
     let body = '';
     req.on('data', c => { body += c.toString(); });
