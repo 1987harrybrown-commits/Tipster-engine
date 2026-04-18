@@ -24,8 +24,8 @@ const fetch = (...args) => import('node-fetch').then(({ default: f }) => f(...ar
 const crypto = require('crypto');
 
 // ─── CREDENTIALS ─────────────────────────────────────────────
-const SUPABASE_URL         = 'https://eyhlzzaaxrwisrtwyoyh.supabase.co';
-const SUPABASE_SERVICE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImV5aGx6emFheHJ3aXNydHd5b3loIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3MzM3OTI3NywiZXhwIjoyMDg4OTU1Mjc3fQ.9Lry94K4qWWYzh0yd4zcgEaGvb8myeAzxrSHtcBSQus';
+const SUPABASE_URL         = process.env.SUPABASE_URL || 'https://eyhlzzaaxrwisrtwyoyh.supabase.co';
+const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY || '';
 const ODDS_API_KEY         = 'cd4587438ed62cce94274935545c86a3';
 const ODDS_BASE            = 'https://api.the-odds-api.com/v4';
 const API_FOOTBALL_KEY     = process.env.API_FOOTBALL_KEY || '';
