@@ -34,6 +34,8 @@ const API_FOOTBALL_BASE    = 'https://v3.football.api-sports.io';
 // BallDontLie: free tier for NBA/NHL injuries — sign up at app.balldontlie.io
 const BDL_API_KEY          = process.env.BDL_API_KEY || ''; // add to Render env vars
 
+// Debug env var loading — remove after confirmed working
+console.log('🔑 SUPABASE_SERVICE_KEY present:', !!process.env.SUPABASE_SERVICE_KEY, 'length:', (process.env.SUPABASE_SERVICE_KEY||'').length);
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
 
 // ─── SPORTS CONFIG ────────────────────────────────────────────
