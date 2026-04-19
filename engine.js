@@ -2216,7 +2216,15 @@ async function sendEmail({ to, subject, html, type = 'daily' }) {
   } catch(e) { console.error('Email error:', e.message); return null; }
 }
 
-function unsubLink(userId) { return `${SITE_URL}/unsubscribe?token=${Buffer.from(userId).toString('base64')}`; }
+function generateUnsubToken(userId) {
+  const secret = process.env.UNSUBSCRIBE_SECRET || '';
+  return crypto.createHmac('sha256', secret).update(userId).digest('hex');
+}
+function verifyUnsubToken(token, userId) {
+  const expected = generateUnsubToken(userId);
+  return crypto.timingSafeEqual(Buffer.from(token, 'hex'), Buffer.from(expected, 'hex'));
+}
+function unsubLink(userId) { return `${SITE_URL}/unsubscribe?uid=${encodeURIComponent(userId)}&token=${generateUnsubToken(userId)}`; }
 
 function emailBase(content, userId) {
   return `<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
@@ -2752,18 +2760,53 @@ function startScheduler() {
 // ═══════════════════════════════════════════════════════════════
 
 const http = require('http');
+
+// ─── RATE LIMITER ─────────────────────────────────────────────
+// Simple in-memory rate limiter per IP.
+// Limits: 60 requests per minute for general endpoints.
+const rateLimitMap = new Map();
+const RATE_LIMIT    = 60;
+const RATE_WINDOW   = 60 * 1000; // 1 minute
+
+function isRateLimited(ip) {
+  const now = Date.now();
+  const entry = rateLimitMap.get(ip) || { count: 0, start: now };
+  if (now - entry.start > RATE_WINDOW) {
+    entry.count = 1; entry.start = now;
+  } else {
+    entry.count++;
+  }
+  rateLimitMap.set(ip, entry);
+  // Clean up old entries every 1000 requests to prevent memory leak
+  if (rateLimitMap.size > 1000) {
+    for (const [key, val] of rateLimitMap) {
+      if (now - val.start > RATE_WINDOW) rateLimitMap.delete(key);
+    }
+  }
+  return entry.count > RATE_LIMIT;
+}
 http.createServer(async (req, res) => {
   const url  = new URL(req.url, 'http://localhost');
-  const cors = { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Methods': 'GET, POST, OPTIONS', 'Access-Control-Allow-Headers': 'Content-Type, Authorization' };
+  const origin = req.headers['origin'] || '';
+  const allowedOrigins = ['https://www.thetipsteredge.com', 'https://thetipsteredge.com', 'https://the-tipster.vercel.app'];
+  const allowOrigin = allowedOrigins.includes(origin) ? origin : allowedOrigins[0];
+  const cors = { 'Access-Control-Allow-Origin': allowOrigin, 'Access-Control-Allow-Methods': 'GET, POST, OPTIONS', 'Access-Control-Allow-Headers': 'Content-Type, Authorization', 'Vary': 'Origin' };
 
   if (req.method === 'OPTIONS') { res.writeHead(204, cors); res.end(); return; }
+
+  const clientIp = req.headers['x-forwarded-for']?.split(',')[0].trim() || req.socket.remoteAddress || '';
+  if (isRateLimited(clientIp)) {
+    res.writeHead(429, { ...cors, 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'Too many requests' }));
+    return;
+  }
 
   if (url.pathname === '/') {
     res.writeHead(200, { ...cors, 'Content-Type': 'text/plain' });
     res.end(`The Tipster Engine v7.1 | Season: ${seasonFor()}`); return;
   }
 
-  const adminKey = url.searchParams.get('key');
+  const adminKey = (req.headers['authorization'] || '').replace('Bearer ', '').trim();
 
   if (url.pathname === '/admin/generate-acca') {
     if (adminKey !== process.env.ADMIN_KEY) { res.writeHead(403); res.end('Forbidden'); return; }
@@ -2847,9 +2890,11 @@ http.createServer(async (req, res) => {
 
   if (url.pathname === '/unsubscribe') {
     const token = url.searchParams.get('token');
-    if (!token) { res.writeHead(400); res.end('Invalid'); return; }
+    const uid   = url.searchParams.get('uid');
+    if (!token || !uid) { res.writeHead(400); res.end('Invalid'); return; }
     try {
-      await supabase.from('users').update({ email_opt_in: false }).eq('id', Buffer.from(token, 'base64').toString('utf8'));
+      if (!verifyUnsubToken(token, uid)) { res.writeHead(403); res.end('Invalid token'); return; }
+      await supabase.from('users').update({ email_opt_in: false }).eq('id', uid);
       res.writeHead(200, { 'Content-Type': 'text/html' });
       res.end('<html><body style="font-family:sans-serif;text-align:center;padding:60px;background:#07090d;color:#dde6f0;"><h2>Unsubscribed</h2><p>You have been removed from all emails.</p><a href="https://www.thetipsteredge.com/account.html" style="color:#18e07a;">Manage preferences</a></body></html>');
     } catch(e) { res.writeHead(400); res.end('Invalid token'); }
@@ -2949,7 +2994,8 @@ http.createServer(async (req, res) => {
         res.end(JSON.stringify({ isPro: !!isPro }));
       } catch(e) {
         res.writeHead(500, cors);
-        res.end(JSON.stringify({ error: e.message }));
+        console.error('verify-pro error:', e.message);
+        res.end(JSON.stringify({ error: 'Internal error' }));
       }
     });
     return;
