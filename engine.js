@@ -1968,6 +1968,10 @@ async function settleResults() {
 
   console.log(`🏁 Settling ${pending.length} tips...`);
 
+  // Fetch current running PL once before the loop to avoid race condition
+  const { data: lastRow } = await supabase.from('results_history').select('running_pl').order('settled_at', { ascending: false }).limit(1).maybeSingle();
+  let currentRunningPL = parseFloat(lastRow?.running_pl || 0);
+
   const now = Date.now();
   let count = 0;
 
@@ -2055,8 +2059,9 @@ async function settleResults() {
       // If already in results_history, skip insert — but still updated tips above
       if (already) continue;
 
-      const { data: last } = await supabase.from('results_history').select('running_pl').order('settled_at', { ascending: false }).limit(1).maybeSingle();
-      const runningPL = parseFloat(((last?.running_pl || 0) + pl).toFixed(2));
+      // Use in-memory running PL tracker (set before loop) to avoid race condition
+      // where multiple tips settling in same cycle all read the same last row
+      currentRunningPL = parseFloat((currentRunningPL + pl).toFixed(2));
 
       await supabase.from('results_history').insert({
         tip_ref:    tip.tip_ref,
@@ -2068,7 +2073,7 @@ async function settleResults() {
         tier:       tip.tier || 'pro',
         result:     won ? 'WON' : 'LOST',
         profit_loss: pl,
-        running_pl:  runningPL,
+        running_pl:  currentRunningPL,
         settled_at:  (() => { const d = new Date(); const ukDate = d.toLocaleDateString('en-CA', { timeZone: 'Europe/London' }); return ukDate + 'T12:00:00.000Z'; })(),
         confidence:  tip.confidence || 0,
       });
