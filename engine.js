@@ -2736,8 +2736,7 @@ function startScheduler() {
 // ═══════════════════════════════════════════════════════════════
 
 (async () => {
-  console.log(`\n🟢 The Tipster Engine v7.1 (Baseball Hard Block) starting... Season: ${seasonFor()}`);
-  await runEngine();
+  console.log(`\n🟢 The Tipster Engine v7.1 starting... Season: ${seasonFor()} | KEY_CHECK SUPA:${!!process.env.SUPA_SERVICE_KEY} SUPABASE:${!!process.env.SUPABASE_SERVICE_KEY}`);await runEngine();
   await settleResults();
   setInterval(runEngine, 15 * 60 * 1000);
   startScheduler();
