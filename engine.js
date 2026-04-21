@@ -2821,6 +2821,125 @@ http.createServer(async (req, res) => {
     return;
   }
 
+  if (url.pathname === '/admin/resettle') {
+    if (adminKey !== process.env.ADMIN_KEY) { res.writeHead(403); res.end('Forbidden'); return; }
+    res.writeHead(200, { ...cors, 'Content-Type': 'application/json' });
+    // Run async, stream result back
+    (async () => {
+      try {
+        const log = [];
+        const push = msg => { log.push(msg); console.log(msg); };
+
+        push('🔁 HISTORICAL RESETTLEMENT STARTING...');
+
+        const { data: tips, error: tipsErr } = await supabase
+          .from('tips').select('*').in('status', ['won', 'lost'])
+          .order('event_time', { ascending: true });
+
+        if (tipsErr) throw new Error(tipsErr.message);
+        push(`📋 Found ${tips.length} settled tips`);
+
+        const scoreCache = {};
+        const fetchScores = async (sportKey) => {
+          if (scoreCache[sportKey]) return scoreCache[sportKey];
+          const r = await fetch(`${ODDS_BASE}/sports/${sportKey}/scores/?apiKey=${ODDS_API_KEY}&daysFrom=30`);
+          if (!r.ok) { scoreCache[sportKey] = []; return []; }
+          const d = await r.json();
+          scoreCache[sportKey] = Array.isArray(d) ? d : [];
+          push(`📡 ${scoreCache[sportKey].length} scores for ${sportKey}`);
+          return scoreCache[sportKey];
+        };
+
+        let corrected = 0, unchanged = 0, noMatch = 0;
+        const updates = [];
+
+        for (const tip of tips) {
+          const sport = SPORTS.find(s => s.league === tip.league);
+          if (!sport) { noMatch++; continue; }
+
+          const scores = await fetchScores(sport.key);
+          const match = scores.find(s => s.completed && (
+            (nameMatch(s.home_team, tip.home_team) && nameMatch(s.away_team, tip.away_team)) ||
+            (nameMatch(s.home_team, tip.away_team) && nameMatch(s.away_team, tip.home_team))
+          ));
+
+          if (!match?.scores || match.scores.length < 2) { noMatch++; continue; }
+
+          const hh        = nameMatch(match.home_team, tip.home_team);
+          const hs        = parseFloat(match.scores[0]?.score ?? 0);
+          const as2       = parseFloat(match.scores[1]?.score ?? 0);
+          const homeScore = hh ? hs  : as2;
+          const awayScore = hh ? as2 : hs;
+
+          const sel = tip.selection.toLowerCase();
+          let won = false;
+          if (sel.includes('win')) {
+            const team = tip.selection.replace(/ win$/i, '').trim();
+            won = nameMatch(team, tip.home_team) ? homeScore > awayScore : awayScore > homeScore;
+          } else if (sel === 'draw') {
+            won = homeScore === awayScore;
+          } else if (sel.startsWith('over')) {
+            won = (homeScore + awayScore) > parseFloat(sel.replace('over ', ''));
+          } else if (sel.startsWith('under')) {
+            won = (homeScore + awayScore) < parseFloat(sel.replace('under ', ''));
+          } else if (sel.includes('btts')) {
+            won = homeScore > 0 && awayScore > 0;
+          }
+
+          const settlementOdds = parseFloat(tip.best_odds || tip.odds);
+          const pl = won
+            ? parseFloat(((settlementOdds - 1) * tip.stake).toFixed(2))
+            : parseFloat((-tip.stake).toFixed(2));
+          const newStatus = won ? 'won' : 'lost';
+
+          if (tip.status !== newStatus) {
+            push(`✏️  CORRECTION [${tip.tip_ref}] ${tip.home_team} vs ${tip.away_team} | ${tip.selection} | ${homeScore}-${awayScore} | ${tip.status.toUpperCase()} → ${newStatus.toUpperCase()} | ${pl >= 0 ? '+' : ''}${pl}u`);
+            corrected++;
+          } else {
+            unchanged++;
+          }
+          updates.push({ tip, won, pl, newStatus });
+        }
+
+        push(`\n📊 ${corrected} corrections, ${unchanged} unchanged, ${noMatch} no score found`);
+
+        // Update tips table
+        for (const { tip, pl, newStatus } of updates) {
+          await supabase.from('tips').update({ status: newStatus, profit_loss: pl }).eq('tip_ref', tip.tip_ref);
+        }
+
+        // Rebuild results_history
+        push('🗑️  Clearing results_history...');
+        await supabase.from('results_history').delete().neq('id', 0);
+
+        push('📝 Rebuilding results_history...');
+        let runningPL = 0;
+        const sorted = [...updates].sort((a, b) => new Date(a.tip.event_time) - new Date(b.tip.event_time));
+
+        for (const { tip, won, pl } of sorted) {
+          runningPL = parseFloat((runningPL + pl).toFixed(2));
+          const settlementOdds = parseFloat(tip.best_odds || tip.odds);
+          await supabase.from('results_history').insert({
+            tip_ref: tip.tip_ref, sport: tip.sport,
+            event: `${tip.home_team} vs ${tip.away_team}`,
+            selection: tip.selection, odds: settlementOdds, stake: tip.stake,
+            tier: tip.tier || 'pro', result: won ? 'WON' : 'LOST',
+            profit_loss: pl, running_pl: runningPL, league: tip.league,
+            confidence: tip.confidence,
+            settled_at: tip.result_updated_at || tip.event_time,
+          });
+        }
+
+        push(`✅ DONE — ${sorted.length} tips rebuilt | Final P&L: ${runningPL >= 0 ? '+' : ''}${runningPL}u | Corrections: ${corrected}`);
+        res.end(JSON.stringify({ success: true, corrected, unchanged, noMatch, finalPL: runningPL, log }));
+      } catch (e) {
+        console.error('Resettle error:', e.message);
+        res.end(JSON.stringify({ success: false, error: e.message }));
+      }
+    })();
+    return;
+  }
+
   if (url.pathname === '/admin/test-email') {
     if (adminKey !== process.env.ADMIN_KEY) { res.writeHead(403); res.end('Forbidden'); return; }
     const r = await sendTestEmail(url.searchParams.get('to'), url.searchParams.get('type')||'daily');
