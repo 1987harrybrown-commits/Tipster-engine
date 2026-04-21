@@ -2002,8 +2002,8 @@ async function settleResults() {
           ));
           if (!match?.scores) { console.log(`⏳ No result yet: ${tip.home_team} vs ${tip.away_team}`); continue; }
           const hh = nameMatch(match.home_team, tip.home_team);
-          const hs = parseFloat(match.scores.find(s => nameMatch(s.name, match.home_team))?.score || 0);
-          const as2 = parseFloat(match.scores.find(s => nameMatch(s.name, match.away_team))?.score || 0);
+          const hs  = parseFloat(match.scores[0]?.score ?? 0);
+          const as2 = parseFloat(match.scores[1]?.score ?? 0);
           homeScore = hh ? hs : as2;
           awayScore = hh ? as2 : hs;
         } catch(e) { console.error(`Scores fetch error:`, e.message); continue; }
@@ -2020,8 +2020,8 @@ async function settleResults() {
         ));
         if (!match?.scores) { console.log(`⏳ No scores: ${tip.home_team} vs ${tip.away_team}`); continue; }
         const hh = nameMatch(match.home_team, tip.home_team);
-        const hs = parseFloat(match.scores.find(s => nameMatch(s.name, match.home_team))?.score || 0);
-        const as2 = parseFloat(match.scores.find(s => nameMatch(s.name, match.away_team))?.score || 0);
+        const hs  = parseFloat(match.scores[0]?.score ?? 0);
+        const as2 = parseFloat(match.scores[1]?.score ?? 0);
         homeScore = hh ? hs : as2;
         awayScore = hh ? as2 : hs;
       } else { continue; }
