@@ -133,23 +133,34 @@ async function fetchAllFormData() {
   console.log('📊 Fetching form data at 06:00...');
   formApiCalls = 0;
 
-  const { data: tips } = await supabase
+  // Seed already-fetched teams from existing formCache to avoid duplicate calls
+  const alreadyFetchedTeams = new Set(Object.keys(formCache).map(k => k.split('_')[0]));
+
+  // Only fetch form for tomorrow's football fixtures that pass bookmaker sanity check
+  // getEligibleFootballFormFixtures enforces the MAX_FOOTBALL_FORM_CALLS hard cap
+  // and deduplicates teams to control actual call count precisely
+  const { data: pendingTips } = await supabase
     .from('tips').select('home_team, away_team, league').eq('status', 'pending').eq('sport', 'Football');
 
-  if (!tips?.length) { formFetchedDate = today; return; }
+  if (!pendingTips?.length) { formFetchedDate = today; return; }
 
+  // Build mock event objects for the eligible fixture checker
+  // We only have team names from pending tips, so sanity check is simplified here
   const pairs = new Set();
-  for (const t of tips) {
+  for (const t of pendingTips) {
     const sport = SPORTS.find(s => s.league === t.league);
     if (!sport?.leagueId) continue;
-    pairs.add(`${t.home_team}||${sport.leagueId}`);
-    pairs.add(`${t.away_team}||${sport.leagueId}`);
+    // Only add if not already cached
+    if (!alreadyFetchedTeams.has(t.home_team)) pairs.add(`${t.home_team}||${sport.leagueId}`);
+    if (!alreadyFetchedTeams.has(t.away_team)) pairs.add(`${t.away_team}||${sport.leagueId}`);
   }
 
+  let formCallsUsed = 0;
   for (const entry of pairs) {
-    if (formApiCalls >= MAX_FORM_CALLS) break;
+    if (formCallsUsed >= MAX_FOOTBALL_FORM_CALLS) break;
     const [team, lid] = entry.split('||');
     await fetchTeamForm(team, parseInt(lid));
+    formCallsUsed++;
     await new Promise(r => setTimeout(r, 350));
   }
 
@@ -325,10 +336,17 @@ function getLeagueAvg(leagueId) {
 // Shared by form fetcher, season stats, H2H, and settler.
 // Prevents overrun on free plan (100/day).
 // Resets automatically when date changes.
+// ─── API CALL BUDGET ─────────────────────────────────────────
+// Football = 55/day, NHL = 30/day, NBA = 0 (disabled)
+// Total = 85/day — one shared counter across all sports
+const API_BUDGET_LIMITS = { football: 55, nhl: 30, nba: 0, total: 85 };
+const MAX_FOOTBALL_FORM_CALLS = 10; // hard cap — enforced by call counter not fixture count
+const ENABLE_NBA_TIPS = false;      // disabled: ptsAgainst defaults to league avg, model unreliable
+
 let apiBudget = {
   date:  '',
   used:  0,
-  limit: 88, // 88 hard ceiling, leaves 12 for settler
+  limit: 85, // total daily ceiling across all sports
 };
 
 function budgetCheck(n = 1) {
@@ -732,6 +750,186 @@ function confidenceFromEdge(edgePct, formQuality, hasFullStats) {
   return Math.min(95, Math.max(75, fromEdge + formAdj + dataAdj));
 }
 
+// ═══════════════════════════════════════════════════════════════
+// NEW SELECTION SYSTEM
+// Replaces highest-edge selection with quality-scored system.
+// All candidates pass through veto → score → threshold check.
+// ═══════════════════════════════════════════════════════════════
+
+// ── TOMORROW CHECK ────────────────────────────────────────────
+// Returns true if event falls on tomorrow's date in Europe/London timezone.
+function isTomorrowFixture(commenceTime) {
+  if (!commenceTime) return false;
+  const eventDate = new Date(commenceTime);
+  if (isNaN(eventDate.getTime())) return false;
+  const londonNow = new Date(new Date().toLocaleString('en-GB', { timeZone: 'Europe/London' }));
+  const londonTomorrow = new Date(londonNow);
+  londonTomorrow.setDate(londonTomorrow.getDate() + 1);
+  const eventStr    = new Intl.DateTimeFormat('en-CA', { timeZone: 'Europe/London', year: 'numeric', month: '2-digit', day: '2-digit' }).format(eventDate);
+  const tomorrowStr = new Intl.DateTimeFormat('en-CA', { timeZone: 'Europe/London', year: 'numeric', month: '2-digit', day: '2-digit' }).format(londonTomorrow);
+  return eventStr === tomorrowStr;
+}
+
+// ── BOOKMAKER SANITY CHECK ────────────────────────────────────
+// Football fixture passes only if:
+// - At least 2 bookmakers provide full 1X2 market
+// - Home and away odds both within valid odds range
+function passedBookmakerSanityCheck(event, sport) {
+  if (sport !== 'Football') return false;
+  let complete1x2Books = 0;
+  let bestHomeOdds = 0;
+  let bestAwayOdds = 0;
+  for (const book of (event.bookmakers || [])) {
+    const h2h = book.markets?.find(m => m.key === 'h2h');
+    if (!h2h) continue;
+    let hasHome = false, hasAway = false, hasDraw = false;
+    for (const o of (h2h.outcomes || [])) {
+      if (nameMatch(o.name, event.home_team))       { hasHome = true; if (o.price > bestHomeOdds) bestHomeOdds = o.price; }
+      else if (nameMatch(o.name, event.away_team))  { hasAway = true; if (o.price > bestAwayOdds) bestAwayOdds = o.price; }
+      else if (o.name === 'Draw')                   { hasDraw = true; }
+    }
+    if (hasHome && hasAway && hasDraw) complete1x2Books++;
+  }
+  return (
+    complete1x2Books >= 2 &&
+    bestHomeOdds >= ODDS_MIN && bestHomeOdds <= ODDS_ELITE_MAX &&
+    bestAwayOdds >= ODDS_MIN && bestAwayOdds <= ODDS_ELITE_MAX
+  );
+}
+
+// ── ELIGIBLE FORM FIXTURES ────────────────────────────────────
+// Returns tomorrow's football fixtures that pass sanity check,
+// sorted by bookmaker depth, respecting MAX_FOOTBALL_FORM_CALLS.
+// Deduplicates teams using alreadyFetchedTeams (seeded from formCache).
+function getEligibleFootballFormFixtures(events, sport, alreadyFetchedTeams = new Set()) {
+  if (sport !== 'Football') return [];
+  const eligible = events
+    .filter(event => isTomorrowFixture(event.commence_time) && passedBookmakerSanityCheck(event, sport))
+    .map(event => {
+      let depth = 0;
+      for (const book of (event.bookmakers || [])) {
+        const h2h = book.markets?.find(m => m.key === 'h2h');
+        if (!h2h) continue;
+        let hasHome = false, hasAway = false, hasDraw = false;
+        for (const o of (h2h.outcomes || [])) {
+          if (nameMatch(o.name, event.home_team)) hasHome = true;
+          else if (nameMatch(o.name, event.away_team)) hasAway = true;
+          else if (o.name === 'Draw') hasDraw = true;
+        }
+        if (hasHome && hasAway && hasDraw) depth++;
+      }
+      return { event, bookmakerDepth: depth };
+    })
+    .sort((a, b) => b.bookmakerDepth - a.bookmakerDepth);
+
+  const selected = [];
+  let callsUsed = 0;
+  for (const { event } of eligible) {
+    let needed = 0;
+    if (!alreadyFetchedTeams.has(event.home_team)) needed++;
+    if (!alreadyFetchedTeams.has(event.away_team)) needed++;
+    if (callsUsed + needed > MAX_FOOTBALL_FORM_CALLS) break;
+    selected.push(event);
+    if (!alreadyFetchedTeams.has(event.home_team)) { alreadyFetchedTeams.add(event.home_team); callsUsed++; }
+    if (!alreadyFetchedTeams.has(event.away_team)) { alreadyFetchedTeams.add(event.away_team); callsUsed++; }
+  }
+  return selected;
+}
+
+// ── VETO LAYER ────────────────────────────────────────────────
+// Hard reject before scoring. Any true = reject.
+// Football probGap = top - second (draw included).
+// NHL probGap = abs(home - away) (2-way market).
+function vetoCandidate({ sport, hasCoreData, hasCompleteMarket, homeWinProb, drawProb = 0, awayWinProb, adverseLineMove }) {
+  const minTopOutcomeProb = sport === 'Football' ? 0.42 : 0.50;
+  let topOutcomeProb, probGap;
+  if (sport === 'Football') {
+    const probs = [homeWinProb, drawProb, awayWinProb].sort((a, b) => b - a);
+    topOutcomeProb = probs[0];
+    probGap = probs[0] - probs[1];
+  } else {
+    topOutcomeProb = Math.max(homeWinProb, awayWinProb);
+    probGap = Math.abs(homeWinProb - awayWinProb);
+  }
+  if (!hasCoreData)          return true;
+  if (!hasCompleteMarket)    return true;
+  if (topOutcomeProb < minTopOutcomeProb) return true;
+  if (probGap < 0.10)        return true;
+  if (adverseLineMove >= 0.10) return true;
+  return false;
+}
+
+// ── DATA QUALITY TIER ─────────────────────────────────────────
+function getDataQualityTier({ hasFullStats, hasFormFallback }) {
+  if (hasFullStats)    return 1.0;
+  if (hasFormFallback) return 0.7;
+  return 0.0;
+}
+
+// ── PROBABILITY STRENGTH ──────────────────────────────────────
+// How far the model probability is from 50% — range 0 to 1.
+function getProbabilityStrength(modelProb) {
+  return Math.min(1, Math.abs(modelProb - 0.5) / 0.5);
+}
+
+// ── CANDIDATE QUALITY SCORE ───────────────────────────────────
+// 3-signal score: edge (primary 60%), probability strength (25%), data quality (15%).
+// Edge dominates but is tempered by model conviction and data reliability.
+function scoreCandidate({ edgePct, modelProb, dataQualityTier }) {
+  const edgeScore   = Math.max(0, edgePct) / 20;
+  const probStrength = getProbabilityStrength(modelProb);
+  return edgeScore * 0.60 + probStrength * 0.25 + dataQualityTier * 0.15;
+}
+
+// ── PICK BEST CANDIDATE ───────────────────────────────────────
+// Scores all candidates, returns highest scorer above threshold.
+// Returns null if no candidate meets MIN_QUALITY_SCORE.
+const MIN_QUALITY_SCORE = 0.42;
+
+function pickBestCandidate(candidates) {
+  if (!candidates.length) return null;
+  const scored = candidates.map(c => ({
+    ...c,
+    qualityScore: scoreCandidate({
+      edgePct:         c.edge,
+      modelProb:       c.modelProb,
+      dataQualityTier: c.dataQualityTier,
+    }),
+  }));
+  const best = scored.reduce((a, b) => a.qualityScore >= b.qualityScore ? a : b);
+  if (best.qualityScore < MIN_QUALITY_SCORE) return null;
+  return best;
+}
+
+// ── UPDATED CONFIDENCE FUNCTION ───────────────────────────────
+// Edge-band base + 2 additional signals: probability strength and data quality.
+// NHL tips capped at 82 due to missing goalie data.
+function confidenceFromSignals({ edgePct, modelProb, dataQualityTier, sport }) {
+  // Base from edge bands
+  let conf;
+  if      (edgePct >= 18) conf = 88;
+  else if (edgePct >= 14) conf = 84;
+  else if (edgePct >= 10) conf = 80;
+  else if (edgePct >= 8)  conf = 77;
+  else                    conf = 74;
+
+  // Signal 1: probability strength
+  const probStrength = Math.min(1, Math.abs(modelProb - 0.5) / 0.5);
+  if (probStrength >= 0.30) conf += 2;
+  else if (probStrength >= 0.20) conf += 1;
+  else if (probStrength < 0.10)  conf -= 1;
+
+  // Signal 2: data quality penalty
+  if (dataQualityTier === 0.7) conf -= 3;
+
+  conf = Math.max(70, Math.min(92, Math.round(conf)));
+
+  // NHL cap: permanently 82 due to missing goalie starter data
+  if (sport === 'Ice Hockey') conf = applyNHLGoalieConfidenceCap(conf);
+
+  return conf;
+}
+
 // ── J. MARKET-AWARE FORM ADJUSTMENT ──────────────────────────
 // Returns a form quality signal (0–1) for use in confidence calculation.
 // This is NOT added directly to confidence — it feeds confidenceFromEdge
@@ -897,8 +1095,8 @@ async function analyseFootballFixture(event, sport) {
       if (edge >= MIN_EDGE_PCT) {
         const kelly  = kellyStake(homeWin, market.homeOdds);
         if (kelly > 0) {
-          const fq   = getFormQuality(hf, af, 'home');
-          const conf = confidenceFromEdge(edge, fq, hasFullStats);
+          const tier_ = getDataQualityTier({ hasFullStats, hasFormFallback: !hasFullStats && (hf !== null || af !== null) });
+          const conf = confidenceFromSignals({ edgePct: edge, modelProb: homeWin, dataQualityTier: tier_, sport: 'Football' });
           if (conf >= MIN_CONFIDENCE) candidates.push({
             market: 'home', edge, modelProb: homeWin,
             fairPrice: fairOdds(homeWin), bookOdds: market.homeOdds,
@@ -915,8 +1113,8 @@ async function analyseFootballFixture(event, sport) {
       if (edge >= MIN_EDGE_PCT) {
         const kelly = kellyStake(awayWin, market.awayOdds);
         if (kelly > 0) {
-          const fq   = getFormQuality(hf, af, 'away');
-          const conf = confidenceFromEdge(edge, fq, hasFullStats);
+          const tier_ = getDataQualityTier({ hasFullStats, hasFormFallback: !hasFullStats && (hf !== null || af !== null) });
+          const conf = confidenceFromSignals({ edgePct: edge, modelProb: awayWin, dataQualityTier: tier_, sport: 'Football' });
           if (conf >= MIN_CONFIDENCE) candidates.push({
             market: 'away', edge, modelProb: awayWin,
             fairPrice: fairOdds(awayWin), bookOdds: market.awayOdds,
@@ -933,8 +1131,8 @@ async function analyseFootballFixture(event, sport) {
       if (edge >= MIN_EDGE_PCT + 5) { // +5% extra hurdle — draws are noisiest market
         const kelly = kellyStake(draw, market.drawOdds);
         if (kelly > 0) {
-          const fq   = getFormQuality(hf, af, 'draw');
-          const conf = confidenceFromEdge(edge, fq, hasFullStats);
+          const tier_ = getDataQualityTier({ hasFullStats, hasFormFallback: !hasFullStats && (hf !== null || af !== null) });
+          const conf = confidenceFromSignals({ edgePct: edge, modelProb: draw, dataQualityTier: tier_, sport: 'Football' });
           if (conf >= MIN_CONFIDENCE) candidates.push({
             market: 'draw', edge, modelProb: draw,
             fairPrice: fairOdds(draw), bookOdds: market.drawOdds,
@@ -951,8 +1149,8 @@ async function analyseFootballFixture(event, sport) {
       if (edge >= MIN_EDGE_PCT) {
         const kelly = kellyStake(over25, market.over25Odds);
         if (kelly > 0) {
-          const fq   = getFormQuality(hf, af, 'over25');
-          const conf = confidenceFromEdge(edge, fq, hasFullStats);
+          const tier_ = getDataQualityTier({ hasFullStats, hasFormFallback: !hasFullStats && (hf !== null || af !== null) });
+          const conf = confidenceFromSignals({ edgePct: edge, modelProb: over25, dataQualityTier: tier_, sport: 'Football' });
           if (conf >= MIN_CONFIDENCE) candidates.push({
             market: 'over25', edge, modelProb: over25,
             fairPrice: fairOdds(over25), bookOdds: market.over25Odds,
@@ -965,13 +1163,28 @@ async function analyseFootballFixture(event, sport) {
 
     if (!candidates.length) return null;
 
-    // Pick highest-edge candidate — edge is the primary signal
-    const pick = candidates.reduce((a, b) => a.edge >= b.edge ? a : b);
+    // ── Veto + quality score selection ─────────────────────────
+    // Apply veto layer first, then score remaining candidates.
+    const vetoed = candidates.filter(c => !vetoCandidate({
+      sport:             'Football',
+      hasCoreData:       hasFullStats || (hf !== null && af !== null),
+      hasCompleteMarket: !!market,
+      homeWinProb:       homeWin,
+      drawProb:          draw,
+      awayWinProb:       awayWin,
+      adverseLineMove:   0, // line movement tracking not yet implemented
+    }));
+
+    // Attach data quality tier to each candidate
+    const tier = getDataQualityTier({ hasFullStats, hasFormFallback: !hasFullStats && (hf !== null || af !== null) });
+    const withTier = vetoed.map(c => ({ ...c, dataQualityTier: tier }));
+
+    // Pick best by quality score — returns null if none pass threshold
+    const pick = pickBestCandidate(withTier);
+    if (!pick) return null;
 
     // H2H record string for notes
-    const h2hStr = (h2h.total >= 3)
-      ? `${h2h.homeWins}W-${h2h.draws}D-${h2h.awayWins}L (last ${h2h.total})`
-      : null;
+    const h2hStr = null; // H2H removed to preserve API budget
 
     const notes = buildFootballNotes({
       market:      pick.market,
@@ -1444,6 +1657,19 @@ const NHL_HOME_ADVANTAGE  = 0.20;
 const NHL_LEAGUE_AVG_GF   = 3.10; // goals per game per team, recent seasons
 const NHL_MATRIX_MAX      = 7;
 
+// ─── NHL GOALIE DATA ──────────────────────────────────────────
+// BDL does not reliably expose confirmed NHL starter data.
+// Flag is permanently false — all NHL tips run under 82 confidence ceiling.
+const HAS_CONFIRMED_NHL_GOALIE_DATA = false;
+const NHL_CONFIDENCE_CEILING = 82;
+
+function applyNHLGoalieConfidenceCap(confidence) {
+  if (!HAS_CONFIRMED_NHL_GOALIE_DATA) {
+    return Math.min(confidence, NHL_CONFIDENCE_CEILING);
+  }
+  return confidence;
+}
+
 async function analyseNHLFixture(event, sport) {
   try {
     const [homeStats, awayStats] = await Promise.all([
@@ -1511,7 +1737,7 @@ async function analyseNHLFixture(event, sport) {
     if (market.homeOdds >= 1.25 && market.homeOdds <= 4.5 && market.trueHome > 0) {
       const edge = calcEdge(homeWinML, market.trueHome);
       if (edge >= MIN_EDGE_PCT) {
-        const conf  = Math.min(92, Math.max(75, Math.round(75 + (edge - 5) * 1.5) - injPen));
+        const conf  = confidenceFromSignals({ edgePct: edge, modelProb: homeWinML, dataQualityTier: 1.0, sport: 'Ice Hockey' });
         const stake = kellyStake(homeWinML, market.homeOdds);
         if (stake > 0 && conf >= MIN_CONFIDENCE) candidates.push({
           selection: `${event.home_team} Win`, market: 'home', edge,
@@ -1526,7 +1752,7 @@ async function analyseNHLFixture(event, sport) {
     if (market.awayOdds >= 1.25 && market.awayOdds <= 4.5 && market.trueAway > 0) {
       const edge = calcEdge(awayWinML, market.trueAway);
       if (edge >= MIN_EDGE_PCT) {
-        const conf  = Math.min(92, Math.max(75, Math.round(75 + (edge - 5) * 1.5) - injPen));
+        const conf  = confidenceFromSignals({ edgePct: edge, modelProb: awayWinML, dataQualityTier: 1.0, sport: 'Ice Hockey' });
         const stake = kellyStake(awayWinML, market.awayOdds);
         if (stake > 0 && conf >= MIN_CONFIDENCE) candidates.push({
           selection: `${event.away_team} Win`, market: 'away', edge,
@@ -1542,7 +1768,7 @@ async function analyseNHLFixture(event, sport) {
       const over55IP = 1 / market.over25Odds;
       const edge = calcEdge(over55, over55IP);
       if (edge >= MIN_EDGE_PCT) {
-        const conf  = Math.min(90, Math.max(75, Math.round(75 + (edge - 5) * 1.2)));
+        const conf  = confidenceFromSignals({ edgePct: edge, modelProb: over55, dataQualityTier: 1.0, sport: 'Ice Hockey' });
         const stake = kellyStake(over55, market.over25Odds);
         if (stake > 0 && conf >= MIN_CONFIDENCE) candidates.push({
           selection: 'Over 5.5', market: 'over55', edge,
@@ -1554,7 +1780,21 @@ async function analyseNHLFixture(event, sport) {
     }
 
     if (!candidates.length) return null;
-    const pick = candidates.reduce((a, b) => a.edge >= b.edge ? a : b);
+
+    // ── Veto + quality score selection ─────────────────────────
+    const vetoed = candidates.filter(c => !vetoCandidate({
+      sport:             'Ice Hockey',
+      hasCoreData:       !!(homeStats && awayStats),
+      hasCompleteMarket: !!market,
+      homeWinProb:       homeWinML,
+      drawProb:          0,
+      awayWinProb:       awayWinML,
+      adverseLineMove:   0,
+    }));
+    const nhlTier = getDataQualityTier({ hasFullStats: !!(homeStats && awayStats), hasFormFallback: false });
+    const withTier = vetoed.map(c => ({ ...c, dataQualityTier: nhlTier }));
+    const pick = pickBestCandidate(withTier);
+    if (!pick) return null;
 
     return {
       tip_ref:    generateTipRef('Ice Hockey'),
