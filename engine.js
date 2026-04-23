@@ -385,6 +385,30 @@ const LEAGUE_FD_CODE = {
 const fdStandingsCache = {};
 const teamStatsCache = {};
 
+// Name aliases: Odds API name → football-data.org name
+// Add entries here whenever a team name mismatch appears in logs
+const FD_NAME_ALIASES = {
+  'RC Lens':               'Lens',
+  'Paris Saint-Germain':   'Paris Saint-Germain FC',
+  'Atletico Madrid':       'Atlético de Madrid',
+  'Athletic Club':         'Athletic Club',
+  'Manchester City':       'Manchester City FC',
+  'Manchester United':     'Manchester United FC',
+  'Tottenham Hotspur':     'Tottenham Hotspur FC',
+  'Newcastle United':      'Newcastle United FC',
+  'West Ham United':       'West Ham United FC',
+  'Wolverhampton Wanderers': 'Wolverhampton Wanderers FC',
+  'Nottingham Forest':     "Nottingham Forest FC",
+  'Brighton and Hove Albion': 'Brighton & Hove Albion FC',
+  'Bayer Leverkusen':      'Bayer 04 Leverkusen',
+  'Borussia Dortmund':     'Borussia Dortmund',
+  'Eintracht Frankfurt':   'Eintracht Frankfurt',
+  'AC Milan':              'AC Milan',
+  'Inter Milan':           'FC Internazionale Milano',
+  'AS Roma':               'AS Roma',
+  'Napoli':                'SSC Napoli',
+};
+
 async function fetchFDStandings(leagueId) {
   const today = new Date().toISOString().split('T')[0];
   if (fdStandingsCache[leagueId]?.date === today) return fdStandingsCache[leagueId].teams;
@@ -429,10 +453,11 @@ async function fetchTeamSeasonStats(teamName, leagueId) {
   const teams = await fetchFDStandings(leagueId);
   if (!teams) return null;
 
-  // Match by name — football-data.org uses full names like "Manchester City FC"
+  // Match by name — check alias map first, then fuzzy match
+  const aliasedName = FD_NAME_ALIASES[teamName] || teamName;
   let match = null;
   for (const [fdName, stats] of Object.entries(teams)) {
-    if (nameMatch(fdName, teamName)) { match = stats; break; }
+    if (nameMatch(fdName, aliasedName) || nameMatch(fdName, teamName)) { match = stats; break; }
   }
 
   if (!match) {
