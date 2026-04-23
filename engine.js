@@ -2126,6 +2126,8 @@ async function saveTips(tips) {
         .gte('event_time', `${date}T00:00:00Z`).lte('event_time', `${date}T23:59:59Z`)
         .in('status', ['pending', 'won', 'lost', 'void']).maybeSingle();
       if (existing) {
+  if (existing.status !== 'pending') { skipped++; continue; } // already settled, skip
+  // Always refresh odds and bookmaker...
         // Always refresh odds and bookmaker — lines move every 15 minutes.
         // Also update confidence, stake and notes if the model reprices.
         // Only skip if literally nothing has changed (within tiny float tolerance).
