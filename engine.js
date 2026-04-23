@@ -915,6 +915,11 @@ function vetoCandidate({ sport, hasCoreData, hasCompleteMarket, homeWinProb, dra
   if (topOutcomeProb < minTopOutcomeProb) return true;
   if (probGap < 0.10)        return true;
   if (adverseLineMove >= 0.10) return true;
+  // Veto if model is implausibly confident — likely a data error (inflated lambda)
+  const topModelProb = sport === 'Football'
+    ? Math.max(homeWinProb, drawProb, awayWinProb)
+    : Math.max(homeWinProb, awayWinProb);
+  if (topModelProb > 0.82)   return true;
   return false;
 }
 
@@ -935,7 +940,7 @@ function getProbabilityStrength(modelProb) {
 // 3-signal score: edge (primary 60%), probability strength (25%), data quality (15%).
 // Edge dominates but is tempered by model conviction and data reliability.
 function scoreCandidate({ edgePct, modelProb, dataQualityTier }) {
-  const edgeScore   = Math.max(0, edgePct) / 20;
+  const edgeScore   = Math.min(1, Math.max(0, edgePct) / 20); // capped at 1.0 — prevents fake large edges dominating
   const probStrength = getProbabilityStrength(modelProb);
   return edgeScore * 0.60 + probStrength * 0.25 + dataQualityTier * 0.15;
 }
@@ -1108,11 +1113,16 @@ async function analyseFootballFixture(event, sport) {
       lambdaAway = awayAttack * homeDef   * lgAway;
 
     } else if (hf && af) {
-      // Fallback: use last-5 form averages as λ proxies.
-      // Less precise but usable. Confidence penalised via hasFullStats=false.
-      lambdaHome = (hf.avgGoalsFor + af.avgGoalsAgainst) / 2;
-      lambdaAway = (af.avgGoalsFor + hf.avgGoalsAgainst) / 2;
-      console.log(`  ⚠️ Form-fallback λ: ${event.home_team} vs ${event.away_team}`);
+      // Fallback: use last-5 form averages as λ proxies, normalised via league averages.
+      // Mirrors the full-stats attack/defence formula so lambdas stay calibrated.
+      // Confidence penalised via hasFullStats=false.
+      const hfAttack = hf.avgGoalsFor     / lgHome;
+      const hfDef    = hf.avgGoalsAgainst / lgAway;
+      const afAttack = af.avgGoalsFor     / lgAway;
+      const afDef    = af.avgGoalsAgainst / lgHome;
+      lambdaHome = hfAttack * afDef  * lgHome;
+      lambdaAway = afAttack * hfDef  * lgAway;
+      console.log(`  ⚠️ Form-fallback λ (normalised): ${event.home_team} vs ${event.away_team}`);
     } else {
       // No data available — refuse to price
       return null;
@@ -1128,9 +1138,10 @@ async function analyseFootballFixture(event, sport) {
     lambdaHome = lambdaHome * (1 + h2h.homeMod);
     lambdaAway = lambdaAway * (1 + h2h.awayMod);
 
-    // Clamp to realistic range
-    const lH = Math.max(0.25, Math.min(5.0, lambdaHome));
-    const lA = Math.max(0.25, Math.min(5.0, lambdaAway));
+    // Clamp to realistic range — football xG rarely exceeds 3.0 per team per match.
+    // Ceiling of 2.8 prevents runaway fallback values corrupting the matrix.
+    const lH = Math.max(0.30, Math.min(2.8, lambdaHome));
+    const lA = Math.max(0.30, Math.min(2.8, lambdaAway));
 
     // ── 3. Score matrix with Dixon-Coles correction ─────────
     const matrix = buildScoreMatrix(lH, lA);
