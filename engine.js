@@ -32,9 +32,10 @@ if (!ODDS_API_KEY) throw new Error('FATAL: ODDS_API_KEY env var is not set');
 const ODDS_BASE            = 'https://api.the-odds-api.com/v4';
 const API_FOOTBALL_KEY     = process.env.API_FOOTBALL_KEY || '';
 const API_FOOTBALL_BASE    = 'https://v3.football.api-sports.io';
-// API-Sports Basketball + Hockey use same key, separate endpoints + separate 100/day budgets
-// BallDontLie: free tier for NBA/NHL injuries — sign up at app.balldontlie.io
+// BallDontLie: free tier for NBA/NHL injuries + NBA stats
 const BDL_API_KEY          = process.env.BDL_API_KEY || ''; // add to Render env vars
+// football-data.org: free tier for football standings (Premier League, La Liga etc)
+const FOOTBALL_DATA_TOKEN  = process.env.FOOTBALL_DATA_TOKEN || '315a4b3479ba41d0bd6def1a02d2f425';
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
 
@@ -341,7 +342,7 @@ function getLeagueAvg(leagueId) {
 // Total = 85/day — one shared counter across all sports
 const API_BUDGET_LIMITS = { football: 55, nhl: 30, nba: 0, total: 85 };
 const MAX_FOOTBALL_FORM_CALLS = 10; // hard cap — enforced by call counter not fixture count
-const ENABLE_NBA_TIPS = false;      // disabled: ptsAgainst defaults to league avg, model unreliable
+const ENABLE_NBA_TIPS = true;       // enabled: stats now sourced from BallDontLie games cache
 
 let apiBudget = {
   date:  '',
@@ -362,72 +363,105 @@ function budgetStatus() {
 }
 
 // ── C. TEAM SEASON STATS ──────────────────────────────────────
-// Fetches full season home/away goals for/against from API-Football.
-// Cached per team+league+season — fetched once then reused all day.
+// Uses football-data.org free tier — no call limits that matter for our use.
+// One standings call per league fetches ALL teams at once.
+// Returns goalsFor, goalsAgainst, playedGames per team from standings.
+// Home/away splits not available on free tier — we use overall averages.
 // Guards against < 4 games played (stats unreliable early season).
+
+const FOOTBALL_DATA_BASE  = 'https://api.football-data.org/v4';
+
+// Map API-Football leagueId → football-data.org competition code
+const LEAGUE_FD_CODE = {
+  39:  'PL',  // Premier League
+  140: 'PD',  // La Liga
+  78:  'BL1', // Bundesliga
+  135: 'SA',  // Serie A
+  61:  'FL1', // Ligue 1
+  2:   'CL',  // Champions League
+};
+
+// Cache: leagueId → { date, teams: { teamName → stats } }
+const fdStandingsCache = {};
 const teamStatsCache = {};
+
+async function fetchFDStandings(leagueId) {
+  const today = new Date().toISOString().split('T')[0];
+  if (fdStandingsCache[leagueId]?.date === today) return fdStandingsCache[leagueId].teams;
+
+  const code = LEAGUE_FD_CODE[leagueId];
+  if (!code) return null;
+
+  try {
+    const res = await fetch(
+      `${FOOTBALL_DATA_BASE}/competitions/${code}/standings`,
+      { headers: { 'X-Auth-Token': FOOTBALL_DATA_TOKEN } }
+    );
+    if (!res.ok) { console.log(`⚠️ FD standings ${code}: ${res.status}`); return null; }
+    const data = await res.json();
+
+    const standings = data.standings?.[0]?.table || [];
+    const teams = {};
+    for (const row of standings) {
+      const name = row.team?.name || '';
+      if (!name) continue;
+      teams[name] = {
+        playedGames:  row.playedGames || 0,
+        goalsFor:     row.goalsFor    || 0,
+        goalsAgainst: row.goalsAgainst || 0,
+        // Derive per-game averages
+        goalsForPG:     row.playedGames > 0 ? row.goalsFor    / row.playedGames : 0,
+        goalsAgainstPG: row.playedGames > 0 ? row.goalsAgainst / row.playedGames : 0,
+      };
+    }
+
+    fdStandingsCache[leagueId] = { date: today, teams };
+    console.log(`⚽ FD standings ${code}: ${standings.length} teams loaded`);
+    return teams;
+  } catch(e) { console.error(`FD standings error (${code}):`, e.message); return null; }
+}
 
 async function fetchTeamSeasonStats(teamName, leagueId) {
   const season   = seasonFor(leagueId);
   const cacheKey = `stats_${teamName}_${leagueId}_${season}`;
   if (teamStatsCache[cacheKey]) return teamStatsCache[cacheKey];
 
-  // Reuse team ID from formCache if already resolved today
-  const formKey = `${teamName}_${leagueId}`;
-  let teamId = formCache[formKey]?.teamId || null;
+  const teams = await fetchFDStandings(leagueId);
+  if (!teams) return null;
 
-  if (!teamId) {
-    if (!budgetCheck(1)) { console.log(`⚠️ Budget: skipping stats for ${teamName}`); return null; }
-    try {
-      const sr = await fetch(
-        `${API_FOOTBALL_BASE}/teams?name=${encodeURIComponent(teamName)}&league=${leagueId}&season=${season}`,
-        { headers: { 'x-apisports-key': API_FOOTBALL_KEY } }
-      );
-      if (!sr.ok) return null;
-      const sd = await sr.json();
-      teamId = sd.response?.[0]?.team?.id || null;
-      if (!teamId) return null;
-      // Cache the teamId for future reuse
-      if (!formCache[formKey]) formCache[formKey] = {};
-      formCache[formKey].teamId = teamId;
-    } catch(e) { console.error(`Team ID error (${teamName}):`, e.message); return null; }
+  // Match by name — football-data.org uses full names like "Manchester City FC"
+  let match = null;
+  for (const [fdName, stats] of Object.entries(teams)) {
+    if (nameMatch(fdName, teamName)) { match = stats; break; }
   }
 
-  if (!budgetCheck(1)) { console.log(`⚠️ Budget: skipping stats for ${teamName}`); return null; }
-  try {
-    const res = await fetch(
-      `${API_FOOTBALL_BASE}/teams/statistics?team=${teamId}&league=${leagueId}&season=${season}`,
-      { headers: { 'x-apisports-key': API_FOOTBALL_KEY } }
-    );
-    if (!res.ok) return null;
-    const data  = await res.json();
-    const stats = data.response;
-    if (!stats) return null;
+  if (!match) {
+    console.log(`  ⚠️ FD: no standings match for "${teamName}"`);
+    return null;
+  }
 
-    const fg = stats.goals;
-    const fx = stats.fixtures;
-    const hg = fx?.played?.home || 0;
-    const ag = fx?.played?.away || 0;
+  if (match.playedGames < 4) {
+    console.log(`  ⚠️ ${teamName}: only ${match.playedGames} games — insufficient`);
+    return null;
+  }
 
-    // Require at least 4 home and 4 away games for reliable stats
-    if (hg < 4 || ag < 4) {
-      console.log(`  ⚠️ ${teamName}: only ${hg}H/${ag}A games — insufficient for model`);
-      return null;
-    }
+  // football-data.org free tier doesn't split home/away goals.
+  // We approximate home/away using overall averages — sufficient for Dixon-Coles.
+  const hg = Math.floor(match.playedGames / 2);
+  const ag = match.playedGames - hg;
+  const result = {
+    homeScored:   Math.round(match.goalsForPG     * hg),
+    homeConceded: Math.round(match.goalsAgainstPG * hg),
+    awayScored:   Math.round(match.goalsForPG     * ag),
+    awayConceded: Math.round(match.goalsAgainstPG * ag),
+    homeGames:    hg,
+    awayGames:    ag,
+    teamId:       null, // not needed downstream
+  };
 
-    const result = {
-      homeScored:   fg?.for?.total?.home    || 0,
-      homeConceded: fg?.against?.total?.home || 0,
-      awayScored:   fg?.for?.total?.away    || 0,
-      awayConceded: fg?.against?.total?.away || 0,
-      homeGames:    hg,
-      awayGames:    ag,
-      teamId,
-    };
-
-    teamStatsCache[cacheKey] = result;
-    return result;
-  } catch(e) { console.error(`Team stats error (${teamName}):`, e.message); return null; }
+  teamStatsCache[cacheKey] = result;
+  console.log(`  ⚽ ${teamName}: ${match.goalsForPG.toFixed(2)} GF/gm, ${match.goalsAgainstPG.toFixed(2)} GA/gm [FD]`);
+  return result;
 }
 
 // ── D. H2H RECORD ─────────────────────────────────────────────
@@ -1253,24 +1287,10 @@ const API_BASKETBALL_BASE = 'https://v2.nba.api-sports.io';
 const API_HOCKEY_BASE     = 'https://v1.hockey.api-sports.io';
 const BDL_BASE            = 'https://api.balldontlie.io';
 
-// These counters are independent of the football budget counter.
-// Each API-Sports API has its own 100/day limit.
-let nbaBudget  = { date: '', used: 0, limit: 85 }; // NBA: ~30 teams × 2 calls
-let nhlBudget  = { date: '', used: 0, limit: 90 }; // NHL: ~32 teams × 2 calls
-let bdlBudget  = { date: '', used: 0, limit: 150 }; // BDL free tier is generous
+// BDL budget counter — generous free tier, ~5 req/min rate limit
+// We use it for injuries + team stats (games endpoint), ~10-20 calls/day total
+let bdlBudget  = { date: '', used: 0, limit: 200 };
 
-function checkNBABudget(n = 1) {
-  const today = new Date().toISOString().split('T')[0];
-  if (nbaBudget.date !== today) { nbaBudget.date = today; nbaBudget.used = 0; }
-  if (nbaBudget.used + n > nbaBudget.limit) return false;
-  nbaBudget.used += n; return true;
-}
-function checkNHLBudget(n = 1) {
-  const today = new Date().toISOString().split('T')[0];
-  if (nhlBudget.date !== today) { nhlBudget.date = today; nhlBudget.used = 0; }
-  if (nhlBudget.used + n > nhlBudget.limit) return false;
-  nhlBudget.used += n; return true;
-}
 function checkBDLBudget(n = 1) {
   const today = new Date().toISOString().split('T')[0];
   if (bdlBudget.date !== today) { bdlBudget.date = today; bdlBudget.used = 0; }
@@ -1359,64 +1379,73 @@ function injuryPenalty(homeTeam, awayTeam, sport) {
 }
 
 // ── NBA TEAM STATS CACHE ──────────────────────────────────────
-// Keyed by teamName_season.
-// Fetches offensive rating, defensive rating, pace from API-NBA.
+// Derived from last 15 BallDontLie game results — no API-Sports needed.
+// Computes pts/gm scored and allowed from actual game box scores.
 const nbaTeamCache = {};
+// BDL team name → BDL team ID (fetched once, cached for process lifetime)
+const bdlNBATeamIds = {};
+
+async function fetchBDLNBATeamId(teamName) {
+  if (bdlNBATeamIds[teamName]) return bdlNBATeamIds[teamName];
+  if (!checkBDLBudget(1)) return null;
+  try {
+    const res = await fetch(
+      `${BDL_BASE}/nba/v1/teams?search=${encodeURIComponent(teamName)}`,
+      { headers: { 'Authorization': BDL_API_KEY } }
+    );
+    if (!res.ok) return null;
+    const data = await res.json();
+    const team = (data.data || []).find(t =>
+      nameMatch(t.full_name, teamName) || nameMatch(t.name, teamName)
+    );
+    if (!team) return null;
+    bdlNBATeamIds[teamName] = team.id;
+    return team.id;
+  } catch(e) { console.error(`BDL NBA team ID error (${teamName}):`, e.message); return null; }
+}
 
 async function fetchNBATeamStats(teamName) {
   const season = seasonFor();
   const cacheKey = `${teamName}_${season}`;
   if (nbaTeamCache[cacheKey]) return nbaTeamCache[cacheKey];
-  if (!checkNBABudget(2)) { console.log(`⚠️ NBA budget: skipping ${teamName}`); return null; }
+  if (!checkBDLBudget(1)) { console.log(`⚠️ BDL NBA budget: skipping ${teamName}`); return null; }
 
   try {
-    // Step 1: find team ID — use permanent cache to save API calls
-    let teamId = permanentTeamIds[`${teamName}_nba`] || null;
-    if (!teamId) {
-      const tr = await fetch(
-        `${API_BASKETBALL_BASE}/teams?name=${encodeURIComponent(teamName)}&league=12&season=${season}`,
-        { headers: { 'x-apisports-key': API_FOOTBALL_KEY } }
-      );
-      if (!tr.ok) return null;
-      const td = await tr.json();
-      const team = td.response?.[0];
-      if (!team?.id) return null;
-      teamId = team.id;
-      permanentTeamIds[`${teamName}_nba`] = teamId;
-    } else {
-      checkNBABudget(-1); // refund the budget check — no call needed
-    }
+    const teamId = await fetchBDLNBATeamId(teamName);
+    if (!teamId) return null;
 
-    // Step 2: team statistics for current season (league 12 = NBA)
-    const sr = await fetch(
-      `${API_BASKETBALL_BASE}/teams/statistics?id=${team.id}&season=${season}`,
-      { headers: { 'x-apisports-key': API_FOOTBALL_KEY } }
+    // Fetch last 15 completed games for this team this season
+    const res = await fetch(
+      `${BDL_BASE}/nba/v1/games?team_ids[]=${teamId}&seasons[]=${season}&per_page=15`,
+      { headers: { 'Authorization': BDL_API_KEY } }
     );
-    if (!sr.ok) return null;
-    const sd = await sr.json();
-    const stats = sd.response?.[0];
-    if (!stats) return null;
+    if (!res.ok) return null;
+    const data = await res.json();
+    const games = (data.data || []).filter(g => g.status === 'Final');
 
-    // API-NBA returns per-game averages directly
-    const games = stats.games?.played || 1;
-    const result = {
-      teamId:       team.id,
-      gamesPlayed:  games,
-      // Points scored and allowed per game
-      ptsFor:       parseFloat(stats.points?.for?.average?.all   || stats.points?.for?.average?.['in'] || 110),
-      ptsAgainst:   parseFloat(stats.points?.against?.average?.all || stats.points?.against?.average?.['in'] || 110),
-    };
-
-    // Require at least 8 games for reliable stats
-    if (result.gamesPlayed < 8) {
-      console.log(`  ⚠️ NBA ${teamName}: only ${result.gamesPlayed} games — skipping model`);
+    if (games.length < 5) {
+      console.log(`  ⚠️ NBA ${teamName}: only ${games.length} completed games — skipping`);
       return null;
     }
 
+    let ptsFor = 0, ptsAgainst = 0;
+    for (const g of games) {
+      const isHome = g.home_team?.id === teamId;
+      ptsFor     += isHome ? (g.home_team_score || 0) : (g.visitor_team_score || 0);
+      ptsAgainst += isHome ? (g.visitor_team_score || 0) : (g.home_team_score || 0);
+    }
+    const n = games.length;
+    const result = {
+      teamId,
+      gamesPlayed: n,
+      ptsFor:      ptsFor / n,
+      ptsAgainst:  ptsAgainst / n,
+    };
+
     nbaTeamCache[cacheKey] = result;
-    console.log(`  🏀 NBA ${teamName}: ${result.ptsFor.toFixed(1)} pts/gm, ${result.ptsAgainst.toFixed(1)} allowed`);
+    console.log(`  🏀 NBA ${teamName} [BDL ${n}gm]: ${result.ptsFor.toFixed(1)} pts/gm, ${result.ptsAgainst.toFixed(1)} allowed`);
     return result;
-  } catch(e) { console.error(`NBA team stats error (${teamName}):`, e.message); return null; }
+  } catch(e) { console.error(`BDL NBA team stats error (${teamName}):`, e.message); return null; }
 }
 
 // ── NBA GAME MODEL ────────────────────────────────────────────
@@ -1588,65 +1617,70 @@ async function analyseNBAFixture(event, sport) {
 }
 
 // ── PERMANENT TEAM ID CACHE ──────────────────────────────────
-// Team ID lookups (name → API id) are cached for the process lifetime.
-// This saves 1 API call per team per day — critical for NHL with 32 teams.
-// Stats (the second call) still refresh daily via the keyed cache.
-const permanentTeamIds = {}; // key: 'teamName_sport' → teamId
+// Retained for football model (API-Football team IDs).
+const permanentTeamIds = {};
 
 // ── NHL TEAM STATS CACHE ──────────────────────────────────────
+// Uses the official NHL Stats API (api.nhle.com) — completely free, no auth.
+// One call fetches ALL 32 teams at once — extremely efficient.
+// Returns goalsPerGame and goalsAgainstPerGame directly.
 const nhlTeamCache = {};
+let nhlAllTeamsCache = null; // populated once per day
+let nhlAllTeamsCacheDate = '';
 
-async function fetchNHLTeamStats(teamName) {
-  const season = seasonFor();
-  const cacheKey = `${teamName}_${season}`;
-  if (nhlTeamCache[cacheKey]) return nhlTeamCache[cacheKey];
-  if (!checkNHLBudget(2)) { console.log(`⚠️ NHL budget: skipping ${teamName}`); return null; }
+async function fetchNHLAllTeams() {
+  const today = new Date().toISOString().split('T')[0];
+  if (nhlAllTeamsCache && nhlAllTeamsCacheDate === today) return nhlAllTeamsCache;
+
+  // Season format for NHL API: YYYYYYYY e.g. 20242025
+  const year = seasonFor();
+  const seasonId = `${year}${year + 1}`;
 
   try {
-    // Find team ID — use permanent cache to save API calls
-    let teamId = permanentTeamIds[`${teamName}_nhl`] || null;
-    if (!teamId) {
-      const tr = await fetch(
-        `${API_HOCKEY_BASE}/teams?name=${encodeURIComponent(teamName)}&league=57&season=${season}`,
-        { headers: { 'x-apisports-key': API_FOOTBALL_KEY } }
-      );
-      if (!tr.ok) return null;
-      const td = await tr.json();
-      const team = td.response?.[0];
-      if (!team?.id) return null;
-      teamId = team.id;
-      permanentTeamIds[`${teamName}_nhl`] = teamId;
-    } else {
-      checkNHLBudget(-1); // refund the budget check — no call needed
-    }
-
-    // Team statistics (league 57 = NHL)
-    const sr = await fetch(
-      `${API_HOCKEY_BASE}/teams/statistics?id=${team.id}&season=${season}`,
-      { headers: { 'x-apisports-key': API_FOOTBALL_KEY } }
+    const res = await fetch(
+      `https://api.nhle.com/stats/rest/en/team/summary?cayenneExp=seasonId=${seasonId}%20and%20gameTypeId=2`
     );
-    if (!sr.ok) return null;
-    const sd = await sr.json();
-    const stats = sd.response?.[0];
-    if (!stats) return null;
+    if (!res.ok) return null;
+    const data = await res.json();
+    nhlAllTeamsCache = data.data || [];
+    nhlAllTeamsCacheDate = today;
+    console.log(`🏒 NHL team stats loaded: ${nhlAllTeamsCache.length} teams from NHL API`);
+    return nhlAllTeamsCache;
+  } catch(e) { console.error('NHL API fetch error:', e.message); return null; }
+}
 
-    const games = stats.games?.played || 1;
-    if (games < 8) {
-      console.log(`  ⚠️ NHL ${teamName}: only ${games} games`);
-      return null;
-    }
+async function fetchNHLTeamStats(teamName) {
+  const cacheKey = `${teamName}_${seasonFor()}`;
+  if (nhlTeamCache[cacheKey]) return nhlTeamCache[cacheKey];
 
-    const result = {
-      teamId:      team.id,
-      gamesPlayed: games,
-      goalsFor:    parseFloat(stats.goals?.for?.total?.all   || 0) / games,
-      goalsAgainst: parseFloat(stats.goals?.against?.total?.all || 0) / games,
-    };
+  const allTeams = await fetchNHLAllTeams();
+  if (!allTeams) return null;
 
-    nhlTeamCache[cacheKey] = result;
-    console.log(`  🏒 NHL ${teamName}: ${result.goalsFor.toFixed(2)} GF/gm, ${result.goalsAgainst.toFixed(2)} GA/gm`);
-    return result;
-  } catch(e) { console.error(`NHL team stats error (${teamName}):`, e.message); return null; }
+  // Match team by name — NHL API uses full names like "Edmonton Oilers"
+  const team = allTeams.find(t =>
+    nameMatch(t.teamFullName, teamName) || nameMatch(t.teamName, teamName)
+  );
+
+  if (!team) {
+    console.log(`  ⚠️ NHL: no match for "${teamName}" in NHL API`);
+    return null;
+  }
+
+  if ((team.gamesPlayed || 0) < 5) {
+    console.log(`  ⚠️ NHL ${teamName}: only ${team.gamesPlayed} games — skipping`);
+    return null;
+  }
+
+  const result = {
+    teamId:       team.teamId,
+    gamesPlayed:  team.gamesPlayed,
+    goalsFor:     parseFloat(team.goalsForPerGame || 0),
+    goalsAgainst: parseFloat(team.goalsAgainstPerGame || 0),
+  };
+
+  nhlTeamCache[cacheKey] = result;
+  console.log(`  🏒 NHL ${teamName} [NHL API]: ${result.goalsFor.toFixed(2)} GF/gm, ${result.goalsAgainst.toFixed(2)} GA/gm`);
+  return result;
 }
 
 // ── NHL GAME MODEL ────────────────────────────────────────────
