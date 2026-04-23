@@ -2124,8 +2124,7 @@ async function saveTips(tips) {
       const { data: existing } = await supabase.from('tips').select('id, tip_ref, confidence, odds, best_odds, bookmaker')
         .eq('home_team', tip.home_team).eq('away_team', tip.away_team)
         .gte('event_time', `${date}T00:00:00Z`).lte('event_time', `${date}T23:59:59Z`)
-        .eq('status', 'pending').maybeSingle();
-
+        .in('status', ['pending', 'won', 'lost', 'void']).maybeSingle();
       if (existing) {
         // Always refresh odds and bookmaker — lines move every 15 minutes.
         // Also update confidence, stake and notes if the model reprices.
