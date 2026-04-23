@@ -2027,7 +2027,6 @@ function applyStrictRules(tip, existingBestOdds = null) {
     confidence: tip.confidence, // unchanged — model probability stays
     notes: (tip.notes || '') + ` | Grade: ${grade} | Edge: +${edge.toFixed(1)}%`,
   };
-}
 
 // ═══════════════════════════════════════════════════════════════
 // TIP GENERATION — ONE tip per game
