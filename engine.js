@@ -363,11 +363,16 @@ function budgetStatus() {
 }
 
 // ── C. TEAM SEASON STATS ──────────────────────────────────────
-// Uses football-data.org free tier — no call limits that matter for our use.
-// One standings call per league fetches ALL teams at once.
-// Returns goalsFor, goalsAgainst, playedGames per team from standings.
-// Home/away splits not available on free tier — we use overall averages.
-// Guards against < 4 games played (stats unreliable early season).
+// Primary source: football-data.org /matches endpoint (FINISHED fixtures).
+// Iterates all completed matches and accumulates exact home/away goals
+// per team — no approximation, no hardcoded splits.
+//
+// Fallback (if results fetch fails): standings-derived approximation
+// using league home/away goal ratio from LEAGUE_AVERAGES.
+//
+// API cost: 1 call per league per day (6 leagues = 6 extra calls).
+// Results cache is shared — all teams in a league are built in one call.
+// ─────────────────────────────────────────────────────────────
 
 const FOOTBALL_DATA_BASE  = 'https://api.football-data.org/v4';
 
@@ -383,7 +388,8 @@ const LEAGUE_FD_CODE = {
 
 // Cache: leagueId → { date, teams: { teamName → stats } }
 const fdStandingsCache = {};
-const teamStatsCache = {};
+const fdResultsCache   = {}; // leagueId → { date, teams: { teamName → exact home/away stats } }
+const teamStatsCache   = {};
 
 // Name aliases: Odds API name → football-data.org name
 // Add entries here whenever a team name mismatch appears in logs
@@ -409,6 +415,80 @@ const FD_NAME_ALIASES = {
   'Napoli':                'SSC Napoli',
 };
 
+// ── RESULTS-BASED HOME/AWAY STATS ─────────────────────────────
+// Fetches all FINISHED matches for a league this season.
+// Builds exact homeScored / homeConceded / awayScored / awayConceded
+// per team by iterating every completed fixture.
+// One API call covers all 20 teams — result cached for the day.
+async function fetchFDResults(leagueId) {
+  const today = new Date().toISOString().split('T')[0];
+  if (fdResultsCache[leagueId]?.date === today) return fdResultsCache[leagueId].teams;
+
+  const code   = LEAGUE_FD_CODE[leagueId];
+  if (!code) return null;
+
+  const season = seasonFor(leagueId);
+
+  try {
+    const res = await fetch(
+      `${FOOTBALL_DATA_BASE}/competitions/${code}/matches?status=FINISHED&season=${season}`,
+      { headers: { 'X-Auth-Token': FOOTBALL_DATA_TOKEN } }
+    );
+    if (!res.ok) {
+      console.log(`⚠️ FD results ${code}: ${res.status} — will fall back to standings`);
+      return null;
+    }
+    const data = await res.json();
+    const matches = data.matches || [];
+    if (!matches.length) {
+      console.log(`⚠️ FD results ${code}: no finished matches returned`);
+      return null;
+    }
+
+    // Accumulate exact home/away records per team name
+    const teams = {};
+    const ensureTeam = name => {
+      if (!teams[name]) teams[name] = {
+        homeScored: 0, homeConceded: 0, homeGames: 0,
+        awayScored: 0, awayConceded: 0, awayGames: 0,
+      };
+    };
+
+    for (const m of matches) {
+      const hName = m.homeTeam?.name;
+      const aName = m.awayTeam?.name;
+      const hGoals = m.score?.fullTime?.home;
+      const aGoals = m.score?.fullTime?.away;
+
+      // Skip if score not recorded (postponed, abandoned etc.)
+      if (!hName || !aName || hGoals == null || aGoals == null) continue;
+
+      ensureTeam(hName);
+      ensureTeam(aName);
+
+      teams[hName].homeScored   += hGoals;
+      teams[hName].homeConceded += aGoals;
+      teams[hName].homeGames    += 1;
+
+      teams[aName].awayScored   += aGoals;
+      teams[aName].awayConceded += hGoals;
+      teams[aName].awayGames    += 1;
+    }
+
+    fdResultsCache[leagueId] = { date: today, teams };
+    console.log(`⚽ FD results ${code}: ${matches.length} matches → ${Object.keys(teams).length} teams built`);
+    return teams;
+
+  } catch(e) {
+    console.error(`FD results error (${code}):`, e.message);
+    return null;
+  }
+}
+
+// ── STANDINGS FALLBACK ─────────────────────────────────────────
+// Used only if fetchFDResults fails.
+// Approximates home/away splits using the league's known goal ratio
+// from LEAGUE_AVERAGES rather than a naive 50/50 split.
 async function fetchFDStandings(leagueId) {
   const today = new Date().toISOString().split('T')[0];
   if (fdStandingsCache[leagueId]?.date === today) return fdStandingsCache[leagueId].teams;
@@ -426,37 +506,79 @@ async function fetchFDStandings(leagueId) {
 
     const standings = data.standings?.[0]?.table || [];
     const teams = {};
+
+    // Use league-ratio split rather than 50/50 — strictly more accurate
+    const leagueAvg  = getLeagueAvg(leagueId);
+    const totalAvg   = leagueAvg.homeGoals + leagueAvg.awayGoals;
+    const homeRatio  = leagueAvg.homeGoals / totalAvg; // e.g. La Liga ≈ 0.579
+    const awayRatio  = leagueAvg.awayGoals / totalAvg; // e.g. La Liga ≈ 0.421
+
     for (const row of standings) {
       const name = row.team?.name || '';
       if (!name) continue;
+      const played = row.playedGames || 0;
+      const gf     = row.goalsFor    || 0;
+      const ga     = row.goalsAgainst || 0;
+      // Estimate home/away game counts using ratio
+      const hg = Math.max(1, Math.round(played * homeRatio));
+      const ag = Math.max(1, played - hg);
       teams[name] = {
-        playedGames:  row.playedGames || 0,
-        goalsFor:     row.goalsFor    || 0,
-        goalsAgainst: row.goalsAgainst || 0,
-        // Derive per-game averages
-        goalsForPG:     row.playedGames > 0 ? row.goalsFor    / row.playedGames : 0,
-        goalsAgainstPG: row.playedGames > 0 ? row.goalsAgainst / row.playedGames : 0,
+        homeScored:   Math.round(gf * homeRatio),
+        homeConceded: Math.round(ga * homeRatio),
+        homeGames:    hg,
+        awayScored:   Math.round(gf * awayRatio),
+        awayConceded: Math.round(ga * awayRatio),
+        awayGames:    ag,
+        playedGames:  played,
+        // Keep these for the min-games guard below
+        goalsForPG:     played > 0 ? gf / played : 0,
+        goalsAgainstPG: played > 0 ? ga / played : 0,
       };
     }
 
     fdStandingsCache[leagueId] = { date: today, teams };
-    console.log(`⚽ FD standings ${code}: ${standings.length} teams loaded`);
+    console.log(`⚽ FD standings ${code}: ${standings.length} teams loaded (ratio-split fallback)`);
     return teams;
   } catch(e) { console.error(`FD standings error (${code}):`, e.message); return null; }
 }
 
+// ── MAIN STATS FETCHER ────────────────────────────────────────
+// Tries results (exact) first, falls back to standings (approximated).
+// Logs source so you can see which path fired in Render logs.
 async function fetchTeamSeasonStats(teamName, leagueId) {
   const season   = seasonFor(leagueId);
   const cacheKey = `stats_${teamName}_${leagueId}_${season}`;
   if (teamStatsCache[cacheKey]) return teamStatsCache[cacheKey];
 
-  const teams = await fetchFDStandings(leagueId);
-  if (!teams) return null;
-
-  // Match by name — check alias map first, then fuzzy match
   const aliasedName = FD_NAME_ALIASES[teamName] || teamName;
+
+  // ── Primary: results-based exact home/away splits ──────────
+  const resultTeams = await fetchFDResults(leagueId);
+  if (resultTeams) {
+    let match = null;
+    for (const [fdName, stats] of Object.entries(resultTeams)) {
+      if (nameMatch(fdName, aliasedName) || nameMatch(fdName, teamName)) { match = stats; break; }
+    }
+    if (match) {
+      const totalGames = match.homeGames + match.awayGames;
+      if (totalGames < 4) {
+        console.log(`  ⚠️ ${teamName}: only ${totalGames} games in results — insufficient`);
+        return null;
+      }
+      const result = { ...match, teamId: null, source: 'results' };
+      teamStatsCache[cacheKey] = result;
+      console.log(`  ⚽ ${teamName}: H ${match.homeScored}/${match.homeConceded} (${match.homeGames}g) A ${match.awayScored}/${match.awayConceded} (${match.awayGames}g) [EXACT]`);
+      return result;
+    }
+    console.log(`  ⚠️ FD results: no match for "${teamName}" — trying standings`);
+  }
+
+  // ── Fallback: standings with league-ratio approximation ────
+  const standingTeams = await fetchFDStandings(leagueId);
+  if (!standingTeams) return null;
+
   let match = null;
-  for (const [fdName, stats] of Object.entries(teams)) {
+  for (const [fdName, stats] of Object.entries(standingTeams)) {
     if (nameMatch(fdName, aliasedName) || nameMatch(fdName, teamName)) { match = stats; break; }
   }
 
@@ -470,22 +592,9 @@ async function fetchTeamSeasonStats(teamName, leagueId) {
     return null;
   }
 
-  // football-data.org free tier doesn't split home/away goals.
-  // We approximate home/away using overall averages — sufficient for Dixon-Coles.
-  const hg = Math.floor(match.playedGames / 2);
-  const ag = match.playedGames - hg;
-  const result = {
-    homeScored:   Math.round(match.goalsForPG     * hg),
-    homeConceded: Math.round(match.goalsAgainstPG * hg),
-    awayScored:   Math.round(match.goalsForPG     * ag),
-    awayConceded: Math.round(match.goalsAgainstPG * ag),
-    homeGames:    hg,
-    awayGames:    ag,
-    teamId:       null, // not needed downstream
-  };
-
+  const result = { ...match, teamId: null, source: 'standings-ratio' };
   teamStatsCache[cacheKey] = result;
-  console.log(`  ⚽ ${teamName}: ${match.goalsForPG.toFixed(2)} GF/gm, ${match.goalsAgainstPG.toFixed(2)} GA/gm [FD]`);
+  console.log(`  ⚽ ${teamName}: ${match.goalsForPG.toFixed(2)} GF/gm, ${match.goalsAgainstPG.toFixed(2)} GA/gm [RATIO APPROX]`);
   return result;
 }
 
@@ -3061,7 +3170,7 @@ function startScheduler() {
 // ═══════════════════════════════════════════════════════════════
 
 (async () => {
-  console.log(`\n🟢 The Tipster Engine v7.1 starting... Season: ${seasonFor()}`);
+  console.log(`\n🟢 The Tipster Engine v7.2 starting... Season: ${seasonFor()}`);
   await runEngine();
   await settleResults();
   setInterval(runEngine, 15 * 60 * 1000);
