@@ -2334,19 +2334,10 @@ async function generateTips(events, sport) {
       await runFootballLab(supabase, [event], sport, teamStatsCache, seasonFor(sport.leagueId));
 
       // ── Football: Dixon-Coles Poisson xG model ───────────
-      // Falls back to market consensus if model has no data or no edge found.
-      // This keeps football tips flowing even when API budget is exhausted
-      // or early-season stats are insufficient (< 4 games played).
+      // No fallback — if the model has no data or no edge, no tip is generated.
+      // Market consensus is not used for football under any circumstances.
       const tip = await analyseFootballFixture(event, sport);
-      if (tip) {
-        candidates.push(tip);
-      } else {
-        // Fallback: market consensus with margin stripping
-        const h2h    = event.bookmakers.map(b => b.markets?.find(m => m.key === 'h2h')).filter(Boolean);
-        const totals = event.bookmakers.map(b => b.markets?.find(m => m.key === 'totals')).filter(Boolean);
-        if (h2h.length    >= 2) { const t = analyseH2H(event, h2h, sport);     if (t) candidates.push(t); }
-        if (totals.length >= 2) { const t = analyseTotals(event, totals, sport); if (t) candidates.push(t); }
-      }
+      if (tip) candidates.push(tip);
     } else if (sport.name === 'Basketball') {
       // ── NBA: pace-adjusted scoring model ─────────────────
       // Falls back to market consensus if stats unavailable
@@ -3274,7 +3265,7 @@ function startScheduler() {
 // ═══════════════════════════════════════════════════════════════
 
 (async () => {
-  console.log(`\n🟢 The Tipster Engine v7.4 starting... Season: ${seasonFor()}`);
+  console.log(`\n🟢 The Tipster Engine v7.5 starting... Season: ${seasonFor()}`);
   await runEngine();
   await settleResults();
   setInterval(runEngine, 15 * 60 * 1000);
