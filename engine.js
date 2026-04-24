@@ -289,22 +289,23 @@ function buildNotes(hf, af, base = '') {
 }
 
 // ═══════════════════════════════════════════════════════════════
-// FOOTBALL MODEL v5 — Dixon-Coles Poisson + H2H + Weighted Form
+// FOOTBALL MODEL v5 — Dixon-Coles Poisson + Form + H2H + Weighted Form
 // ═══════════════════════════════════════════════════════════════
 //
 // Architecture:
 //   A. League averages (static, centralised)
 //   B. API call budget manager (shared across all football fetches)
-//   C. Team season stats cache + fetcher (attack/defence strengths)
-//   D. H2H record fetcher (last 10 head-to-head results)
-//   E. Poisson + Dixon-Coles correction (0..8 goal matrix)
-//   F. Bookmaker margin stripping (true implied probability)
-//   G. Edge calculation on margin-stripped prices
-//   H. Fractional Kelly stake sizing (0.25 Kelly, 0.5-3u range)
-//   I. Confidence from edge + form quality signal
-//   J. Market-aware form adjustment
-//   K. Notes builder (full model diagnostics)
-//   L. Main entry: analyseFootballFixture()
+//   C. Team season stats — exact home/away from FD results endpoint
+//   D. Form from results — last-5 per team, zero extra API calls
+//   E. H2H record fetcher (last 10 head-to-head results)
+//   F. Poisson + Dixon-Coles correction (0..8 goal matrix)
+//   G. Bookmaker margin stripping (true implied probability)
+//   H. Edge calculation on margin-stripped prices
+//   I. Fractional Kelly stake sizing (0.25 Kelly, 0.5-3u range)
+//   J. Confidence from edge + data quality signal
+//   K. Market-aware form adjustment
+//   L. Notes builder (full model diagnostics incl. form strings)
+//   M. Main entry: analyseFootballFixture()
 //
 // API call budget per day (free plan = 100 total):
 //   Form data (06:00):    ~40 calls (fetchTeamForm)
@@ -486,6 +487,94 @@ async function fetchFDResults(leagueId) {
 
   } catch(e) {
     console.error(`FD results error (${code}):`, e.message);
+    return null;
+  }
+}
+
+// ── FORM FROM RESULTS ─────────────────────────────────────────
+// Derives last-5 form per team from the already-fetched match data.
+// Zero additional API calls — reuses the same results response.
+// Returns { formScore, avgGoalsFor, avgGoalsAgainst, formString }
+// formScore: 0–1 (1 = all wins, 0 = all losses, points-based)
+//
+// Cache: leagueId → { date, teams: { teamName → formData } }
+const fdFormCache = {};
+
+async function buildFormFromResults(leagueId) {
+  const today = new Date().toISOString().split('T')[0];
+  if (fdFormCache[leagueId]?.date === today) return fdFormCache[leagueId].teams;
+
+  const code   = LEAGUE_FD_CODE[leagueId];
+  if (!code) return null;
+
+  const season = seasonFor(leagueId);
+
+  try {
+    // Re-fetch finished matches — will be fast from OS cache if done recently
+    // We request with ordering so most recent matches come last
+    const res = await fetch(
+      `${FOOTBALL_DATA_BASE}/competitions/${code}/matches?status=FINISHED&season=${season}`,
+      { headers: { 'X-Auth-Token': FOOTBALL_DATA_TOKEN } }
+    );
+    if (!res.ok) return null;
+    const data = await res.json();
+    const matches = data.matches || [];
+    if (!matches.length) return null;
+
+    // Sort oldest → newest so we can take last 5 per team simply
+    matches.sort((a, b) => new Date(a.utcDate) - new Date(b.utcDate));
+
+    // Build per-team match list: { teamName → [{ scored, conceded, result }] }
+    const teamMatches = {};
+    const ensure = name => { if (!teamMatches[name]) teamMatches[name] = []; };
+
+    for (const m of matches) {
+      const hName  = m.homeTeam?.name;
+      const aName  = m.awayTeam?.name;
+      const hGoals = m.score?.fullTime?.home;
+      const aGoals = m.score?.fullTime?.away;
+      if (!hName || !aName || hGoals == null || aGoals == null) continue;
+
+      ensure(hName);
+      ensure(aName);
+
+      const hResult = hGoals > aGoals ? 'W' : hGoals === aGoals ? 'D' : 'L';
+      const aResult = aGoals > hGoals ? 'W' : aGoals === hGoals ? 'D' : 'L';
+
+      teamMatches[hName].push({ scored: hGoals, conceded: aGoals, result: hResult });
+      teamMatches[aName].push({ scored: aGoals, conceded: hGoals, result: aResult });
+    }
+
+    // For each team take last 5 matches and compute form metrics
+    const formData = {};
+    for (const [name, ms] of Object.entries(teamMatches)) {
+      const last5 = ms.slice(-5);
+      if (last5.length < 3) continue; // not enough data
+
+      let wins = 0, draws = 0, losses = 0, gf = 0, ga = 0;
+      const chars = [];
+      for (const m of last5) {
+        gf += m.scored; ga += m.conceded;
+        if      (m.result === 'W') { wins++;   chars.push('W'); }
+        else if (m.result === 'D') { draws++;  chars.push('D'); }
+        else                       { losses++; chars.push('L'); }
+      }
+      const played = last5.length;
+      formData[name] = {
+        formScore:       (wins * 3 + draws) / (played * 3), // 0–1
+        avgGoalsFor:     gf / played,
+        avgGoalsAgainst: ga / played,
+        formString:      chars.join(''),
+        wins, draws, losses, played,
+      };
+    }
+
+    fdFormCache[leagueId] = { date: today, teams: formData };
+    console.log(`📊 FD form ${code}: ${Object.keys(formData).length} teams built from last-5 results`);
+    return formData;
+
+  } catch(e) {
+    console.error(`FD form error (${code}):`, e.message);
     return null;
   }
 }
@@ -1142,7 +1231,7 @@ function getFormQuality(hf, af, market) {
 // ── K. NOTES BUILDER ─────────────────────────────────────────
 // Full model diagnostics for Supabase notes field.
 // Format: xG: H vs A | Fair odds: X.XX | Book: X.XX (Bookie) | Edge: +X.X% | Model: XX.X% <market> probability
-function buildFootballNotes({ market, modelProb, fairPrice, bookOdds, bookmaker, edgePct, lambdaHome, lambdaAway, bookMargin, h2hRecord }) {
+function buildFootballNotes({ market, modelProb, fairPrice, bookOdds, bookmaker, edgePct, lambdaHome, lambdaAway, bookMargin, h2hRecord, homeForm, awayForm }) {
   if (lambdaHome == null || lambdaAway == null || modelProb == null) {
     return `Book: ${bookOdds} (${bookmaker || 'Multiple'}) | Edge: +${(edgePct || 0).toFixed(1)}%`;
   }
@@ -1161,6 +1250,8 @@ function buildFootballNotes({ market, modelProb, fairPrice, bookOdds, bookmaker,
     `Model: ${(modelProb * 100).toFixed(1)}% ${probSuffix}`,
   ];
   if (bookMargin != null) parts.push(`Mkt margin: ${bookMargin}%`);
+  if (homeForm)           parts.push(`Home form: ${homeForm}`);
+  if (awayForm)           parts.push(`Away form: ${awayForm}`);
   if (h2hRecord)          parts.push(`H2H: ${h2hRecord}`);
   return parts.join(' | ');
 }
@@ -1203,9 +1294,26 @@ async function analyseFootballFixture(event, sport) {
       fetchTeamSeasonStats(event.away_team, leagueId),
     ]);
 
-    // Form data from morning fetch (may be null if budget expired)
-    const hf = formCache[`${event.home_team}_${leagueId}`] || null;
-    const af = formCache[`${event.away_team}_${leagueId}`] || null;
+    // Form data — derived from match results (no API-Football dependency)
+    // Used to adjust lambdas for recent momentum before Poisson runs
+    const fdForm    = await buildFormFromResults(leagueId);
+    const aliasedHome = FD_NAME_ALIASES[event.home_team] || event.home_team;
+    const aliasedAway = FD_NAME_ALIASES[event.away_team] || event.away_team;
+
+    // Match form by name — check alias then fuzzy
+    let hf = null, af = null;
+    if (fdForm) {
+      for (const [fdName, fd] of Object.entries(fdForm)) {
+        if (nameMatch(fdName, aliasedHome) || nameMatch(fdName, event.home_team)) { hf = fd; break; }
+      }
+      for (const [fdName, fd] of Object.entries(fdForm)) {
+        if (nameMatch(fdName, aliasedAway) || nameMatch(fdName, event.away_team)) { af = fd; break; }
+      }
+    }
+
+    // Also check legacy formCache (API-Football, may still have data from earlier)
+    if (!hf) hf = formCache[`${event.home_team}_${leagueId}`] || null;
+    if (!af) af = formCache[`${event.away_team}_${leagueId}`] || null;
 
     let lambdaHome, lambdaAway;
     let hasFullStats = false;
@@ -1251,6 +1359,26 @@ async function analyseFootballFixture(event, sport) {
     // Apply H2H modifier to lambdas
     lambdaHome = lambdaHome * (1 + h2h.homeMod);
     lambdaAway = lambdaAway * (1 + h2h.awayMod);
+
+    // ── 2b. Form momentum adjustment ────────────────────────
+    // Adjusts lambdas based on last-5 form relative to neutral (0.5).
+    // formScore 1.0 (all wins) → +10% lambda boost for that team
+    // formScore 0.0 (all losses) → -10% lambda reduction
+    // Maximum adjustment: ±10% — meaningful but not dominant
+    // Applied symmetrically: poor home form reduces lambdaHome,
+    // poor away form reduces lambdaAway.
+    let formAdjStr = '';
+    if (hf) {
+      const homeFormMod = (hf.formScore - 0.5) * 0.20; // -0.10 to +0.10
+      lambdaHome = lambdaHome * (1 + homeFormMod);
+      formAdjStr += `H:${hf.formString}(${homeFormMod >= 0 ? '+' : ''}${(homeFormMod * 100).toFixed(0)}%)`;
+    }
+    if (af) {
+      const awayFormMod = (af.formScore - 0.5) * 0.20; // -0.10 to +0.10
+      lambdaAway = lambdaAway * (1 + awayFormMod);
+      formAdjStr += ` A:${af.formString}(${awayFormMod >= 0 ? '+' : ''}${(awayFormMod * 100).toFixed(0)}%)`;
+    }
+    if (formAdjStr) console.log(`  📊 Form adj [${event.home_team} vs ${event.away_team}]: ${formAdjStr}`);
 
     // Clamp to realistic range — football xG rarely exceeds 3.0 per team per match.
     // Ceiling of 2.8 prevents runaway fallback values corrupting the matrix.
@@ -1381,6 +1509,8 @@ async function analyseFootballFixture(event, sport) {
       lambdaAway:  lA,
       bookMargin:  market.avgMargin,
       h2hRecord:   h2hStr,
+      homeForm:    hf ? hf.formString : null,
+      awayForm:    af ? af.formString : null,
     });
 
     return {
@@ -3175,7 +3305,7 @@ function startScheduler() {
 // ═══════════════════════════════════════════════════════════════
 
 (async () => {
-  console.log(`\n🟢 The Tipster Engine v7.2 starting... Season: ${seasonFor()}`);
+  console.log(`\n🟢 The Tipster Engine v7.3 starting... Season: ${seasonFor()}`);
   await runEngine();
   await settleResults();
   setInterval(runEngine, 15 * 60 * 1000);
