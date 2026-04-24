@@ -390,6 +390,7 @@ const LEAGUE_FD_CODE = {
 // Cache: leagueId → { date, teams: { teamName → stats } }
 const fdStandingsCache = {};
 const fdResultsCache   = {}; // leagueId → { date, teams: { teamName → exact home/away stats } }
+const fdFormCache      = {}; // leagueId → { date, teams: { teamName → last-5 form data } }
 const teamStatsCache   = {};
 
 // Name aliases: Odds API name → football-data.org name
@@ -421,17 +422,21 @@ const FD_NAME_ALIASES = {
   'Napoli':                   'SSC Napoli',
 };
 
-// ── RESULTS-BASED HOME/AWAY STATS ─────────────────────────────
-// Fetches all FINISHED matches for a league this season.
-// Builds exact homeScored / homeConceded / awayScored / awayConceded
-// per team by iterating every completed fixture.
-// One API call covers all 20 teams — result cached for the day.
-async function fetchFDResults(leagueId) {
-  const today = new Date().toISOString().split('T')[0];
-  if (fdResultsCache[leagueId]?.date === today) return fdResultsCache[leagueId].teams;
-
+// ── UNIFIED MATCH DATA FETCH ──────────────────────────────────
+// Single HTTP call per league per day.
+// Builds BOTH season stats (home/away splits) AND last-5 form
+// in one pass over the matches array.
+// Populates fdResultsCache and fdFormCache simultaneously.
+// This eliminates the double-fetch that was causing 429s on Ligue 1.
+async function fetchFDMatchData(leagueId) {
+  const today  = new Date().toISOString().split('T')[0];
   const code   = LEAGUE_FD_CODE[leagueId];
-  if (!code) return null;
+  if (!code) return { stats: null, form: null };
+
+  // Return from cache if both are already populated for today
+  if (fdResultsCache[leagueId]?.date === today && fdFormCache[leagueId]?.date === today) {
+    return { stats: fdResultsCache[leagueId].teams, form: fdFormCache[leagueId].teams };
+  }
 
   const season = seasonFor(leagueId);
 
@@ -442,92 +447,32 @@ async function fetchFDResults(leagueId) {
     );
     if (!res.ok) {
       console.log(`⚠️ FD results ${code}: ${res.status} — will fall back to standings`);
-      return null;
+      return { stats: null, form: null };
     }
-    const data = await res.json();
+    const data    = await res.json();
     const matches = data.matches || [];
     if (!matches.length) {
       console.log(`⚠️ FD results ${code}: no finished matches returned`);
-      return null;
+      return { stats: null, form: null };
     }
 
-    // Accumulate exact home/away records per team name
-    const teams = {};
-    const ensureTeam = name => {
-      if (!teams[name]) teams[name] = {
+    // Sort oldest → newest once — used for both stats and form
+    matches.sort((a, b) => new Date(a.utcDate) - new Date(b.utcDate));
+
+    // ── Season stats accumulator ───────────────────────────
+    const statsTeams = {};
+    const ensureStats = name => {
+      if (!statsTeams[name]) statsTeams[name] = {
         homeScored: 0, homeConceded: 0, homeGames: 0,
         awayScored: 0, awayConceded: 0, awayGames: 0,
       };
     };
 
-    for (const m of matches) {
-      const hName = m.homeTeam?.name;
-      const aName = m.awayTeam?.name;
-      const hGoals = m.score?.fullTime?.home;
-      const aGoals = m.score?.fullTime?.away;
-
-      // Skip if score not recorded (postponed, abandoned etc.)
-      if (!hName || !aName || hGoals == null || aGoals == null) continue;
-
-      ensureTeam(hName);
-      ensureTeam(aName);
-
-      teams[hName].homeScored   += hGoals;
-      teams[hName].homeConceded += aGoals;
-      teams[hName].homeGames    += 1;
-
-      teams[aName].awayScored   += aGoals;
-      teams[aName].awayConceded += hGoals;
-      teams[aName].awayGames    += 1;
-    }
-
-    fdResultsCache[leagueId] = { date: today, teams };
-    console.log(`⚽ FD results ${code}: ${matches.length} matches → ${Object.keys(teams).length} teams built`);
-    return teams;
-
-  } catch(e) {
-    console.error(`FD results error (${code}):`, e.message);
-    return null;
-  }
-}
-
-// ── FORM FROM RESULTS ─────────────────────────────────────────
-// Derives last-5 form per team from the already-fetched match data.
-// Zero additional API calls — reuses the same results response.
-// Returns { formScore, avgGoalsFor, avgGoalsAgainst, formString }
-// formScore: 0–1 (1 = all wins, 0 = all losses, points-based)
-//
-// Cache: leagueId → { date, teams: { teamName → formData } }
-const fdFormCache = {};
-
-async function buildFormFromResults(leagueId) {
-  const today = new Date().toISOString().split('T')[0];
-  if (fdFormCache[leagueId]?.date === today) return fdFormCache[leagueId].teams;
-
-  const code   = LEAGUE_FD_CODE[leagueId];
-  if (!code) return null;
-
-  const season = seasonFor(leagueId);
-
-  try {
-    // Re-fetch finished matches — will be fast from OS cache if done recently
-    // We request with ordering so most recent matches come last
-    const res = await fetch(
-      `${FOOTBALL_DATA_BASE}/competitions/${code}/matches?status=FINISHED&season=${season}`,
-      { headers: { 'X-Auth-Token': FOOTBALL_DATA_TOKEN } }
-    );
-    if (!res.ok) return null;
-    const data = await res.json();
-    const matches = data.matches || [];
-    if (!matches.length) return null;
-
-    // Sort oldest → newest so we can take last 5 per team simply
-    matches.sort((a, b) => new Date(a.utcDate) - new Date(b.utcDate));
-
-    // Build per-team match list: { teamName → [{ scored, conceded, result }] }
+    // ── Form accumulator (full match list per team) ────────
     const teamMatches = {};
-    const ensure = name => { if (!teamMatches[name]) teamMatches[name] = []; };
+    const ensureForm  = name => { if (!teamMatches[name]) teamMatches[name] = []; };
 
+    // Single pass — build both in one loop
     for (const m of matches) {
       const hName  = m.homeTeam?.name;
       const aName  = m.awayTeam?.name;
@@ -535,33 +480,39 @@ async function buildFormFromResults(leagueId) {
       const aGoals = m.score?.fullTime?.away;
       if (!hName || !aName || hGoals == null || aGoals == null) continue;
 
-      ensure(hName);
-      ensure(aName);
+      // Season stats
+      ensureStats(hName); ensureStats(aName);
+      statsTeams[hName].homeScored   += hGoals;
+      statsTeams[hName].homeConceded += aGoals;
+      statsTeams[hName].homeGames    += 1;
+      statsTeams[aName].awayScored   += aGoals;
+      statsTeams[aName].awayConceded += hGoals;
+      statsTeams[aName].awayGames    += 1;
 
+      // Form match list (all matches, we slice last 5 below)
+      ensureForm(hName); ensureForm(aName);
       const hResult = hGoals > aGoals ? 'W' : hGoals === aGoals ? 'D' : 'L';
       const aResult = aGoals > hGoals ? 'W' : aGoals === hGoals ? 'D' : 'L';
-
       teamMatches[hName].push({ scored: hGoals, conceded: aGoals, result: hResult });
       teamMatches[aName].push({ scored: aGoals, conceded: hGoals, result: aResult });
     }
 
-    // For each team take last 5 matches and compute form metrics
-    const formData = {};
+    // ── Derive last-5 form per team ────────────────────────
+    const formTeams = {};
     for (const [name, ms] of Object.entries(teamMatches)) {
       const last5 = ms.slice(-5);
-      if (last5.length < 3) continue; // not enough data
-
+      if (last5.length < 3) continue;
       let wins = 0, draws = 0, losses = 0, gf = 0, ga = 0;
       const chars = [];
       for (const m of last5) {
         gf += m.scored; ga += m.conceded;
-        if      (m.result === 'W') { wins++;   chars.push('W'); }
-        else if (m.result === 'D') { draws++;  chars.push('D'); }
+        if      (m.result === 'W') { wins++;  chars.push('W'); }
+        else if (m.result === 'D') { draws++; chars.push('D'); }
         else                       { losses++; chars.push('L'); }
       }
       const played = last5.length;
-      formData[name] = {
-        formScore:       (wins * 3 + draws) / (played * 3), // 0–1
+      formTeams[name] = {
+        formScore:       (wins * 3 + draws) / (played * 3),
         avgGoalsFor:     gf / played,
         avgGoalsAgainst: ga / played,
         formString:      chars.join(''),
@@ -569,14 +520,32 @@ async function buildFormFromResults(leagueId) {
       };
     }
 
-    fdFormCache[leagueId] = { date: today, teams: formData };
-    console.log(`📊 FD form ${code}: ${Object.keys(formData).length} teams built from last-5 results`);
-    return formData;
+    // Populate both caches from the single fetch
+    fdResultsCache[leagueId] = { date: today, teams: statsTeams };
+    fdFormCache[leagueId]    = { date: today, teams: formTeams  };
+
+    console.log(`⚽ FD ${code}: ${matches.length} matches → ${Object.keys(statsTeams).length} teams [stats + form]`);
+    return { stats: statsTeams, form: formTeams };
 
   } catch(e) {
-    console.error(`FD form error (${code}):`, e.message);
-    return null;
+    console.error(`FD match data error (${code}):`, e.message);
+    return { stats: null, form: null };
   }
+}
+
+// Convenience wrappers — callers use these, not fetchFDMatchData directly
+async function fetchFDResults(leagueId) {
+  const today = new Date().toISOString().split('T')[0];
+  if (fdResultsCache[leagueId]?.date === today) return fdResultsCache[leagueId].teams;
+  const { stats } = await fetchFDMatchData(leagueId);
+  return stats;
+}
+
+async function buildFormFromResults(leagueId) {
+  const today = new Date().toISOString().split('T')[0];
+  if (fdFormCache[leagueId]?.date === today) return fdFormCache[leagueId].teams;
+  const { form } = await fetchFDMatchData(leagueId);
+  return form;
 }
 
 // ── STANDINGS FALLBACK ─────────────────────────────────────────
@@ -3305,7 +3274,7 @@ function startScheduler() {
 // ═══════════════════════════════════════════════════════════════
 
 (async () => {
-  console.log(`\n🟢 The Tipster Engine v7.3 starting... Season: ${seasonFor()}`);
+  console.log(`\n🟢 The Tipster Engine v7.4 starting... Season: ${seasonFor()}`);
   await runEngine();
   await settleResults();
   setInterval(runEngine, 15 * 60 * 1000);
