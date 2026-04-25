@@ -181,15 +181,24 @@ async function fetchTournamentEvents(tournamentId) {
 // Convert fractional odds string to decimal (e.g. "3/10" → 1.30)
 function fractionalToDecimal(fractional) {
   if (!fractional) return 0;
-  const parts = fractional.toString().split('/');
+  const str = fractional.toString().trim();
+  const parts = str.split('/');
   if (parts.length === 2) {
     const num = parseFloat(parts[0]);
     const den = parseFloat(parts[1]);
-    if (den === 0) return 0;
+    if (!den || den === 0) return 0;
     return parseFloat((1 + num / den).toFixed(3));
   }
   // Already decimal
-  return parseFloat(fractional) || 0;
+  const d = parseFloat(str);
+  return isNaN(d) ? 0 : d;
+}
+
+// Get price from choice — try fractionalValue first, then initialFractionalValue, then odds
+function getChoicePrice(choice) {
+  return fractionalToDecimal(choice.fractionalValue) ||
+         fractionalToDecimal(choice.initialFractionalValue) ||
+         parseFloat(choice.odds || 0);
 }
 
 // Fetch odds for a specific event
@@ -231,7 +240,7 @@ function parseSofascoreOdds(markets, homeTeam, awayTeam) {
 
   if (ftMarket?.choices) {
     for (const choice of ftMarket.choices) {
-      const decimal = fractionalToDecimal(choice.fractionalValue);
+      const decimal = getChoicePrice(choice);
       if (!decimal) continue;
       if (choice.name === '1')      h2hOutcomes.push({ name: homeTeam, price: decimal });
       else if (choice.name === 'X') h2hOutcomes.push({ name: 'Draw',   price: decimal });
@@ -250,25 +259,22 @@ function parseSofascoreOdds(markets, homeTeam, awayTeam) {
     );
 
     if (moneylineMarket?.choices) {
-      // Log first market to see structure
-      console.log(`  🔍 2-way market: "${moneylineMarket.marketName}" / "${moneylineMarket.marketGroup}" choices: ${moneylineMarket.choices.map(c => `"${c.name}"`).join(', ')}`);
+      console.log(`  🔍 2-way market: "${moneylineMarket.marketName}" / "${moneylineMarket.marketGroup}" choices: ${moneylineMarket.choices.map(c => `"${c.name}"=${getChoicePrice(c)}`).join(', ')}`);
       for (const choice of moneylineMarket.choices) {
-        const decimal = fractionalToDecimal(choice.fractionalValue);
+        const decimal = getChoicePrice(choice);
         if (!decimal) continue;
-        if (choice.name === '1')      h2hOutcomes.push({ name: homeTeam, price: decimal });
-        else if (choice.name === '2') h2hOutcomes.push({ name: awayTeam, price: decimal });
-        // Some use team names directly
+        if (choice.name === '1')           h2hOutcomes.push({ name: homeTeam, price: decimal });
+        else if (choice.name === '2')      h2hOutcomes.push({ name: awayTeam, price: decimal });
         else if (h2hOutcomes.length === 0) h2hOutcomes.push({ name: homeTeam, price: decimal });
         else if (h2hOutcomes.length === 1) h2hOutcomes.push({ name: awayTeam, price: decimal });
       }
     } else {
-      // Log what markets ARE available
       const names = markets.slice(0,5).map(m => `"${m.marketName}/${m.marketGroup}"`).join(', ');
       console.log(`  🔍 No 2-way market found. Available: ${names}`);
     }
   }
 
-  // Totals — try "Match goals" (football), then "Total" (basketball/hockey)
+  // Totals
   const totalsLines = ['2.5', '5.5', '3.5', '1.5', '215.5', '220.5', '225.5', '210.5'];
   for (const line of totalsLines) {
     const totalsMarket = markets.find(m =>
@@ -277,7 +283,7 @@ function parseSofascoreOdds(markets, homeTeam, awayTeam) {
     );
     if (totalsMarket?.choices) {
       for (const choice of totalsMarket.choices) {
-        const decimal = fractionalToDecimal(choice.fractionalValue);
+        const decimal = getChoicePrice(choice);
         if (!decimal) continue;
         if (choice.name === 'Over')  totalsOutcomes.push({ name: 'Over',  price: decimal, point: parseFloat(line) });
         if (choice.name === 'Under') totalsOutcomes.push({ name: 'Under', price: decimal, point: parseFloat(line) });
