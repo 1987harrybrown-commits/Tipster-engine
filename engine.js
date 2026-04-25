@@ -122,20 +122,38 @@ async function sofascoreFetch(path, params = {}) {
   for (const [k, v] of Object.entries(params)) url.searchParams.set(k, v);
   trackApiCall();
   try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 10000); // 10s timeout
     const res = await fetch(url.toString(), {
+      signal: controller.signal,
       headers: {
         'x-rapidapi-key':  RAPIDAPI_KEY,
         'x-rapidapi-host': RAPIDAPI_HOST,
         'Content-Type':    'application/json',
       },
     });
+    clearTimeout(timeout);
     if (!res.ok) {
       console.log(`⚠️ Sofascore ${path}: ${res.status}`);
       return null;
     }
-    return await res.json();
+    const text = await res.text();
+    if (!text || text.trim() === '') {
+      console.log(`⚠️ Sofascore ${path}: empty response`);
+      return null;
+    }
+    try {
+      return JSON.parse(text);
+    } catch(parseErr) {
+      console.log(`⚠️ Sofascore ${path}: JSON parse error — ${text.slice(0, 100)}`);
+      return null;
+    }
   } catch(e) {
-    console.error(`Sofascore fetch error (${path}):`, e.message);
+    if (e.name === 'AbortError') {
+      console.log(`⚠️ Sofascore ${path}: timeout`);
+    } else {
+      console.error(`Sofascore fetch error (${path}):`, e.message);
+    }
     return null;
   }
 }
@@ -176,7 +194,7 @@ function fractionalToDecimal(fractional) {
 
 // Fetch odds for a specific event
 async function fetchEventOdds(eventId) {
-  await new Promise(r => setTimeout(r, 250));
+  await new Promise(r => setTimeout(r, 500)); // 500ms gap — stay under 5 req/sec
   const data = await sofascoreFetch(`/matches/get-all-odds`, { matchId: eventId });
   return data?.markets || null;
 }
