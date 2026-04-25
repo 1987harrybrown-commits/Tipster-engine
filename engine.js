@@ -381,6 +381,11 @@ async function morningFetch() {
 
         const oddsRaw    = await fetchEventOdds(event.id);
         const bookmakers = parseSofascoreOdds(oddsRaw, homeTeam, awayTeam);
+        if (oddsRaw && !bookmakers.length) {
+          console.log(`  ⚠️ Odds parse failed for ${homeTeam} vs ${awayTeam} — markets: ${oddsRaw?.length || 0}`);
+        } else if (bookmakers.length) {
+          console.log(`  ✅ Odds ok: ${homeTeam} vs ${awayTeam} — H:${bookmakers[0].markets[0]?.outcomes[0]?.price} D:${bookmakers[0].markets[0]?.outcomes[1]?.price} A:${bookmakers[0].markets[0]?.outcomes[2]?.price}`);
+        }
 
         enriched.push({
           id:            event.id,
