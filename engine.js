@@ -761,19 +761,16 @@ function extractMarketData(event) {
   for (const book of (event.bookmakers || [])) {
     const h2h = book.markets?.find(m => m.key === 'h2h');
     if (h2h) {
-      let bHome = 0, bDraw = 0, bAway = 0;
-      let homeFound = false, awayFound = false;
-      for (const o of h2h.outcomes) {
-        if (o.name === 'Draw') { bDraw = o.price; }
-        else if (!homeFound)   { bHome = o.price; homeFound = true; }
-        else if (!awayFound)   { bAway = o.price; awayFound = true; }
-      }
-      // 3-way market (football)
+      const outcomes = h2h.outcomes || [];
+      const drawOutcome = outcomes.find(o => o.name === 'Draw');
+      const nonDraw     = outcomes.filter(o => o.name !== 'Draw');
+      const bHome = nonDraw[0]?.price || 0;
+      const bAway = nonDraw[1]?.price || 0;
+      const bDraw = drawOutcome?.price || 0;
+
       if (bHome > 0 && bDraw > 0 && bAway > 0) {
         books1x2.push({ title: book.title, home: bHome, draw: bDraw, away: bAway });
-      }
-      // 2-way market (NBA/NHL)
-      else if (bHome > 0 && bAway > 0 && bDraw === 0) {
+      } else if (bHome > 0 && bAway > 0) {
         books2way.push({ title: book.title, home: bHome, away: bAway });
       }
       if (bHome > bestRaw.home) { bestRaw.home = bHome; bestRaw.homeBook = book.title; }
@@ -790,43 +787,32 @@ function extractMarketData(event) {
     }
   }
 
-  // 3-way market path (football)
+  // 3-way market (football)
   if (books1x2.length > 0) {
     const b = books1x2[0];
-    const totalIP      = (1/b.home) + (1/b.draw) + (1/b.away);
-    const bestTrueHome = (1/b.home) / totalIP;
-    const bestTrueDraw = (1/b.draw) / totalIP;
-    const bestTrueAway = (1/b.away) / totalIP;
-    const avgMargin    = totalIP - 1;
-
+    const totalIP = (1/b.home) + (1/b.draw) + (1/b.away);
     return {
-      trueHome: bestTrueHome, trueDraw: bestTrueDraw, trueAway: bestTrueAway,
-      homeOdds: bestRaw.home, drawOdds: bestRaw.draw, awayOdds: bestRaw.away,
+      trueHome: (1/b.home) / totalIP, trueDraw: (1/b.draw) / totalIP, trueAway: (1/b.away) / totalIP,
+      homeOdds: b.home, drawOdds: b.draw, awayOdds: b.away,
       over25Odds: bestRaw.over25,
-      homeBook: bestRaw.homeBook, drawBook: bestRaw.drawBook,
-      awayBook: bestRaw.awayBook, over25Book: bestRaw.over25Book,
+      homeBook: b.title, drawBook: b.title, awayBook: b.title, over25Book: bestRaw.over25Book,
       bookCount: books1x2.length,
-      avgMargin: parseFloat((avgMargin * 100).toFixed(2)),
+      avgMargin: parseFloat(((totalIP - 1) * 100).toFixed(2)),
       isTwoWay: false,
     };
   }
 
-  // 2-way market path (NBA/NHL)
+  // 2-way market (NBA/NHL)
   if (books2way.length > 0) {
     const b = books2way[0];
-    const totalIP      = (1/b.home) + (1/b.away);
-    const bestTrueHome = (1/b.home) / totalIP;
-    const bestTrueAway = (1/b.away) / totalIP;
-    const avgMargin    = totalIP - 1;
-
+    const totalIP = (1/b.home) + (1/b.away);
     return {
-      trueHome: bestTrueHome, trueDraw: 0, trueAway: bestTrueAway,
+      trueHome: (1/b.home) / totalIP, trueDraw: 0, trueAway: (1/b.away) / totalIP,
       homeOdds: b.home, drawOdds: 0, awayOdds: b.away,
       over25Odds: bestRaw.over25,
-      homeBook: b.title, drawBook: '', awayBook: b.title,
-      over25Book: bestRaw.over25Book,
+      homeBook: b.title, drawBook: '', awayBook: b.title, over25Book: bestRaw.over25Book,
       bookCount: books2way.length,
-      avgMargin: parseFloat((avgMargin * 100).toFixed(2)),
+      avgMargin: parseFloat(((totalIP - 1) * 100).toFixed(2)),
       isTwoWay: true,
     };
   }
@@ -1080,6 +1066,7 @@ async function analyseNHLFixture(event, sport) {
 
     if (market.homeOdds >= 1.25 && market.homeOdds <= 4.5 && market.trueHome > 0) {
       const edge = calcEdge(homeWinML, market.trueHome);
+      console.log(`  🏒 NHL ${event.home_team} home edge: ${edge.toFixed(1)}% (model:${(homeWinML*100).toFixed(1)}% true:${(market.trueHome*100).toFixed(1)}%)`);
       if (edge >= MIN_EDGE_PCT) {
         const conf  = confidenceFromSignals({ edgePct: edge, modelProb: homeWinML, dataQualityTier: 1.0, sport: 'Ice Hockey' });
         const stake = kellyStake(homeWinML, market.homeOdds);
@@ -1183,6 +1170,7 @@ async function analyseNBAFixture(event, sport) {
 
     if (market.homeOdds >= 1.25 && market.homeOdds <= 5.0 && market.trueHome > 0) {
       const edge = calcEdge(homeWinP, market.trueHome);
+      console.log(`  🏀 NBA ${event.home_team} home edge: ${edge.toFixed(1)}% (model:${(homeWinP*100).toFixed(1)}% true:${(market.trueHome*100).toFixed(1)}%)`);
       if (edge >= MIN_EDGE_PCT) {
         const conf  = Math.min(92, Math.max(75, Math.round(75 + (edge - 5) * 1.5)));
         const stake = kellyStake(homeWinP, market.homeOdds);
