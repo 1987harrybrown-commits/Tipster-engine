@@ -55,7 +55,7 @@ const SPORTS = [
   { key: 'soccer_france_ligue_one',   name: 'Football',   league: 'Ligue 1',          tournamentId: 34  },
   { key: 'soccer_uefa_champs_league', name: 'Football',   league: 'Champions League', tournamentId: 7   },
   { key: 'basketball_nba',            name: 'Basketball', league: 'NBA',              tournamentId: 132 },
-  { key: 'icehockey_nhl',             name: 'Ice Hockey', league: 'NHL',              tournamentId: 40  },
+  { key: 'icehockey_nhl',             name: 'Ice Hockey', league: 'NHL',              tournamentId: 234 },
 ];
 
 // ─── STRICT RULES ENGINE CONSTANTS ───────────────────────────
@@ -215,16 +215,16 @@ async function fetchTeamRecentMatches(teamId) {
 
 // ─── PARSE SOFASCORE ODDS INTO ENGINE FORMAT ──────────────────
 // Sofascore returns fractional odds (e.g. "3/10") — convert to decimal.
-// Markets array contains multiple market objects, each with choices[].
-// 1X2: marketName "Full time", choices named "1", "X", "2"
-// Totals: marketName "Match goals", choiceGroup = "2.5" / "5.5" etc.
+// Football 1X2: marketName "Full time", choices "1", "X", "2"
+// NBA/NHL 2-way: marketName "Home/Away" or "Money line", choices "1", "2"
+// Totals: marketName "Match goals" / "Total" with choiceGroup
 function parseSofascoreOdds(markets, homeTeam, awayTeam) {
   if (!markets || !Array.isArray(markets)) return [];
 
-  const h2hOutcomes   = [];
+  const h2hOutcomes    = [];
   const totalsOutcomes = [];
 
-  // 1X2 full time market
+  // Try football 1X2 first (Full time, 3-way)
   const ftMarket = markets.find(m =>
     m.marketName === 'Full time' && m.marketGroup === '1X2' && m.marketPeriod === 'Full-time'
   );
@@ -239,12 +239,35 @@ function parseSofascoreOdds(markets, homeTeam, awayTeam) {
     }
   }
 
-  // Match goals / totals — find 2.5 line for football, 5.5 for hockey
-  // Try 2.5 first, then 5.5
-  const totalsLines = ['2.5', '5.5', '3.5', '1.5'];
+  // If no 3-way market, try 2-way (NBA/NHL moneyline)
+  if (h2hOutcomes.length < 2) {
+    const moneylineMarket = markets.find(m =>
+      m.marketGroup === 'Home/Away' ||
+      m.marketName === 'Money line' ||
+      m.marketName === 'Home/Away' ||
+      m.marketName === 'Winner' ||
+      (m.marketId === 1 && m.choices?.length === 2)
+    );
+
+    if (moneylineMarket?.choices) {
+      for (const choice of moneylineMarket.choices) {
+        const decimal = fractionalToDecimal(choice.fractionalValue);
+        if (!decimal) continue;
+        if (choice.name === '1')      h2hOutcomes.push({ name: homeTeam, price: decimal });
+        else if (choice.name === '2') h2hOutcomes.push({ name: awayTeam, price: decimal });
+        // Some use team names directly
+        else if (h2hOutcomes.length === 0) h2hOutcomes.push({ name: homeTeam, price: decimal });
+        else if (h2hOutcomes.length === 1) h2hOutcomes.push({ name: awayTeam, price: decimal });
+      }
+    }
+  }
+
+  // Totals — try "Match goals" (football), then "Total" (basketball/hockey)
+  const totalsLines = ['2.5', '5.5', '3.5', '1.5', '215.5', '220.5', '225.5', '210.5'];
   for (const line of totalsLines) {
     const totalsMarket = markets.find(m =>
-      m.marketName === 'Match goals' && m.choiceGroup === line
+      (m.marketName === 'Match goals' || m.marketName === 'Total' || m.marketName === 'Over/Under') &&
+      m.choiceGroup === line
     );
     if (totalsMarket?.choices) {
       for (const choice of totalsMarket.choices) {
@@ -258,6 +281,13 @@ function parseSofascoreOdds(markets, homeTeam, awayTeam) {
   }
 
   if (h2hOutcomes.length < 2) return [];
+
+  // For 2-way markets (NBA/NHL), add Draw with 0 price so extractMarketData still works
+  // The engine models handle 2-way markets directly
+  const markets2way = h2hOutcomes.length === 2;
+  if (markets2way) {
+    h2hOutcomes.push({ name: 'Draw', price: 0 });
+  }
 
   return [{
     title: 'Sofascore',
