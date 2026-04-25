@@ -160,11 +160,25 @@ async function fetchTournamentEvents(tournamentId) {
   return data?.events || [];
 }
 
+// Convert fractional odds string to decimal (e.g. "3/10" → 1.30)
+function fractionalToDecimal(fractional) {
+  if (!fractional) return 0;
+  const parts = fractional.toString().split('/');
+  if (parts.length === 2) {
+    const num = parseFloat(parts[0]);
+    const den = parseFloat(parts[1]);
+    if (den === 0) return 0;
+    return parseFloat((1 + num / den).toFixed(3));
+  }
+  // Already decimal
+  return parseFloat(fractional) || 0;
+}
+
 // Fetch odds for a specific event
 async function fetchEventOdds(eventId) {
   await new Promise(r => setTimeout(r, 250));
-  const data = await sofascoreFetch(`/matches/get-all-odds`, { id: eventId });
-  return data?.odds || null;
+  const data = await sofascoreFetch(`/matches/get-all-odds`, { matchId: eventId });
+  return data?.markets || null;
 }
 
 // Fetch team stats for a tournament season
@@ -182,67 +196,58 @@ async function fetchTeamRecentMatches(teamId) {
 }
 
 // ─── PARSE SOFASCORE ODDS INTO ENGINE FORMAT ──────────────────
-// Converts Sofascore odds structure to the bookmakers[] format
-// the existing engine models expect
-function parseSofascoreOdds(oddsData, homeTeam, awayTeam) {
-  if (!oddsData) return [];
+// Sofascore returns fractional odds (e.g. "3/10") — convert to decimal.
+// Markets array contains multiple market objects, each with choices[].
+// 1X2: marketName "Full time", choices named "1", "X", "2"
+// Totals: marketName "Match goals", choiceGroup = "2.5" / "5.5" etc.
+function parseSofascoreOdds(markets, homeTeam, awayTeam) {
+  if (!markets || !Array.isArray(markets)) return [];
 
-  // Sofascore returns odds grouped by market
-  // We reconstruct a bookmakers array compatible with extractMarketData()
-  const bookmakers = [];
-  const h2hOutcomes = [];
+  const h2hOutcomes   = [];
   const totalsOutcomes = [];
 
-  // Find 1X2 market (full time result)
-  const ftMarket = oddsData.find?.(o =>
-    o.marketName?.toLowerCase().includes('1x2') ||
-    o.marketName?.toLowerCase().includes('full time') ||
-    o.marketName?.toLowerCase().includes('match result')
+  // 1X2 full time market
+  const ftMarket = markets.find(m =>
+    m.marketName === 'Full time' && m.marketGroup === '1X2' && m.marketPeriod === 'Full-time'
   );
 
   if (ftMarket?.choices) {
     for (const choice of ftMarket.choices) {
-      const name = choice.name?.toLowerCase();
-      if (name === '1' || name === 'home') {
-        h2hOutcomes.push({ name: homeTeam, price: parseFloat(choice.fractionalValue || choice.odds || 0) });
-      } else if (name === 'x' || name === 'draw') {
-        h2hOutcomes.push({ name: 'Draw', price: parseFloat(choice.fractionalValue || choice.odds || 0) });
-      } else if (name === '2' || name === 'away') {
-        h2hOutcomes.push({ name: awayTeam, price: parseFloat(choice.fractionalValue || choice.odds || 0) });
-      }
+      const decimal = fractionalToDecimal(choice.fractionalValue);
+      if (!decimal) continue;
+      if (choice.name === '1')      h2hOutcomes.push({ name: homeTeam, price: decimal });
+      else if (choice.name === 'X') h2hOutcomes.push({ name: 'Draw',   price: decimal });
+      else if (choice.name === '2') h2hOutcomes.push({ name: awayTeam, price: decimal });
     }
   }
 
-  // Find totals market (over/under 2.5 for football, 5.5 for hockey)
-  const totalsMarket = oddsData.find?.(o =>
-    o.marketName?.toLowerCase().includes('over/under') ||
-    o.marketName?.toLowerCase().includes('total goals') ||
-    o.marketName?.toLowerCase().includes('total points')
-  );
-
-  if (totalsMarket?.choices) {
-    for (const choice of totalsMarket.choices) {
-      const name = choice.name?.toLowerCase();
-      const point = parseFloat(totalsMarket.handicap || choice.handicap || 2.5);
-      if (name?.includes('over')) {
-        totalsOutcomes.push({ name: 'Over', price: parseFloat(choice.fractionalValue || choice.odds || 0), point });
-      } else if (name?.includes('under')) {
-        totalsOutcomes.push({ name: 'Under', price: parseFloat(choice.fractionalValue || choice.odds || 0), point });
+  // Match goals / totals — find 2.5 line for football, 5.5 for hockey
+  // Try 2.5 first, then 5.5
+  const totalsLines = ['2.5', '5.5', '3.5', '1.5'];
+  for (const line of totalsLines) {
+    const totalsMarket = markets.find(m =>
+      m.marketName === 'Match goals' && m.choiceGroup === line
+    );
+    if (totalsMarket?.choices) {
+      for (const choice of totalsMarket.choices) {
+        const decimal = fractionalToDecimal(choice.fractionalValue);
+        if (!decimal) continue;
+        if (choice.name === 'Over')  totalsOutcomes.push({ name: 'Over',  price: decimal, point: parseFloat(line) });
+        if (choice.name === 'Under') totalsOutcomes.push({ name: 'Under', price: decimal, point: parseFloat(line) });
       }
+      if (totalsOutcomes.length >= 2) break;
     }
   }
 
-  if (h2hOutcomes.length >= 2) {
-    bookmakers.push({
-      title: 'Sofascore',
-      markets: [
-        { key: 'h2h', outcomes: h2hOutcomes },
-        ...(totalsOutcomes.length ? [{ key: 'totals', outcomes: totalsOutcomes }] : []),
-      ],
-    });
-  }
+  if (h2hOutcomes.length < 2) return [];
 
-  return bookmakers;
+  return [{
+    title: 'Sofascore',
+    markets: [
+      { key: 'h2h',    outcomes: h2hOutcomes },
+      ...(totalsOutcomes.length >= 2 ? [{ key: 'totals', outcomes: totalsOutcomes }] : []),
+    ],
+  }];
 }
 
 // ─── BUILD TEAM STATS FROM STANDINGS ─────────────────────────
@@ -356,11 +361,7 @@ async function morningFetch() {
         if (!homeTeam || !awayTeam) continue;
 
         const oddsRaw    = await fetchEventOdds(event.id);
-        const bookmakers = parseSofascoreOdds(
-          Array.isArray(oddsRaw) ? oddsRaw : oddsRaw?.markets || oddsRaw?.odds,
-          homeTeam,
-          awayTeam
-        );
+        const bookmakers = parseSofascoreOdds(oddsRaw, homeTeam, awayTeam);
 
         enriched.push({
           id:            event.id,
@@ -439,11 +440,7 @@ async function middayOddsRefresh() {
     for (const event of events) {
       try {
         const oddsRaw    = await fetchEventOdds(event.id);
-        const bookmakers = parseSofascoreOdds(
-          Array.isArray(oddsRaw) ? oddsRaw : oddsRaw?.markets || oddsRaw?.odds,
-          event.home_team,
-          event.away_team
-        );
+        const bookmakers = parseSofascoreOdds(oddsRaw, event.home_team, event.away_team);
         if (bookmakers.length) {
           event.bookmakers = bookmakers;
           updated++;
@@ -723,21 +720,17 @@ function extractMarketData(event) {
 
   if (!books1x2.length) return null;
 
-  let bestTrueHome = 0, bestTrueDraw = 0, bestTrueAway = 0;
-  let bestTrueHomeBook = '', bestTrueDrawBook = '', bestTrueAwayBook = '';
-
-  for (const b of books1x2) {
-    const totalIP  = (1/b.home) + (1/b.draw) + (1/b.away);
-    const trueHome = (1/b.home) / totalIP;
-    const trueDraw = (1/b.draw) / totalIP;
-    const trueAway = (1/b.away) / totalIP;
-    if (trueHome > bestTrueHome) { bestTrueHome = trueHome; bestTrueHomeBook = b.title; }
-    if (trueDraw > bestTrueDraw) { bestTrueDraw = trueDraw; bestTrueDrawBook = b.title; }
-    if (trueAway > bestTrueAway) { bestTrueAway = trueAway; bestTrueAwayBook = b.title; }
-  }
-
-  const avgMargin = books1x2.reduce((s, b) =>
-    s + ((1/b.home) + (1/b.draw) + (1/b.away) - 1), 0) / books1x2.length;
+  // Single source (Sofascore) — use raw implied prob as true prob
+  // No multi-book margin stripping needed, but we still normalise the 1X2
+  const b = books1x2[0];
+  const totalIP  = (1/b.home) + (1/b.draw) + (1/b.away);
+  const bestTrueHome = (1/b.home) / totalIP;
+  const bestTrueDraw = (1/b.draw) / totalIP;
+  const bestTrueAway = (1/b.away) / totalIP;
+  const bestTrueHomeBook = b.title;
+  const bestTrueDrawBook = b.title;
+  const bestTrueAwayBook = b.title;
+  const avgMargin = totalIP - 1;
 
   return {
     trueHome: bestTrueHome, trueDraw: bestTrueDraw, trueAway: bestTrueAway,
