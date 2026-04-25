@@ -288,17 +288,10 @@ function parseSofascoreOdds(markets, homeTeam, awayTeam) {
 
   if (h2hOutcomes.length < 2) return [];
 
-  // For 2-way markets (NBA/NHL), add Draw with 0 price so extractMarketData still works
-  // The engine models handle 2-way markets directly
-  const markets2way = h2hOutcomes.length === 2;
-  if (markets2way) {
-    h2hOutcomes.push({ name: 'Draw', price: 0 });
-  }
-
   return [{
     title: 'Sofascore',
     markets: [
-      { key: 'h2h',    outcomes: h2hOutcomes },
+      { key: 'h2h', outcomes: h2hOutcomes },
       ...(totalsOutcomes.length >= 2 ? [{ key: 'totals', outcomes: totalsOutcomes }] : []),
     ],
   }];
@@ -757,16 +750,17 @@ function extractMarketData(event) {
     const h2h = book.markets?.find(m => m.key === 'h2h');
     if (h2h) {
       let bHome = 0, bDraw = 0, bAway = 0;
+      let homeFound = false, awayFound = false;
       for (const o of h2h.outcomes) {
-        if (nameMatch(o.name, event.home_team))       { bHome = o.price; }
-        else if (nameMatch(o.name, event.away_team))  { bAway = o.price; }
-        else if (o.name === 'Draw')                   { bDraw = o.price; }
+        if (o.name === 'Draw') { bDraw = o.price; }
+        else if (!homeFound)   { bHome = o.price; homeFound = true; }
+        else if (!awayFound)   { bAway = o.price; awayFound = true; }
       }
       // 3-way market (football)
       if (bHome > 0 && bDraw > 0 && bAway > 0) {
         books1x2.push({ title: book.title, home: bHome, draw: bDraw, away: bAway });
       }
-      // 2-way market (NBA/NHL) — draw price is 0
+      // 2-way market (NBA/NHL)
       else if (bHome > 0 && bAway > 0 && bDraw === 0) {
         books2way.push({ title: book.title, home: bHome, away: bAway });
       }
