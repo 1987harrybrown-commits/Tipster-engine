@@ -259,7 +259,11 @@ function parseSofascoreOdds(markets, homeTeam, awayTeam) {
     );
 
     if (moneylineMarket?.choices) {
-      console.log(`  🔍 2-way market: "${moneylineMarket.marketName}" / "${moneylineMarket.marketGroup}" choices: ${moneylineMarket.choices.map(c => `"${c.name}"=${getChoicePrice(c)}`).join(', ')}`);
+      const debugPrices = moneylineMarket.choices.map(c => {
+        const p = getChoicePrice(c);
+        return `"${c.name}"(frac:${c.fractionalValue},init:${c.initialFractionalValue})=${p}`;
+      }).join(', ');
+      console.log(`  🔍 2-way: ${debugPrices}`);
       for (const choice of moneylineMarket.choices) {
         const decimal = getChoicePrice(choice);
         if (!decimal) continue;
@@ -419,7 +423,9 @@ async function morningFetch() {
         if (oddsRaw && !bookmakers.length) {
           console.log(`  ⚠️ Odds parse failed for ${homeTeam} vs ${awayTeam} — markets: ${oddsRaw?.length || 0}`);
         } else if (bookmakers.length) {
-          console.log(`  ✅ Odds ok: ${homeTeam} vs ${awayTeam} — H:${bookmakers[0].markets[0]?.outcomes[0]?.price} D:${bookmakers[0].markets[0]?.outcomes[1]?.price} A:${bookmakers[0].markets[0]?.outcomes[2]?.price}`);
+          const outs = bookmakers[0].markets[0]?.outcomes || [];
+          const h = outs[0]?.price, d = outs.find(o=>o.name==='Draw')?.price, a = outs[outs.length-1]?.price;
+          console.log(`  ✅ Odds ok: ${homeTeam} vs ${awayTeam} — H:${h} D:${d||0} A:${a}`);
         }
 
         enriched.push({
