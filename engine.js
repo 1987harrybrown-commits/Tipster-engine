@@ -55,7 +55,7 @@ const SPORTS = [
   { key: 'soccer_france_ligue_one',   name: 'Football',   league: 'Ligue 1',          tournamentId: 34  },
   { key: 'soccer_uefa_champs_league', name: 'Football',   league: 'Champions League', tournamentId: 7   },
   { key: 'basketball_nba',            name: 'Basketball', league: 'NBA',              tournamentId: 132 },
-  { key: 'icehockey_nhl',             name: 'Ice Hockey', league: 'NHL',              tournamentId: 234 },
+  { key: 'icehockey_nhl',             name: 'Ice Hockey', league: 'NHL',              tournamentId: 40  },
 ];
 
 // ─── STRICT RULES ENGINE CONSTANTS ───────────────────────────
@@ -122,38 +122,20 @@ async function sofascoreFetch(path, params = {}) {
   for (const [k, v] of Object.entries(params)) url.searchParams.set(k, v);
   trackApiCall();
   try {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 10000); // 10s timeout
     const res = await fetch(url.toString(), {
-      signal: controller.signal,
       headers: {
         'x-rapidapi-key':  RAPIDAPI_KEY,
         'x-rapidapi-host': RAPIDAPI_HOST,
         'Content-Type':    'application/json',
       },
     });
-    clearTimeout(timeout);
     if (!res.ok) {
       console.log(`⚠️ Sofascore ${path}: ${res.status}`);
       return null;
     }
-    const text = await res.text();
-    if (!text || text.trim() === '') {
-      console.log(`⚠️ Sofascore ${path}: empty response`);
-      return null;
-    }
-    try {
-      return JSON.parse(text);
-    } catch(parseErr) {
-      console.log(`⚠️ Sofascore ${path}: JSON parse error — ${text.slice(0, 100)}`);
-      return null;
-    }
+    return await res.json();
   } catch(e) {
-    if (e.name === 'AbortError') {
-      console.log(`⚠️ Sofascore ${path}: timeout`);
-    } else {
-      console.error(`Sofascore fetch error (${path}):`, e.message);
-    }
+    console.error(`Sofascore fetch error (${path}):`, e.message);
     return null;
   }
 }
@@ -178,25 +160,11 @@ async function fetchTournamentEvents(tournamentId) {
   return data?.events || [];
 }
 
-// Convert fractional odds string to decimal (e.g. "3/10" → 1.30)
-function fractionalToDecimal(fractional) {
-  if (!fractional) return 0;
-  const parts = fractional.toString().split('/');
-  if (parts.length === 2) {
-    const num = parseFloat(parts[0]);
-    const den = parseFloat(parts[1]);
-    if (den === 0) return 0;
-    return parseFloat((1 + num / den).toFixed(3));
-  }
-  // Already decimal
-  return parseFloat(fractional) || 0;
-}
-
 // Fetch odds for a specific event
 async function fetchEventOdds(eventId) {
-  await new Promise(r => setTimeout(r, 500)); // 500ms gap — stay under 5 req/sec
-  const data = await sofascoreFetch(`/matches/get-all-odds`, { matchId: eventId });
-  return data?.markets || null;
+  await new Promise(r => setTimeout(r, 250));
+  const data = await sofascoreFetch(`/matches/get-all-odds`, { id: eventId });
+  return data?.odds || null;
 }
 
 // Fetch team stats for a tournament season
@@ -214,88 +182,67 @@ async function fetchTeamRecentMatches(teamId) {
 }
 
 // ─── PARSE SOFASCORE ODDS INTO ENGINE FORMAT ──────────────────
-// Sofascore returns fractional odds (e.g. "3/10") — convert to decimal.
-// Football 1X2: marketName "Full time", choices "1", "X", "2"
-// NBA/NHL 2-way: marketName "Home/Away" or "Money line", choices "1", "2"
-// Totals: marketName "Match goals" / "Total" with choiceGroup
-function parseSofascoreOdds(markets, homeTeam, awayTeam) {
-  if (!markets || !Array.isArray(markets)) return [];
+// Converts Sofascore odds structure to the bookmakers[] format
+// the existing engine models expect
+function parseSofascoreOdds(oddsData, homeTeam, awayTeam) {
+  if (!oddsData) return [];
 
-  const h2hOutcomes    = [];
+  // Sofascore returns odds grouped by market
+  // We reconstruct a bookmakers array compatible with extractMarketData()
+  const bookmakers = [];
+  const h2hOutcomes = [];
   const totalsOutcomes = [];
 
-  // Try football 1X2 first (Full time, 3-way)
-  const ftMarket = markets.find(m =>
-    m.marketName === 'Full time' && m.marketGroup === '1X2' && m.marketPeriod === 'Full-time'
+  // Find 1X2 market (full time result)
+  const ftMarket = oddsData.find?.(o =>
+    o.marketName?.toLowerCase().includes('1x2') ||
+    o.marketName?.toLowerCase().includes('full time') ||
+    o.marketName?.toLowerCase().includes('match result')
   );
 
   if (ftMarket?.choices) {
     for (const choice of ftMarket.choices) {
-      const decimal = fractionalToDecimal(choice.fractionalValue);
-      if (!decimal) continue;
-      if (choice.name === '1')      h2hOutcomes.push({ name: homeTeam, price: decimal });
-      else if (choice.name === 'X') h2hOutcomes.push({ name: 'Draw',   price: decimal });
-      else if (choice.name === '2') h2hOutcomes.push({ name: awayTeam, price: decimal });
-    }
-  }
-
-  // If no 3-way market, try 2-way (NBA/NHL moneyline)
-  if (h2hOutcomes.length < 2) {
-    const moneylineMarket = markets.find(m =>
-      m.marketGroup === 'Home/Away' ||
-      m.marketName === 'Money line' ||
-      m.marketName === 'Home/Away' ||
-      m.marketName === 'Winner' ||
-      (m.marketId === 1 && m.choices?.length === 2)
-    );
-
-    if (moneylineMarket?.choices) {
-      for (const choice of moneylineMarket.choices) {
-        const decimal = fractionalToDecimal(choice.fractionalValue);
-        if (!decimal) continue;
-        if (choice.name === '1')      h2hOutcomes.push({ name: homeTeam, price: decimal });
-        else if (choice.name === '2') h2hOutcomes.push({ name: awayTeam, price: decimal });
-        // Some use team names directly
-        else if (h2hOutcomes.length === 0) h2hOutcomes.push({ name: homeTeam, price: decimal });
-        else if (h2hOutcomes.length === 1) h2hOutcomes.push({ name: awayTeam, price: decimal });
+      const name = choice.name?.toLowerCase();
+      if (name === '1' || name === 'home') {
+        h2hOutcomes.push({ name: homeTeam, price: parseFloat(choice.fractionalValue || choice.odds || 0) });
+      } else if (name === 'x' || name === 'draw') {
+        h2hOutcomes.push({ name: 'Draw', price: parseFloat(choice.fractionalValue || choice.odds || 0) });
+      } else if (name === '2' || name === 'away') {
+        h2hOutcomes.push({ name: awayTeam, price: parseFloat(choice.fractionalValue || choice.odds || 0) });
       }
     }
   }
 
-  // Totals — try "Match goals" (football), then "Total" (basketball/hockey)
-  const totalsLines = ['2.5', '5.5', '3.5', '1.5', '215.5', '220.5', '225.5', '210.5'];
-  for (const line of totalsLines) {
-    const totalsMarket = markets.find(m =>
-      (m.marketName === 'Match goals' || m.marketName === 'Total' || m.marketName === 'Over/Under') &&
-      m.choiceGroup === line
-    );
-    if (totalsMarket?.choices) {
-      for (const choice of totalsMarket.choices) {
-        const decimal = fractionalToDecimal(choice.fractionalValue);
-        if (!decimal) continue;
-        if (choice.name === 'Over')  totalsOutcomes.push({ name: 'Over',  price: decimal, point: parseFloat(line) });
-        if (choice.name === 'Under') totalsOutcomes.push({ name: 'Under', price: decimal, point: parseFloat(line) });
+  // Find totals market (over/under 2.5 for football, 5.5 for hockey)
+  const totalsMarket = oddsData.find?.(o =>
+    o.marketName?.toLowerCase().includes('over/under') ||
+    o.marketName?.toLowerCase().includes('total goals') ||
+    o.marketName?.toLowerCase().includes('total points')
+  );
+
+  if (totalsMarket?.choices) {
+    for (const choice of totalsMarket.choices) {
+      const name = choice.name?.toLowerCase();
+      const point = parseFloat(totalsMarket.handicap || choice.handicap || 2.5);
+      if (name?.includes('over')) {
+        totalsOutcomes.push({ name: 'Over', price: parseFloat(choice.fractionalValue || choice.odds || 0), point });
+      } else if (name?.includes('under')) {
+        totalsOutcomes.push({ name: 'Under', price: parseFloat(choice.fractionalValue || choice.odds || 0), point });
       }
-      if (totalsOutcomes.length >= 2) break;
     }
   }
 
-  if (h2hOutcomes.length < 2) return [];
-
-  // For 2-way markets (NBA/NHL), add Draw with 0 price so extractMarketData still works
-  // The engine models handle 2-way markets directly
-  const markets2way = h2hOutcomes.length === 2;
-  if (markets2way) {
-    h2hOutcomes.push({ name: 'Draw', price: 0 });
+  if (h2hOutcomes.length >= 2) {
+    bookmakers.push({
+      title: 'Sofascore',
+      markets: [
+        { key: 'h2h', outcomes: h2hOutcomes },
+        ...(totalsOutcomes.length ? [{ key: 'totals', outcomes: totalsOutcomes }] : []),
+      ],
+    });
   }
 
-  return [{
-    title: 'Sofascore',
-    markets: [
-      { key: 'h2h',    outcomes: h2hOutcomes },
-      ...(totalsOutcomes.length >= 2 ? [{ key: 'totals', outcomes: totalsOutcomes }] : []),
-    ],
-  }];
+  return bookmakers;
 }
 
 // ─── BUILD TEAM STATS FROM STANDINGS ─────────────────────────
@@ -400,7 +347,6 @@ async function morningFetch() {
       });
 
       console.log(`  → ${upcoming.length} fixtures in next 48h`);
-      if (upcoming.length > 0) console.log(`  Debug IDs: ${upcoming.slice(0,3).map(e => e.id).join(', ')}`);
 
       // Fetch odds for each fixture + build event objects
       const enriched = [];
@@ -410,12 +356,11 @@ async function morningFetch() {
         if (!homeTeam || !awayTeam) continue;
 
         const oddsRaw    = await fetchEventOdds(event.id);
-        const bookmakers = parseSofascoreOdds(oddsRaw, homeTeam, awayTeam);
-        if (oddsRaw && !bookmakers.length) {
-          console.log(`  ⚠️ Odds parse failed for ${homeTeam} vs ${awayTeam} — markets: ${oddsRaw?.length || 0}`);
-        } else if (bookmakers.length) {
-          console.log(`  ✅ Odds ok: ${homeTeam} vs ${awayTeam} — H:${bookmakers[0].markets[0]?.outcomes[0]?.price} D:${bookmakers[0].markets[0]?.outcomes[1]?.price} A:${bookmakers[0].markets[0]?.outcomes[2]?.price}`);
-        }
+        const bookmakers = parseSofascoreOdds(
+          Array.isArray(oddsRaw) ? oddsRaw : oddsRaw?.markets || oddsRaw?.odds,
+          homeTeam,
+          awayTeam
+        );
 
         enriched.push({
           id:            event.id,
@@ -494,7 +439,11 @@ async function middayOddsRefresh() {
     for (const event of events) {
       try {
         const oddsRaw    = await fetchEventOdds(event.id);
-        const bookmakers = parseSofascoreOdds(oddsRaw, event.home_team, event.away_team);
+        const bookmakers = parseSofascoreOdds(
+          Array.isArray(oddsRaw) ? oddsRaw : oddsRaw?.markets || oddsRaw?.odds,
+          event.home_team,
+          event.away_team
+        );
         if (bookmakers.length) {
           event.bookmakers = bookmakers;
           updated++;
@@ -774,17 +723,21 @@ function extractMarketData(event) {
 
   if (!books1x2.length) return null;
 
-  // Single source (Sofascore) — use raw implied prob as true prob
-  // No multi-book margin stripping needed, but we still normalise the 1X2
-  const b = books1x2[0];
-  const totalIP  = (1/b.home) + (1/b.draw) + (1/b.away);
-  const bestTrueHome = (1/b.home) / totalIP;
-  const bestTrueDraw = (1/b.draw) / totalIP;
-  const bestTrueAway = (1/b.away) / totalIP;
-  const bestTrueHomeBook = b.title;
-  const bestTrueDrawBook = b.title;
-  const bestTrueAwayBook = b.title;
-  const avgMargin = totalIP - 1;
+  let bestTrueHome = 0, bestTrueDraw = 0, bestTrueAway = 0;
+  let bestTrueHomeBook = '', bestTrueDrawBook = '', bestTrueAwayBook = '';
+
+  for (const b of books1x2) {
+    const totalIP  = (1/b.home) + (1/b.draw) + (1/b.away);
+    const trueHome = (1/b.home) / totalIP;
+    const trueDraw = (1/b.draw) / totalIP;
+    const trueAway = (1/b.away) / totalIP;
+    if (trueHome > bestTrueHome) { bestTrueHome = trueHome; bestTrueHomeBook = b.title; }
+    if (trueDraw > bestTrueDraw) { bestTrueDraw = trueDraw; bestTrueDrawBook = b.title; }
+    if (trueAway > bestTrueAway) { bestTrueAway = trueAway; bestTrueAwayBook = b.title; }
+  }
+
+  const avgMargin = books1x2.reduce((s, b) =>
+    s + ((1/b.home) + (1/b.draw) + (1/b.away) - 1), 0) / books1x2.length;
 
   return {
     trueHome: bestTrueHome, trueDraw: bestTrueDraw, trueAway: bestTrueAway,
