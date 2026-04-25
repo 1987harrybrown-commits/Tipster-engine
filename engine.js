@@ -250,6 +250,8 @@ function parseSofascoreOdds(markets, homeTeam, awayTeam) {
     );
 
     if (moneylineMarket?.choices) {
+      // Log first market to see structure
+      console.log(`  🔍 2-way market: "${moneylineMarket.marketName}" / "${moneylineMarket.marketGroup}" choices: ${moneylineMarket.choices.map(c => `"${c.name}"`).join(', ')}`);
       for (const choice of moneylineMarket.choices) {
         const decimal = fractionalToDecimal(choice.fractionalValue);
         if (!decimal) continue;
@@ -259,6 +261,10 @@ function parseSofascoreOdds(markets, homeTeam, awayTeam) {
         else if (h2hOutcomes.length === 0) h2hOutcomes.push({ name: homeTeam, price: decimal });
         else if (h2hOutcomes.length === 1) h2hOutcomes.push({ name: awayTeam, price: decimal });
       }
+    } else {
+      // Log what markets ARE available
+      const names = markets.slice(0,5).map(m => `"${m.marketName}/${m.marketGroup}"`).join(', ');
+      console.log(`  🔍 No 2-way market found. Available: ${names}`);
     }
   }
 
