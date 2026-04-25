@@ -352,6 +352,7 @@ async function morningFetch() {
       });
 
       console.log(`  → ${upcoming.length} fixtures in next 48h`);
+      if (upcoming.length > 0) console.log(`  Debug IDs: ${upcoming.slice(0,3).map(e => e.id).join(', ')}`);
 
       // Fetch odds for each fixture + build event objects
       const enriched = [];
