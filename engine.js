@@ -43,7 +43,7 @@ const SOFASCORE_TOURNAMENTS = {
   ligue_1:          34,
   champions_league: 7,
   nba:              132,
-  nhl:              40,
+  nhl:              234,
 };
 
 // ─── SPORTS CONFIG ────────────────────────────────────────────
@@ -55,26 +55,36 @@ const SPORTS = [
   { key: 'soccer_france_ligue_one',   name: 'Football',   league: 'Ligue 1',          tournamentId: 34  },
   { key: 'soccer_uefa_champs_league', name: 'Football',   league: 'Champions League', tournamentId: 7   },
   { key: 'basketball_nba',            name: 'Basketball', league: 'NBA',              tournamentId: 132 },
-  { key: 'icehockey_nhl',             name: 'Ice Hockey', league: 'NHL',              tournamentId: 40  },
+  { key: 'icehockey_nhl',             name: 'Ice Hockey', league: 'NHL',              tournamentId: 234 },
 ];
 
 // ─── STRICT RULES ENGINE CONSTANTS ───────────────────────────
-const MIN_CONFIDENCE    = 78;
-const MIN_EDGE_PCT      = 8;
-const OVERS_MIN_EDGE    = 12;
+const MIN_CONFIDENCE     = 52;  // Minimum win probability to publish
+const NBA_MIN_CONFIDENCE = 52;
+const NHL_MIN_CONFIDENCE = 52;
+const MIN_EDGE_PCT      = 0;
+const NHL_MIN_EDGE      = 0;
+const NBA_MIN_EDGE      = 0;
+const OVERS_MIN_EDGE    = 0;
 const ELITE_H2H_EDGE    = 10;
 const ELITE_OVERS_EDGE  = 14;
-const ODDS_MIN          = 1.40;
-const ODDS_CORE_MAX     = 2.20;
-const ODDS_ELITE_MAX    = 2.50;
+
+// Odds tiers:
+//   INSIGHT_ODDS_MIN  — show as "Short Price Watch" (informational, stake 0)
+//   BET_ODDS_MIN      — minimum odds for a real bet recommendation
+//   ODDS_ELITE_MAX    — maximum odds published
+const INSIGHT_ODDS_MIN  = 1.05; // Show from here — heavy favs shown as insight
+const BET_ODDS_MIN      = 1.35; // Minimum odds for a real bet
+const ODDS_CORE_MAX     = 5.00;
+const ODDS_ELITE_MAX    = 10.0;
+
 const LINE_MOVE_REJECT  = 0.10;
 const MATRIX_MAX_GOALS  = 8;
-const FOOTBALL_EDGE_PREMIUM = 2;
-const MIN_QUALITY_SCORE = 0.42;
+const FOOTBALL_EDGE_PREMIUM = 0;
+const MIN_QUALITY_SCORE = 0.10;
 const NHL_HOME_ADVANTAGE  = 0.20;
 const NHL_LEAGUE_AVG_GF   = 3.10;
 const NHL_MATRIX_MAX      = 7;
-const NHL_CONFIDENCE_CEILING = 82;
 const NBA_HOME_ADVANTAGE  = 3.5;
 const NBA_LEAGUE_AVG_PTS  = 113;
 const NBA_SCORE_STD_DEV   = 12.0;
@@ -122,20 +132,46 @@ async function sofascoreFetch(path, params = {}) {
   for (const [k, v] of Object.entries(params)) url.searchParams.set(k, v);
   trackApiCall();
   try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 10000); // 10s timeout
     const res = await fetch(url.toString(), {
+      signal: controller.signal,
       headers: {
         'x-rapidapi-key':  RAPIDAPI_KEY,
         'x-rapidapi-host': RAPIDAPI_HOST,
         'Content-Type':    'application/json',
       },
     });
+    clearTimeout(timeout);
     if (!res.ok) {
       console.log(`⚠️ Sofascore ${path}: ${res.status}`);
       return null;
     }
-    return await res.json();
+    const text = await res.text();
+    if (!res.ok) {
+      console.error(`Sofascore ${path}: HTTP ${res.status} — ${text.slice(0, 150)}`);
+      return null;
+    }
+    if (!text || text.trim() === '') {
+      console.log(`⚠️ Sofascore ${path}: empty response (HTTP ${res.status})`);
+      return null;
+    }
+    if (!text.trim().startsWith('{') && !text.trim().startsWith('[')) {
+      console.error(`Sofascore ${path}: unexpected body — ${text.slice(0, 150)}`);
+      return null;
+    }
+    try {
+      return JSON.parse(text);
+    } catch(parseErr) {
+      console.log(`⚠️ Sofascore ${path}: JSON parse error — ${text.slice(0, 150)}`);
+      return null;
+    }
   } catch(e) {
-    console.error(`Sofascore fetch error (${path}):`, e.message);
+    if (e.name === 'AbortError') {
+      console.log(`⚠️ Sofascore ${path}: timeout`);
+    } else {
+      console.error(`Sofascore fetch error (${path}):`, e.message);
+    }
     return null;
   }
 }
@@ -160,11 +196,38 @@ async function fetchTournamentEvents(tournamentId) {
   return data?.events || [];
 }
 
+// ─── ROBUST ODDS PARSER ───────────────────────────────────────
+// Handles: fractional strings "11/10", "3/1", decimal numbers, strings like "1.95"
+// Returns decimal odds (e.g. 2.10) or 0 if unparseable
+function parseOdds(value) {
+  if (value == null) return 0;
+  const s = String(value).trim();
+  // Fractional format: "11/10", "3/1", "1/2" etc
+  if (s.includes('/')) {
+    const parts = s.split('/');
+    if (parts.length !== 2) return 0;
+    const num = parseFloat(parts[0]);
+    const den = parseFloat(parts[1]);
+    if (!isFinite(num) || !isFinite(den) || den === 0) return 0;
+    return parseFloat((1 + num / den).toFixed(4));
+  }
+  // Decimal format
+  const d = parseFloat(s);
+  return isFinite(d) && d > 0 ? d : 0;
+}
+
+// Get best available price from a Sofascore choice object
+function getChoicePrice(choice) {
+  return parseOdds(choice.fractionalValue) ||
+         parseOdds(choice.initialFractionalValue) ||
+         parseOdds(choice.odds);
+}
+
 // Fetch odds for a specific event
 async function fetchEventOdds(eventId) {
-  await new Promise(r => setTimeout(r, 250));
-  const data = await sofascoreFetch(`/matches/get-all-odds`, { id: eventId });
-  return data?.odds || null;
+  await new Promise(r => setTimeout(r, 500)); // 500ms gap — stay under 5 req/sec
+  const data = await sofascoreFetch(`/matches/get-all-odds`, { matchId: eventId });
+  return data?.markets || null;
 }
 
 // Fetch team stats for a tournament season
@@ -182,67 +245,78 @@ async function fetchTeamRecentMatches(teamId) {
 }
 
 // ─── PARSE SOFASCORE ODDS INTO ENGINE FORMAT ──────────────────
-// Converts Sofascore odds structure to the bookmakers[] format
-// the existing engine models expect
-function parseSofascoreOdds(oddsData, homeTeam, awayTeam) {
-  if (!oddsData) return [];
+// Football: "Full time" 1X2 market, choices "1"/"X"/"2"
+// NBA/NHL:  "Full time"/"Home/Away" 2-way market, choices "1"/"2"
+// targetTotalsLine: exact line to use — '2.5' for football, '5.5' for NHL, null for NBA
+function parseSofascoreOdds(markets, homeTeam, awayTeam, targetTotalsLine = null) {
+  if (!markets || !Array.isArray(markets)) return [];
 
-  // Sofascore returns odds grouped by market
-  // We reconstruct a bookmakers array compatible with extractMarketData()
-  const bookmakers = [];
-  const h2hOutcomes = [];
+  const h2hOutcomes    = [];
   const totalsOutcomes = [];
 
-  // Find 1X2 market (full time result)
-  const ftMarket = oddsData.find?.(o =>
-    o.marketName?.toLowerCase().includes('1x2') ||
-    o.marketName?.toLowerCase().includes('full time') ||
-    o.marketName?.toLowerCase().includes('match result')
+  // ── Football 1X2 (3-way) ──────────────────────────────────
+  const ftMarket = markets.find(m =>
+    m.marketName === 'Full time' && m.marketGroup === '1X2' && m.marketPeriod === 'Full-time'
   );
 
   if (ftMarket?.choices) {
     for (const choice of ftMarket.choices) {
-      const name = choice.name?.toLowerCase();
-      if (name === '1' || name === 'home') {
-        h2hOutcomes.push({ name: homeTeam, price: parseFloat(choice.fractionalValue || choice.odds || 0) });
-      } else if (name === 'x' || name === 'draw') {
-        h2hOutcomes.push({ name: 'Draw', price: parseFloat(choice.fractionalValue || choice.odds || 0) });
-      } else if (name === '2' || name === 'away') {
-        h2hOutcomes.push({ name: awayTeam, price: parseFloat(choice.fractionalValue || choice.odds || 0) });
+      const price = getChoicePrice(choice);
+      if (!price) continue;
+      if (choice.name === '1')      h2hOutcomes.push({ name: homeTeam, price });
+      else if (choice.name === 'X') h2hOutcomes.push({ name: 'Draw',   price });
+      else if (choice.name === '2') h2hOutcomes.push({ name: awayTeam, price });
+    }
+  }
+
+  // ── NBA/NHL 2-way moneyline ───────────────────────────────
+  if (h2hOutcomes.length < 2) {
+    const moneylineMarket = markets.find(m =>
+      m.marketGroup === 'Home/Away' ||
+      m.marketName === 'Money line' ||
+      m.marketName === 'Home/Away' ||
+      m.marketName === 'Winner' ||
+      (m.marketId === 1 && m.choices?.length === 2)
+    );
+
+    if (moneylineMarket?.choices) {
+      for (const choice of moneylineMarket.choices) {
+        const price = getChoicePrice(choice);
+        if (!price) continue;
+        if      (choice.name === '1')           h2hOutcomes.push({ name: homeTeam, price });
+        else if (choice.name === '2')           h2hOutcomes.push({ name: awayTeam, price });
+        else if (h2hOutcomes.length === 0)      h2hOutcomes.push({ name: homeTeam, price });
+        else if (h2hOutcomes.length === 1)      h2hOutcomes.push({ name: awayTeam, price });
       }
     }
   }
 
-  // Find totals market (over/under 2.5 for football, 5.5 for hockey)
-  const totalsMarket = oddsData.find?.(o =>
-    o.marketName?.toLowerCase().includes('over/under') ||
-    o.marketName?.toLowerCase().includes('total goals') ||
-    o.marketName?.toLowerCase().includes('total points')
-  );
-
-  if (totalsMarket?.choices) {
-    for (const choice of totalsMarket.choices) {
-      const name = choice.name?.toLowerCase();
-      const point = parseFloat(totalsMarket.handicap || choice.handicap || 2.5);
-      if (name?.includes('over')) {
-        totalsOutcomes.push({ name: 'Over', price: parseFloat(choice.fractionalValue || choice.odds || 0), point });
-      } else if (name?.includes('under')) {
-        totalsOutcomes.push({ name: 'Under', price: parseFloat(choice.fractionalValue || choice.odds || 0), point });
+  // ── Totals — only fetch the exact target line, no fallback ──
+  if (targetTotalsLine) {
+    const totalsMarket = markets.find(m =>
+      (m.marketName === 'Match goals' || m.marketName === 'Total' || m.marketName === 'Over/Under') &&
+      m.choiceGroup === targetTotalsLine
+    );
+    if (totalsMarket?.choices) {
+      for (const choice of totalsMarket.choices) {
+        const price = getChoicePrice(choice);
+        if (!price) continue;
+        if (choice.name === 'Over')  totalsOutcomes.push({ name: 'Over',  price, point: parseFloat(targetTotalsLine) });
+        if (choice.name === 'Under') totalsOutcomes.push({ name: 'Under', price, point: parseFloat(targetTotalsLine) });
       }
     }
+    // NBA: targetTotalsLine is null — no totals fetched at all
   }
 
-  if (h2hOutcomes.length >= 2) {
-    bookmakers.push({
-      title: 'Sofascore',
-      markets: [
-        { key: 'h2h', outcomes: h2hOutcomes },
-        ...(totalsOutcomes.length ? [{ key: 'totals', outcomes: totalsOutcomes }] : []),
-      ],
-    });
-  }
+  if (h2hOutcomes.length < 2) return [];
 
-  return bookmakers;
+  return [{
+    title: 'Sofascore',
+    markets: [
+      { key: 'h2h', outcomes: h2hOutcomes },
+      ...(totalsOutcomes.length >= 2 ? [{ key: 'totals', outcomes: totalsOutcomes }] : []),
+    ],
+  }];
 }
 
 // ─── BUILD TEAM STATS FROM STANDINGS ─────────────────────────
@@ -348,31 +422,33 @@ async function morningFetch() {
 
       console.log(`  → ${upcoming.length} fixtures in next 48h`);
 
-      // Fetch odds for each fixture + build event objects
+      // Fetch odds in batches of 3 — respects 5 req/sec rate limit
       const enriched = [];
-      for (const event of upcoming) {
-        const homeTeam = event.homeTeam?.name || event.homeTeam?.shortName || '';
-        const awayTeam = event.awayTeam?.name || event.awayTeam?.shortName || '';
-        if (!homeTeam || !awayTeam) continue;
-
-        const oddsRaw    = await fetchEventOdds(event.id);
-        const bookmakers = parseSofascoreOdds(
-          Array.isArray(oddsRaw) ? oddsRaw : oddsRaw?.markets || oddsRaw?.odds,
-          homeTeam,
-          awayTeam
-        );
-
-        enriched.push({
-          id:            event.id,
-          home_team:     homeTeam,
-          away_team:     awayTeam,
-          home_team_id:  event.homeTeam?.id,
-          away_team_id:  event.awayTeam?.id,
-          commence_time: new Date((event.startTimestamp || 0) * 1000).toISOString(),
-          tournamentId:  sport.tournamentId,
-          bookmakers,
-        });
+      const BATCH = 3;
+      for (let i = 0; i < upcoming.length; i += BATCH) {
+        const batch = upcoming.slice(i, i + BATCH);
+        const results = await Promise.all(batch.map(async event => {
+          const homeTeam = event.homeTeam?.name || event.homeTeam?.shortName || '';
+          const awayTeam = event.awayTeam?.name || event.awayTeam?.shortName || '';
+          if (!homeTeam || !awayTeam) return null;
+          const oddsRaw    = await fetchEventOdds(event.id);
+          const targetLine = sport.name === 'Football' ? '2.5' : sport.name === 'Ice Hockey' ? '5.5' : null;
+          const bookmakers = parseSofascoreOdds(oddsRaw, homeTeam, awayTeam, targetLine);
+          return {
+            id:            event.id,
+            home_team:     homeTeam,
+            away_team:     awayTeam,
+            home_team_id:  event.homeTeam?.id,
+            away_team_id:  event.awayTeam?.id,
+            commence_time: new Date((event.startTimestamp || 0) * 1000).toISOString(),
+            tournamentId:  sport.tournamentId,
+            bookmakers,
+          };
+        }));
+        for (const r of results) { if (r) enriched.push(r); }
+        if (i + BATCH < upcoming.length) await new Promise(r => setTimeout(r, 700));
       }
+      console.log(`  ✅ ${sport.league}: ${enriched.filter(e => e.bookmakers.length).length}/${enriched.length} with odds`);
 
       sofascoreCache.events[sport.key] = enriched;
 
@@ -380,7 +456,7 @@ async function morningFetch() {
       console.error(`Morning fetch error (${sport.league}):`, e.message);
     }
 
-    await new Promise(r => setTimeout(r, 500));
+    await new Promise(r => setTimeout(r, 200));
   }
 
   // Fetch team stats for football leagues
@@ -421,6 +497,9 @@ async function fetchFootballStats() {
     }
     await new Promise(r => setTimeout(r, 400));
   }
+
+  // Fetch NHL goalie starters for today's games
+  await fetchNHLGoalieData();
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -439,11 +518,8 @@ async function middayOddsRefresh() {
     for (const event of events) {
       try {
         const oddsRaw    = await fetchEventOdds(event.id);
-        const bookmakers = parseSofascoreOdds(
-          Array.isArray(oddsRaw) ? oddsRaw : oddsRaw?.markets || oddsRaw?.odds,
-          event.home_team,
-          event.away_team
-        );
+        const targetLine = sport.name === 'Football' ? '2.5' : sport.name === 'Ice Hockey' ? '5.5' : null;
+        const bookmakers = parseSofascoreOdds(oddsRaw, event.home_team, event.away_team, targetLine);
         if (bookmakers.length) {
           event.bookmakers = bookmakers;
           updated++;
@@ -467,6 +543,158 @@ async function middayOddsRefresh() {
 const nhlTeamCache = {};
 let nhlAllTeamsCache = null;
 let nhlAllTeamsCacheDate = '';
+
+// Goalie data cache — populated once per morning fetch
+// Structure: { 'Team Name': { starter: 'First Last', savePercent: 0.915, gaa: 2.45, gamesPlayed: 38, isConfirmed: true } }
+const nhlGoalieCache = {};
+let nhlGoalieCacheDate = '';
+
+// ─── FETCH TODAY'S NHL GOALIE STARTERS ───────────────────────
+// Uses api-web.nhle.com/v1/schedule/now to get today's games
+// then fetches each game's boxscore for probable/confirmed starters.
+// Falls back gracefully — if no goalie data, model runs without adjustment.
+async function fetchNHLGoalieData() {
+  const today = new Date().toISOString().split('T')[0];
+  if (nhlGoalieCacheDate === today && Object.keys(nhlGoalieCache).length > 0) return;
+
+  try {
+    // Step 1: Get today's schedule
+    const schedRes = await fetch('https://api-web.nhle.com/v1/schedule/now', {
+      headers: { 'User-Agent': 'TipsterEdge/1.0' }
+    });
+    if (!schedRes.ok) { console.log('  🏒 NHL goalie fetch: schedule unavailable'); return; }
+    const schedData = await schedRes.json();
+
+    const todayGames = (schedData.gameWeek || [])
+      .find(d => d.date === today)?.games || [];
+
+    if (!todayGames.length) {
+      console.log('  🏒 NHL goalie fetch: no games today');
+      return;
+    }
+
+    let found = 0;
+    for (const game of todayGames) {
+      try {
+        await new Promise(r => setTimeout(r, 200));
+        const boxRes = await fetch(`https://api-web.nhle.com/v1/gamecenter/${game.id}/boxscore`, {
+          headers: { 'User-Agent': 'TipsterEdge/1.0' }
+        });
+        if (!boxRes.ok) {
+          console.log(`  🥅 Boxscore unavailable for game ${game.id}`);
+          continue;
+        }
+        const box = await boxRes.json();
+        const gameState = box.gameState || box.gameType || 'unknown';
+        console.log(`  🥅 Game ${game.id} state: ${gameState}`);
+
+        // Extract goalie info for home and away
+        for (const side of ['homeTeam', 'awayTeam']) {
+          const team     = box[side];
+          const teamName = team?.name?.default || team?.commonName?.default || '';
+          if (!teamName) continue;
+
+          // Probable starter from pregame roster
+          // Try boxscore goalies first, fall back to landing endpoint pre-game
+          let goalies = box.playerByGameStats?.[side]?.goalies || [];
+          if (!goalies.length) {
+            try {
+              await new Promise(r => setTimeout(r, 150));
+              const pgRes = await fetch(`https://api-web.nhle.com/v1/gamecenter/${game.id}/landing`, {
+                headers: { 'User-Agent': 'TipsterEdge/1.0' }
+              });
+              if (pgRes.ok) {
+                const pgData = await pgRes.json();
+                const sideKey = side === 'homeTeam' ? 'homeTeam' : 'awayTeam';
+                goalies = pgData.matchup?.[sideKey]?.goalies || [];
+                if (goalies.length) console.log(`  🥅 Landing fallback for ${teamName}: ${goalies.length} goalie(s)`);
+              }
+            } catch(e) { /* silent */ }
+          }
+          const players  = box.rosterSpots || [];
+
+          // Try pregame probable goalie first
+          const probable = team?.skaters
+            ? null
+            : team?.goalies?.[0];
+
+          // Fall back to boxscore goalies list
+          const starter = goalies[0];
+          if (!starter) continue;
+
+          // Fetch goalie season stats
+          const playerId = starter.playerId;
+          if (!playerId) continue;
+
+          await new Promise(r => setTimeout(r, 150));
+          const pRes = await fetch(`https://api-web.nhle.com/v1/player/${playerId}/landing`, {
+            headers: { 'User-Agent': 'TipsterEdge/1.0' }
+          });
+          if (!pRes.ok) continue;
+          const pData = await pRes.json();
+
+          // Get current season regular season goalie stats
+          const seasonStats = pData.seasonTotals?.find(s =>
+            s.season === parseInt(`${currentSeason()}${currentSeason()+1}`) &&
+            s.gameTypeId === 2
+          );
+
+          const savePct  = seasonStats?.savePctg    || pData.featuredStats?.regularSeason?.subSeason?.savePctg    || 0;
+          const gaa      = seasonStats?.goalsAgainstAverage || pData.featuredStats?.regularSeason?.subSeason?.goalsAgainstAvg || 0;
+          const gamesP   = seasonStats?.gamesPlayed || 0;
+          const fullName = `${pData.firstName?.default || ''} ${pData.lastName?.default || ''}`.trim();
+
+          nhlGoalieCache[teamName] = {
+            starter:     fullName,
+            savePercent: parseFloat(savePct)  || 0,
+            gaa:         parseFloat(gaa)      || 0,
+            gamesPlayed: parseInt(gamesP)     || 0,
+            isConfirmed: true,
+          };
+          console.log(`  🥅 ${teamName}: ${fullName} (SV%: ${parseFloat(savePct).toFixed(3)}, GAA: ${parseFloat(gaa).toFixed(2)}, GP: ${gamesP})`);
+          found++;
+        }
+      } catch(e) {
+        // Silent — individual game failures don't break the batch
+      }
+    }
+
+    nhlGoalieCacheDate = today;
+    console.log(`  🥅 NHL goalies loaded: ${found} confirmed starters for ${todayGames.length} games`);
+  } catch(e) {
+    console.log(`  🥅 NHL goalie fetch failed: ${e.message} — model running without goalie data`);
+  }
+}
+
+// ─── GOALIE QUALITY SCORE ────────────────────────────────────
+// Returns a multiplier applied to expected goals against.
+// Elite goalie (SV% ≥ .920) → reduces goals against
+// Weak goalie  (SV% ≤ .895) → increases goals against
+// No data → neutral (1.0)
+function goalieQualityMultiplier(goalieName, teamName) {
+  // Try exact team name, then fuzzy
+  const data = nhlGoalieCache[teamName] ||
+    Object.entries(nhlGoalieCache).find(([k]) => nameMatch(k, teamName))?.[1];
+
+  if (!data || !data.savePercent) return { multiplier: 1.0, label: null };
+
+  const sv = data.savePercent;
+  let multiplier;
+  if      (sv >= 0.930) multiplier = 0.82;  // elite — saves 93%+
+  else if (sv >= 0.920) multiplier = 0.90;  // very good
+  else if (sv >= 0.910) multiplier = 0.96;  // average
+  else if (sv >= 0.900) multiplier = 1.03;  // below average
+  else if (sv >= 0.890) multiplier = 1.10;  // weak
+  else                  multiplier = 1.18;  // very weak
+
+  return {
+    multiplier,
+    label: `${data.starter} (SV%: ${sv.toFixed(3)}, GAA: ${data.gaa.toFixed(2)})`,
+    savePercent: sv,
+    gaa: data.gaa,
+    isConfirmed: data.isConfirmed,
+  };
+}
 
 function currentSeason() {
   const now = new Date();
@@ -690,86 +918,143 @@ function winProbFromMargin(expectedMargin, stdDev = NBA_SCORE_STD_DEV) {
 }
 
 // ─── MARKET DATA EXTRACTION ───────────────────────────────────
+// Splits football (3-way) from NBA/NHL (2-way) cleanly.
+// Returns null if no valid market found.
 function extractMarketData(event) {
-  const books1x2 = [];
-  const bestRaw  = { home: 0, draw: 0, away: 0, over25: 0,
-                     homeBook: '', drawBook: '', awayBook: '', over25Book: '' };
+  const books1x2  = [];
+  const books2way = [];
+  let bestOver25 = 0, bestOver25Book = '';
 
   for (const book of (event.bookmakers || [])) {
     const h2h = book.markets?.find(m => m.key === 'h2h');
     if (h2h) {
-      let bHome = 0, bDraw = 0, bAway = 0;
-      for (const o of h2h.outcomes) {
-        if (nameMatch(o.name, event.home_team))       bHome = o.price;
-        else if (nameMatch(o.name, event.away_team))  bAway = o.price;
-        else if (o.name === 'Draw')                   bDraw = o.price;
-      }
+      const outcomes = h2h.outcomes || [];
+      const drawOut  = outcomes.find(o => o.name === 'Draw');
+      const bDraw    = drawOut?.price || 0;
+
+      // Map by name — never by position to avoid feed-order flipping
+      const homeOut = outcomes.find(o =>
+        o.name !== 'Draw' && nameMatch(o.name, event.home_team)
+      );
+      const awayOut = outcomes.find(o =>
+        o.name !== 'Draw' && nameMatch(o.name, event.away_team)
+      );
+
+      // Fallback: if name matching fails, use position (first non-draw = home, second = away)
+      const nonDraw = outcomes.filter(o => o.name !== 'Draw');
+      const bHome = homeOut?.price || nonDraw[0]?.price || 0;
+      const bAway = awayOut?.price || nonDraw[1]?.price || 0;
+
       if (bHome > 0 && bDraw > 0 && bAway > 0) {
         books1x2.push({ title: book.title, home: bHome, draw: bDraw, away: bAway });
+      } else if (bHome > 0 && bAway > 0) {
+        books2way.push({ title: book.title, home: bHome, away: bAway });
       }
-      if (bHome > bestRaw.home) { bestRaw.home = bHome; bestRaw.homeBook = book.title; }
-      if (bDraw > bestRaw.draw) { bestRaw.draw = bDraw; bestRaw.drawBook = book.title; }
-      if (bAway > bestRaw.away) { bestRaw.away = bAway; bestRaw.awayBook = book.title; }
     }
     const totals = book.markets?.find(m => m.key === 'totals');
     if (totals) {
       for (const o of totals.outcomes) {
-        if (o.name === 'Over' && o.price > bestRaw.over25) {
-          bestRaw.over25 = o.price; bestRaw.over25Book = book.title;
+        if (o.name === 'Over' && (o.price || 0) > bestOver25) {
+          bestOver25 = o.price; bestOver25Book = book.title;
         }
       }
     }
   }
 
-  if (!books1x2.length) return null;
-
-  let bestTrueHome = 0, bestTrueDraw = 0, bestTrueAway = 0;
-  let bestTrueHomeBook = '', bestTrueDrawBook = '', bestTrueAwayBook = '';
-
-  for (const b of books1x2) {
-    const totalIP  = (1/b.home) + (1/b.draw) + (1/b.away);
-    const trueHome = (1/b.home) / totalIP;
-    const trueDraw = (1/b.draw) / totalIP;
-    const trueAway = (1/b.away) / totalIP;
-    if (trueHome > bestTrueHome) { bestTrueHome = trueHome; bestTrueHomeBook = b.title; }
-    if (trueDraw > bestTrueDraw) { bestTrueDraw = trueDraw; bestTrueDrawBook = b.title; }
-    if (trueAway > bestTrueAway) { bestTrueAway = trueAway; bestTrueAwayBook = b.title; }
+  // 3-way (football)
+  if (books1x2.length > 0) {
+    const b       = books1x2[0];
+    const totalIP = (1/b.home) + (1/b.draw) + (1/b.away);
+    return {
+      trueHome:   (1/b.home) / totalIP,
+      trueDraw:   (1/b.draw) / totalIP,
+      trueAway:   (1/b.away) / totalIP,
+      homeOdds:   b.home, drawOdds: b.draw, awayOdds: b.away,
+      over25Odds: bestOver25,
+      homeBook:   b.title, drawBook: b.title, awayBook: b.title, over25Book: bestOver25Book,
+      bookCount:  books1x2.length,
+      avgMargin:  parseFloat(((totalIP - 1) * 100).toFixed(2)),
+      isTwoWay:   false,
+    };
   }
 
-  const avgMargin = books1x2.reduce((s, b) =>
-    s + ((1/b.home) + (1/b.draw) + (1/b.away) - 1), 0) / books1x2.length;
+  // 2-way (NBA/NHL)
+  if (books2way.length > 0) {
+    const b       = books2way[0];
+    const totalIP = (1/b.home) + (1/b.away);
+    return {
+      trueHome:   (1/b.home) / totalIP,
+      trueDraw:   0,
+      trueAway:   (1/b.away) / totalIP,
+      homeOdds:   b.home, drawOdds: 0, awayOdds: b.away,
+      over25Odds: bestOver25,
+      homeBook:   b.title, drawBook: '', awayBook: b.title, over25Book: bestOver25Book,
+      bookCount:  books2way.length,
+      avgMargin:  parseFloat(((totalIP - 1) * 100).toFixed(2)),
+      isTwoWay:   true,
+    };
+  }
 
-  return {
-    trueHome: bestTrueHome, trueDraw: bestTrueDraw, trueAway: bestTrueAway,
-    homeOdds: bestRaw.home, drawOdds: bestRaw.draw, awayOdds: bestRaw.away,
-    over25Odds: bestRaw.over25,
-    homeBook: bestRaw.homeBook, drawBook: bestRaw.drawBook,
-    awayBook: bestRaw.awayBook, over25Book: bestRaw.over25Book,
-    bookCount: books1x2.length,
-    avgMargin: parseFloat((avgMargin * 100).toFixed(2)),
-  };
+  return null;
+}
+
+// ─── FALSE-EDGE PROTECTION ────────────────────────────────────
+// Rejects suspicious edge values that likely stem from model error
+// rather than genuine market inefficiency.
+// Returns null if the candidate should be rejected, otherwise candidate unchanged.
+function falseEdgeCheck(candidate, market) {
+  const { edge, modelProb, trueImplied } = candidate;
+
+  // Reject if edge > 20% without strong multi-book confirmation
+  if (edge > 20 && market.bookCount < 3) return null;
+
+  // Reject if model probability diverges from market by > 20 percentage points
+  const divergence = Math.abs(modelProb - trueImplied);
+  if (divergence > 0.20) return null;
+
+  return candidate;
 }
 
 // ─── CANDIDATE SCORING ────────────────────────────────────────
 
-function confidenceFromSignals({ edgePct, modelProb, dataQualityTier, sport }) {
-  let conf;
-  if      (edgePct >= 18) conf = 88;
-  else if (edgePct >= 14) conf = 84;
-  else if (edgePct >= 10) conf = 80;
-  else if (edgePct >= 8)  conf = 77;
-  else                    conf = 74;
+const NBA_CONFIDENCE_CEILING = 80; // cap until injury/rest data available
+const NHL_CONFIDENCE_CEILING = 80; // cap until goalie/rest data available
 
-  const probStrength = Math.min(1, Math.abs(modelProb - 0.5) / 0.5);
-  if (probStrength >= 0.30) conf += 2;
-  else if (probStrength >= 0.20) conf += 1;
-  else if (probStrength < 0.10)  conf -= 1;
+// ─── CONFIDENCE = MODEL WIN PROBABILITY ──────────────────────
+// Confidence is literally how likely we think this outcome is to happen.
+// modelProb is already the margin-stripped win probability from the model.
+// We display it directly — no bands, no transformations.
+//
+// Adjustments applied:
+//   - Data penalty: fewer games = less reliable probability → reduce slightly
+//   - Sport caps: NBA/NHL capped at 80% until we have lineup/injury data
+//     (a model saying 85% without goalie data is overconfident)
+//
+// Output: integer percentage, e.g. 67 means "67% chance this wins"
+function confidenceFromSignals({ modelProb, dataQualityTier, sport, gamesPlayed }) {
+  // Start with the raw model probability as a percentage
+  let conf = Math.round(modelProb * 100);
 
-  if (dataQualityTier === 0.7) conf -= 3;
+  // Data penalty — fewer games means less reliable estimates
+  const games = gamesPlayed || 0;
+  if      (games < 4)  conf -= 8;
+  else if (games < 8)  conf -= 4;
+  else if (games < 15) conf -= 2;
+  // 15+ games: no penalty
 
-  conf = Math.max(70, Math.min(92, Math.round(conf)));
+  // Data quality tier penalty (incomplete stats)
+  if (!dataQualityTier || dataQualityTier < 1.0) conf -= 3;
 
-  if (sport === 'Ice Hockey') conf = Math.min(conf, NHL_CONFIDENCE_CEILING);
+  // Sport caps — NHL cap lifted to 88 when confirmed goalie data is present
+  // Without goalie data (dataQualityTier < 1.0), cap stays at 80
+  if (sport === 'Ice Hockey') {
+    const cap = (dataQualityTier >= 1.0) ? 88 : 80;
+    conf = Math.min(conf, cap);
+  }
+  if (sport === 'Basketball') conf = Math.min(conf, 80);
+
+  // Hard floor — don't publish tips below 50% win probability
+  conf = Math.max(50, Math.min(95, conf));
 
   return conf;
 }
@@ -777,16 +1062,24 @@ function confidenceFromSignals({ edgePct, modelProb, dataQualityTier, sport }) {
 function scoreCandidate({ edgePct, modelProb, dataQualityTier }) {
   const edgeScore    = Math.min(1, Math.max(0, edgePct) / 20);
   const probStrength = Math.min(1, Math.abs(modelProb - 0.5) / 0.5);
-  return edgeScore * 0.60 + probStrength * 0.25 + dataQualityTier * 0.15;
+  // 60% edge, 25% probability strength, 15% data quality
+  return edgeScore * 0.60 + probStrength * 0.25 + (dataQualityTier || 1.0) * 0.15;
 }
 
 function pickBestCandidate(candidates) {
   if (!candidates.length) return null;
-  const scored = candidates.map(c => ({
-    ...c,
-    qualityScore: scoreCandidate({ edgePct: c.edge, modelProb: c.modelProb, dataQualityTier: c.dataQualityTier || 1.0 }),
-  }));
-  const best = scored.reduce((a, b) => a.qualityScore >= b.qualityScore ? a : b);
+  const scored = candidates.map(c => {
+    const qualityScore = scoreCandidate({
+      edgePct:         c.edge,
+      modelProb:       c.modelProb,
+      dataQualityTier: c.dataQualityTier || 1.0,
+    });
+    // Composite rank: 70% quality score + 30% normalised edge (capped at 25%)
+    const normEdge   = Math.min(1, Math.max(0, c.edge) / 25);
+    const composite  = qualityScore * 0.70 + normEdge * 0.30;
+    return { ...c, qualityScore, composite };
+  });
+  const best = scored.reduce((a, b) => a.composite >= b.composite ? a : b);
   if (best.qualityScore < MIN_QUALITY_SCORE) return null;
   return best;
 }
@@ -805,11 +1098,7 @@ function vetoCandidate({ sport, hasCoreData, hasCompleteMarket, homeWinProb, dra
   if (!hasCoreData)       return true;
   if (!hasCompleteMarket) return true;
   if (topOutcomeProb < minTopOutcomeProb) return true;
-  if (probGap < 0.10)    return true;
-  const topModelProb = sport === 'Football'
-    ? Math.max(homeWinProb, drawProb, awayWinProb)
-    : Math.max(homeWinProb, awayWinProb);
-  if (topModelProb > 0.82) return true;
+  if (probGap < 0.05)    return true;  // reduced from 0.10 — don't block close games
   return false;
 }
 
@@ -856,52 +1145,44 @@ async function analyseFootballFixture(event, sport) {
     const over25IP = market.over25Odds > 0 ? 1 / market.over25Odds : 0;
 
     const candidates = [];
-    const h2hEdgeMin = MIN_EDGE_PCT + FOOTBALL_EDGE_PREMIUM;
-    const eliteH2H   = ELITE_H2H_EDGE + FOOTBALL_EDGE_PREMIUM;
 
     // Home win
-    if (market.homeOdds >= ODDS_MIN && market.homeOdds <= ODDS_ELITE_MAX && market.trueHome > 0) {
+    if (market.homeOdds >= INSIGHT_ODDS_MIN && market.homeOdds <= ODDS_ELITE_MAX && market.trueHome > 0) {
       const edge = calcEdge(homeWin, market.trueHome);
-      if (edge >= h2hEdgeMin) {
-        const kelly = kellyStake(homeWin, market.homeOdds);
-        const conf  = confidenceFromSignals({ edgePct: edge, modelProb: homeWin, dataQualityTier: 1.0, sport: 'Football' });
-        if (kelly > 0 && conf >= MIN_CONFIDENCE) candidates.push({
-          market: 'home', edge, modelProb: homeWin, dataQualityTier: 1.0,
-          fairPrice: fairOdds(homeWin), bookOdds: market.homeOdds,
-          bookmaker: market.homeBook, stake: kelly, conf,
-          selection: `${event.home_team} Win`,
-        });
-      }
+      const kelly = kellyStake(homeWin, market.homeOdds);
+      const games = Math.min(hStats?.homeGames || 0, aStats?.awayGames || 0);
+      const conf  = confidenceFromSignals({ modelProb: homeWin, dataQualityTier: 1.0, sport: 'Football', gamesPlayed: games });
+      const qs    = scoreCandidate({ edgePct: edge, modelProb: homeWin, dataQualityTier: 1.0 });
+      const c = { market: 'home', edge, modelProb: homeWin, trueImplied: market.trueHome, dataQualityTier: 1.0,
+        fairPrice: fairOdds(homeWin), bookOdds: market.homeOdds, bookmaker: market.homeBook,
+        stake: kelly, conf, qualityScore: qs, selection: `${event.home_team} Win` };
+      if (conf >= MIN_CONFIDENCE && falseEdgeCheck(c, market)) candidates.push(c);
     }
 
     // Away win
-    if (market.awayOdds >= ODDS_MIN && market.awayOdds <= ODDS_ELITE_MAX && market.trueAway > 0) {
+    if (market.awayOdds >= INSIGHT_ODDS_MIN && market.awayOdds <= ODDS_ELITE_MAX && market.trueAway > 0) {
       const edge = calcEdge(awayWin, market.trueAway);
-      if (edge >= h2hEdgeMin) {
-        const kelly = kellyStake(awayWin, market.awayOdds);
-        const conf  = confidenceFromSignals({ edgePct: edge, modelProb: awayWin, dataQualityTier: 1.0, sport: 'Football' });
-        if (kelly > 0 && conf >= MIN_CONFIDENCE) candidates.push({
-          market: 'away', edge, modelProb: awayWin, dataQualityTier: 1.0,
-          fairPrice: fairOdds(awayWin), bookOdds: market.awayOdds,
-          bookmaker: market.awayBook, stake: kelly, conf,
-          selection: `${event.away_team} Win`,
-        });
-      }
+      const kelly = kellyStake(awayWin, market.awayOdds);
+      const games = Math.min(aStats?.awayGames || 0, hStats?.homeGames || 0);
+      const conf  = confidenceFromSignals({ modelProb: awayWin, dataQualityTier: 1.0, sport: 'Football', gamesPlayed: games });
+      const qs    = scoreCandidate({ edgePct: edge, modelProb: awayWin, dataQualityTier: 1.0 });
+      const c = { market: 'away', edge, modelProb: awayWin, trueImplied: market.trueAway, dataQualityTier: 1.0,
+        fairPrice: fairOdds(awayWin), bookOdds: market.awayOdds, bookmaker: market.awayBook,
+        stake: kelly, conf, qualityScore: qs, selection: `${event.away_team} Win` };
+      if (conf >= MIN_CONFIDENCE && falseEdgeCheck(c, market)) candidates.push(c);
     }
 
-    // Draw
-    if (market.drawOdds >= 2.50 && draw > 0.22 && market.trueDraw > 0) {
+    // Draw — only tip if model has meaningful draw probability
+    if (market.drawOdds >= INSIGHT_ODDS_MIN && draw > 0.20 && market.trueDraw > 0) {
       const edge = calcEdge(draw, market.trueDraw);
-      if (edge >= h2hEdgeMin + 5) {
-        const kelly = kellyStake(draw, market.drawOdds);
-        const conf  = confidenceFromSignals({ edgePct: edge, modelProb: draw, dataQualityTier: 1.0, sport: 'Football' });
-        if (kelly > 0 && conf >= MIN_CONFIDENCE) candidates.push({
-          market: 'draw', edge, modelProb: draw, dataQualityTier: 1.0,
-          fairPrice: fairOdds(draw), bookOdds: market.drawOdds,
-          bookmaker: market.drawBook, stake: kelly, conf,
-          selection: 'Draw',
-        });
-      }
+      const kelly = kellyStake(draw, market.drawOdds);
+      const games = Math.min(hStats?.homeGames || 0, aStats?.awayGames || 0);
+      const conf  = confidenceFromSignals({ modelProb: draw, dataQualityTier: 1.0, sport: 'Football', gamesPlayed: games });
+      const qs    = scoreCandidate({ edgePct: edge, modelProb: draw, dataQualityTier: 1.0 });
+      const c = { market: 'draw', edge, modelProb: draw, trueImplied: market.trueDraw, dataQualityTier: 1.0,
+        fairPrice: fairOdds(draw), bookOdds: market.drawOdds, bookmaker: market.drawBook,
+        stake: kelly, conf, qualityScore: qs, selection: 'Draw' };
+      if (conf >= MIN_CONFIDENCE && falseEdgeCheck(c, market)) candidates.push(c);
     }
 
     if (!candidates.length) return null;
@@ -916,21 +1197,28 @@ async function analyseFootballFixture(event, sport) {
     if (!pick) return null;
 
     return {
-      tip_ref:    generateTipRef('Football'),
-      sport:      'Football',
-      league:     sport.league,
-      home_team:  event.home_team,
-      away_team:  event.away_team,
-      event_time: event.commence_time,
-      selection:  pick.selection,
-      market:     'h2h',
-      odds:       parseFloat(pick.bookOdds.toFixed(2)),
-      stake:      pick.stake,
-      confidence: pick.conf,
-      tier:       'pro',
-      status:     'pending',
-      bookmaker:  pick.bookmaker || 'Sofascore',
-      notes:      `xG: ${lH.toFixed(2)} vs ${lA.toFixed(2)} | Model: ${(pick.modelProb*100).toFixed(1)}% | Fair: ${pick.fairPrice} | Book: ${pick.bookOdds} | Edge: +${pick.edge.toFixed(1)}%`,
+      tip_ref:       generateTipRef('Football'),
+      sport:         'Football',
+      league:        sport.league,
+      home_team:     event.home_team,
+      away_team:     event.away_team,
+      event_time:    event.commence_time,
+      event_id:      event.id,
+      selection:     pick.selection,
+      market:        'h2h',
+      odds:          parseFloat(pick.bookOdds.toFixed(2)),
+      stake:         pick.stake,
+      confidence:    pick.conf,
+      tier:          'pro',
+      status:        'pending',
+      bookmaker:     pick.bookmaker || 'Sofascore',
+      model_edge:    parseFloat(pick.edge.toFixed(2)),
+      model_prob:    parseFloat((pick.modelProb * 100).toFixed(1)),
+      implied_prob:  parseFloat((pick.trueImplied * 100).toFixed(1)),
+      fair_odds:     pick.fairPrice,
+      quality_score: parseFloat((pick.qualityScore || 0).toFixed(3)),
+      book_count:    market.bookCount,
+      notes:         `Model goals: ${lH.toFixed(2)}-${lA.toFixed(2)} | Model: ${(pick.modelProb*100).toFixed(1)}% | Fair: ${pick.fairPrice} | Book: ${pick.bookOdds} | Edge: ${pick.edge >= 0 ? '+' : ''}${pick.edge.toFixed(1)}%`,
     };
   } catch(e) {
     console.error(`Football model error [${event.home_team} vs ${event.away_team}]:`, e.message);
@@ -955,8 +1243,26 @@ async function analyseNHLFixture(event, sport) {
     const awayAttack = awayStats.goalsFor     / NHL_LEAGUE_AVG_GF;
     const awayDef    = awayStats.goalsAgainst / NHL_LEAGUE_AVG_GF;
 
-    let lH = Math.max(0.5, Math.min(6.0, homeAttack * awayDef * NHL_LEAGUE_AVG_GF + NHL_HOME_ADVANTAGE));
-    let lA = Math.max(0.5, Math.min(6.0, awayAttack * homeDef * NHL_LEAGUE_AVG_GF));
+    // Apply goalie quality — adjusts expected goals against based on starter SV%
+    const homeGoalie = goalieQualityMultiplier(null, event.home_team);
+    const awayGoalie = goalieQualityMultiplier(null, event.away_team);
+
+    // homeGoalie faces away shots → multiplier applies to lA (goals scored by away)
+    // awayGoalie faces home shots → multiplier applies to lH (goals scored by home)
+    let lH = Math.max(0.5, Math.min(6.0,
+      homeAttack * awayDef * NHL_LEAGUE_AVG_GF * awayGoalie.multiplier + NHL_HOME_ADVANTAGE
+    ));
+    let lA = Math.max(0.5, Math.min(6.0,
+      awayAttack * homeDef * NHL_LEAGUE_AVG_GF * homeGoalie.multiplier
+    ));
+
+    // Data quality tier — lower if goalie data absent (less confident model)
+    const hasGoalieData = homeGoalie.label && awayGoalie.label;
+    const dataQualityTier = hasGoalieData ? 1.0 : 0.85;
+
+    const goalieNote = hasGoalieData
+      ? `H: ${homeGoalie.label} | A: ${awayGoalie.label}`
+      : 'No goalie data';
 
     const N = NHL_MATRIX_MAX;
     const matrix = [];
@@ -994,47 +1300,44 @@ async function analyseNHLFixture(event, sport) {
 
     const candidates = [];
 
-    if (market.homeOdds >= 1.25 && market.homeOdds <= 4.5 && market.trueHome > 0) {
+    if (market.homeOdds >= INSIGHT_ODDS_MIN && market.homeOdds <= ODDS_ELITE_MAX && market.trueHome > 0) {
       const edge = calcEdge(homeWinML, market.trueHome);
-      if (edge >= MIN_EDGE_PCT) {
-        const conf  = confidenceFromSignals({ edgePct: edge, modelProb: homeWinML, dataQualityTier: 1.0, sport: 'Ice Hockey' });
-        const stake = kellyStake(homeWinML, market.homeOdds);
-        if (stake > 0 && conf >= MIN_CONFIDENCE) candidates.push({
-          selection: `${event.home_team} Win`, market: 'home', edge,
-          modelProb: homeWinML, dataQualityTier: 1.0,
-          bookOdds: market.homeOdds, bookmaker: market.homeBook, stake, conf,
-          notes: `xG: ${lH.toFixed(2)} vs ${lA.toFixed(2)} | Model: ${(homeWinML*100).toFixed(1)}% | Edge: +${edge.toFixed(1)}%`,
-        });
-      }
+      const conf  = confidenceFromSignals({ modelProb: homeWinML, dataQualityTier, sport: 'Ice Hockey', gamesPlayed: homeStats.gamesPlayed });
+      const stake = kellyStake(homeWinML, market.homeOdds);
+      const qs    = scoreCandidate({ edgePct: edge, modelProb: homeWinML, dataQualityTier });
+      const c = { selection: `${event.home_team} Win`, market: 'home', edge,
+        modelProb: homeWinML, trueImplied: market.trueHome, dataQualityTier,
+        fairPrice: fairOdds(homeWinML), bookOdds: market.homeOdds, bookmaker: market.homeBook,
+        stake, conf, qualityScore: qs,
+        notes: `GF/GA: ${lH.toFixed(2)}/${lA.toFixed(2)} | ${goalieNote} | Model: ${(homeWinML*100).toFixed(1)}% | Fair: ${fairOdds(homeWinML)} | Edge: ${edge >= 0 ? '+' : ''}${edge.toFixed(1)}%` };
+      if (conf >= NHL_MIN_CONFIDENCE && falseEdgeCheck(c, market)) candidates.push(c);
     }
 
-    if (market.awayOdds >= 1.25 && market.awayOdds <= 4.5 && market.trueAway > 0) {
+    if (market.awayOdds >= INSIGHT_ODDS_MIN && market.awayOdds <= ODDS_ELITE_MAX && market.trueAway > 0) {
       const edge = calcEdge(awayWinML, market.trueAway);
-      if (edge >= MIN_EDGE_PCT) {
-        const conf  = confidenceFromSignals({ edgePct: edge, modelProb: awayWinML, dataQualityTier: 1.0, sport: 'Ice Hockey' });
-        const stake = kellyStake(awayWinML, market.awayOdds);
-        if (stake > 0 && conf >= MIN_CONFIDENCE) candidates.push({
-          selection: `${event.away_team} Win`, market: 'away', edge,
-          modelProb: awayWinML, dataQualityTier: 1.0,
-          bookOdds: market.awayOdds, bookmaker: market.awayBook, stake, conf,
-          notes: `xG: ${lH.toFixed(2)} vs ${lA.toFixed(2)} | Model: ${(awayWinML*100).toFixed(1)}% | Edge: +${edge.toFixed(1)}%`,
-        });
-      }
+      const conf  = confidenceFromSignals({ modelProb: awayWinML, dataQualityTier, sport: 'Ice Hockey', gamesPlayed: awayStats.gamesPlayed });
+      const stake = kellyStake(awayWinML, market.awayOdds);
+      const qs    = scoreCandidate({ edgePct: edge, modelProb: awayWinML, dataQualityTier });
+      const c = { selection: `${event.away_team} Win`, market: 'away', edge,
+        modelProb: awayWinML, trueImplied: market.trueAway, dataQualityTier,
+        fairPrice: fairOdds(awayWinML), bookOdds: market.awayOdds, bookmaker: market.awayBook,
+        stake, conf, qualityScore: qs,
+        notes: `GF/GA: ${lH.toFixed(2)}/${lA.toFixed(2)} | ${goalieNote} | Model: ${(awayWinML*100).toFixed(1)}% | Fair: ${fairOdds(awayWinML)} | Edge: ${edge >= 0 ? '+' : ''}${edge.toFixed(1)}%` };
+      if (conf >= NHL_MIN_CONFIDENCE && falseEdgeCheck(c, market)) candidates.push(c);
     }
 
-    if (market.over25Odds >= 1.50 && market.over25Odds <= 2.40) {
+    if (market.over25Odds >= INSIGHT_ODDS_MIN && market.over25Odds <= ODDS_ELITE_MAX) {
       const over55IP = 1 / market.over25Odds;
       const edge = calcEdge(over55, over55IP);
-      if (edge >= OVERS_MIN_EDGE) {
-        const conf  = confidenceFromSignals({ edgePct: edge, modelProb: over55, dataQualityTier: 1.0, sport: 'Ice Hockey' });
-        const stake = kellyStake(over55, market.over25Odds);
-        if (stake > 0 && conf >= MIN_CONFIDENCE) candidates.push({
-          selection: 'Over 5.5', market: 'over55', edge,
-          modelProb: over55, dataQualityTier: 1.0,
-          bookOdds: market.over25Odds, bookmaker: market.over25Book, stake, conf,
-          notes: `xG: ${lH.toFixed(2)} vs ${lA.toFixed(2)} | Model: ${(over55*100).toFixed(1)}% over 5.5 | Edge: +${edge.toFixed(1)}%`,
-        });
-      }
+      const conf  = confidenceFromSignals({ modelProb: over55, dataQualityTier, sport: 'Ice Hockey', gamesPlayed: Math.min(homeStats.gamesPlayed, awayStats.gamesPlayed) });
+      const stake = kellyStake(over55, market.over25Odds);
+      const qs    = scoreCandidate({ edgePct: edge, modelProb: over55, dataQualityTier });
+      const c = { selection: 'Over 5.5', market: 'over55', edge,
+        modelProb: over55, trueImplied: over55IP, dataQualityTier,
+        fairPrice: fairOdds(over55), bookOdds: market.over25Odds, bookmaker: market.over25Book,
+        stake, conf, qualityScore: qs,
+        notes: `GF/GA: ${lH.toFixed(2)}/${lA.toFixed(2)} | ${goalieNote} | Model: ${(over55*100).toFixed(1)}% over 5.5 | Edge: ${edge >= 0 ? '+' : ''}${edge.toFixed(1)}%` };
+      if (conf >= NHL_MIN_CONFIDENCE && falseEdgeCheck(c, market)) candidates.push(c);
     }
 
     if (!candidates.length) return null;
@@ -1047,21 +1350,28 @@ async function analyseNHLFixture(event, sport) {
     if (!pick) return null;
 
     return {
-      tip_ref:    generateTipRef('Ice Hockey'),
-      sport:      'Ice Hockey',
-      league:     sport.league,
-      home_team:  event.home_team,
-      away_team:  event.away_team,
-      event_time: event.commence_time,
-      selection:  pick.selection,
-      market:     pick.market.includes('ver') ? 'totals' : 'h2h',
-      odds:       parseFloat(pick.bookOdds.toFixed(2)),
-      stake:      pick.stake,
-      confidence: pick.conf,
-      tier:       'pro',
-      status:     'pending',
-      bookmaker:  pick.bookmaker,
-      notes:      pick.notes,
+      tip_ref:       generateTipRef('Ice Hockey'),
+      sport:         'Ice Hockey',
+      league:        sport.league,
+      home_team:     event.home_team,
+      away_team:     event.away_team,
+      event_time:    event.commence_time,
+      event_id:      event.id,
+      selection:     pick.selection,
+      market:        pick.market.includes('ver') ? 'totals' : 'h2h',
+      odds:          parseFloat(pick.bookOdds.toFixed(2)),
+      stake:         pick.stake,
+      confidence:    pick.conf,
+      tier:          'pro',
+      status:        'pending',
+      bookmaker:     pick.bookmaker,
+      model_edge:    parseFloat(pick.edge.toFixed(2)),
+      model_prob:    parseFloat((pick.modelProb * 100).toFixed(1)),
+      implied_prob:  parseFloat((pick.trueImplied * 100).toFixed(1)),
+      fair_odds:     pick.fairPrice,
+      quality_score: parseFloat((pick.qualityScore || 0).toFixed(3)),
+      book_count:    market.bookCount,
+      notes:         pick.notes,
     };
   } catch(e) {
     console.error(`NHL model error [${event.home_team} vs ${event.away_team}]:`, e.message);
@@ -1097,53 +1407,62 @@ async function analyseNBAFixture(event, sport) {
 
     const candidates = [];
 
-    if (market.homeOdds >= 1.25 && market.homeOdds <= 5.0 && market.trueHome > 0) {
+    if (market.homeOdds >= INSIGHT_ODDS_MIN && market.homeOdds <= ODDS_ELITE_MAX && market.trueHome > 0) {
       const edge = calcEdge(homeWinP, market.trueHome);
-      if (edge >= MIN_EDGE_PCT) {
-        const conf  = Math.min(92, Math.max(75, Math.round(75 + (edge - 5) * 1.5)));
-        const stake = kellyStake(homeWinP, market.homeOdds);
-        if (stake > 0 && conf >= MIN_CONFIDENCE) candidates.push({
-          selection: `${event.home_team} Win`, market: 'home', edge,
-          modelProb: homeWinP, dataQualityTier: 1.0,
-          bookOdds: market.homeOdds, bookmaker: market.homeBook, stake, conf,
-          notes: `Expected: ${homeExpected.toFixed(1)}-${awayExpected.toFixed(1)} | Model: ${(homeWinP*100).toFixed(1)}% | Edge: +${edge.toFixed(1)}%`,
-        });
-      }
+      const conf  = confidenceFromSignals({ modelProb: homeWinP, dataQualityTier: 1.0, sport: 'Basketball', gamesPlayed: homeStats.gamesPlayed });
+      const stake = kellyStake(homeWinP, market.homeOdds);
+      const qs    = scoreCandidate({ edgePct: edge, modelProb: homeWinP, dataQualityTier: 1.0 });
+      const c = { selection: `${event.home_team} Win`, market: 'home', edge,
+        modelProb: homeWinP, trueImplied: market.trueHome, dataQualityTier: 1.0,
+        fairPrice: fairOdds(homeWinP), bookOdds: market.homeOdds, bookmaker: market.homeBook,
+        stake, conf, qualityScore: qs,
+        notes: `Expected: ${homeExpected.toFixed(1)}-${awayExpected.toFixed(1)} | Model: ${(homeWinP*100).toFixed(1)}% | Fair: ${fairOdds(homeWinP)} | Edge: ${edge >= 0 ? '+' : ''}${edge.toFixed(1)}%` };
+      if (conf >= NBA_MIN_CONFIDENCE && falseEdgeCheck(c, market)) candidates.push(c);
     }
 
-    if (market.awayOdds >= 1.25 && market.awayOdds <= 5.0 && market.trueAway > 0) {
+    if (market.awayOdds >= INSIGHT_ODDS_MIN && market.awayOdds <= ODDS_ELITE_MAX && market.trueAway > 0) {
       const edge = calcEdge(awayWinP, market.trueAway);
-      if (edge >= MIN_EDGE_PCT) {
-        const conf  = Math.min(92, Math.max(75, Math.round(75 + (edge - 5) * 1.5)));
-        const stake = kellyStake(awayWinP, market.awayOdds);
-        if (stake > 0 && conf >= MIN_CONFIDENCE) candidates.push({
-          selection: `${event.away_team} Win`, market: 'away', edge,
-          modelProb: awayWinP, dataQualityTier: 1.0,
-          bookOdds: market.awayOdds, bookmaker: market.awayBook, stake, conf,
-          notes: `Expected: ${homeExpected.toFixed(1)}-${awayExpected.toFixed(1)} | Model: ${(awayWinP*100).toFixed(1)}% | Edge: +${edge.toFixed(1)}%`,
-        });
-      }
+      const conf  = confidenceFromSignals({ modelProb: awayWinP, dataQualityTier: 1.0, sport: 'Basketball', gamesPlayed: awayStats.gamesPlayed });
+      const stake = kellyStake(awayWinP, market.awayOdds);
+      const qs    = scoreCandidate({ edgePct: edge, modelProb: awayWinP, dataQualityTier: 1.0 });
+      const c = { selection: `${event.away_team} Win`, market: 'away', edge,
+        modelProb: awayWinP, trueImplied: market.trueAway, dataQualityTier: 1.0,
+        fairPrice: fairOdds(awayWinP), bookOdds: market.awayOdds, bookmaker: market.awayBook,
+        stake, conf, qualityScore: qs,
+        notes: `Expected: ${homeExpected.toFixed(1)}-${awayExpected.toFixed(1)} | Model: ${(awayWinP*100).toFixed(1)}% | Fair: ${fairOdds(awayWinP)} | Edge: ${edge >= 0 ? '+' : ''}${edge.toFixed(1)}%` };
+      if (conf >= NBA_MIN_CONFIDENCE && falseEdgeCheck(c, market)) candidates.push(c);
     }
 
     if (!candidates.length) return null;
-    const pick = candidates.reduce((a, b) => a.edge >= b.edge ? a : b);
+    const pick = candidates.reduce((a, b) => {
+      const scoreA = a.edge * 0.7 + (a.qualityScore || 0) * 0.3;
+      const scoreB = b.edge * 0.7 + (b.qualityScore || 0) * 0.3;
+      return scoreA >= scoreB ? a : b;
+    });
 
     return {
-      tip_ref:    generateTipRef('Basketball'),
-      sport:      'Basketball',
-      league:     sport.league,
-      home_team:  event.home_team,
-      away_team:  event.away_team,
-      event_time: event.commence_time,
-      selection:  pick.selection,
-      market:     'h2h',
-      odds:       parseFloat(pick.bookOdds.toFixed(2)),
-      stake:      pick.stake,
-      confidence: pick.conf,
-      tier:       'pro',
-      status:     'pending',
-      bookmaker:  pick.bookmaker,
-      notes:      pick.notes,
+      tip_ref:       generateTipRef('Basketball'),
+      sport:         'Basketball',
+      league:        sport.league,
+      home_team:     event.home_team,
+      away_team:     event.away_team,
+      event_time:    event.commence_time,
+      event_id:      event.id,
+      selection:     pick.selection,
+      market:        'h2h',
+      odds:          parseFloat(pick.bookOdds.toFixed(2)),
+      stake:         pick.stake,
+      confidence:    pick.conf,
+      tier:          'pro',
+      status:        'pending',
+      bookmaker:     pick.bookmaker,
+      model_edge:    parseFloat(pick.edge.toFixed(2)),
+      model_prob:    parseFloat((pick.modelProb * 100).toFixed(1)),
+      implied_prob:  parseFloat((pick.trueImplied * 100).toFixed(1)),
+      fair_odds:     pick.fairPrice,
+      quality_score: parseFloat((pick.qualityScore || 0).toFixed(3)),
+      book_count:    market.bookCount,
+      notes:         pick.notes,
     };
   } catch(e) {
     console.error(`NBA model error [${event.home_team} vs ${event.away_team}]:`, e.message);
@@ -1159,10 +1478,10 @@ function applyStrictRules(tip, existingBestOdds = null) {
   const ALLOWED_SPORTS = ['Ice Hockey', 'Basketball', 'Football'];
   if (!ALLOWED_SPORTS.includes(tip.sport)) return null;
 
-  const isH2H    = tip.market === 'h2h';
-  const isTotals = tip.market === 'totals';
-  const isOver   = isTotals && (tip.selection||'').toLowerCase().startsWith('over');
-  const isUnder  = isTotals && (tip.selection||'').toLowerCase().startsWith('under');
+  const isH2H      = tip.market === 'h2h';
+  const isTotals   = tip.market === 'totals';
+  const isOver     = isTotals && (tip.selection||'').toLowerCase().startsWith('over');
+  const isUnder    = isTotals && (tip.selection||'').toLowerCase().startsWith('under');
   const isFootball = tip.sport === 'Football';
 
   if (!isH2H && !isTotals)    return null;
@@ -1170,39 +1489,54 @@ function applyStrictRules(tip, existingBestOdds = null) {
   if (isFootball && isTotals)  return null;
 
   const odds = parseFloat(tip.odds || 0);
-  if (odds < ODDS_MIN)         return null;
+  if (odds < INSIGHT_ODDS_MIN) return null; // below 1.05 — not worth showing
   if (odds > ODDS_ELITE_MAX)   return null;
 
-  const edge    = parseFloat(tip.confidence || 0) - (1 / odds) * 100;
-  const h2hMin  = isFootball ? MIN_EDGE_PCT + FOOTBALL_EDGE_PREMIUM : MIN_EDGE_PCT;
-  const eliteH2H = isFootball ? ELITE_H2H_EDGE + FOOTBALL_EDGE_PREMIUM : ELITE_H2H_EDGE;
-
-  if (isH2H && edge < h2hMin)      return null;
-  if (isOver && edge < OVERS_MIN_EDGE) return null;
-
+  // Line movement check
   if (existingBestOdds && existingBestOdds > 0) {
     const lineMove = existingBestOdds - odds;
     if (lineMove >= LINE_MOVE_REJECT) return null;
   }
 
+  // Edge — informational only, used for grade display
+  const edge = (tip.model_edge != null) ? parseFloat(tip.model_edge) : 0;
+
+  // Grade for display
   let grade;
   if (isH2H) {
-    grade = edge >= eliteH2H ? 'A+' : edge >= h2hMin ? 'A' : null;
+    grade = edge >= ELITE_H2H_EDGE ? 'A+' : edge >= 5 ? 'A' : edge >= 0 ? 'B' : 'C';
   } else {
-    grade = edge >= ELITE_OVERS_EDGE ? 'A+' : edge >= OVERS_MIN_EDGE ? 'A' : null;
+    grade = edge >= ELITE_OVERS_EDGE ? 'A+' : edge >= 8 ? 'A' : edge >= 0 ? 'B' : 'C';
+  }
+  const bookCount = tip.book_count || 1;
+  if (grade === 'A+' && bookCount < 2) grade = 'A';
+
+  // ── Short Price Watch — odds below BET_ODDS_MIN ──────────
+  // Published as informational only — no stake, marked as insight
+  if (odds < BET_ODDS_MIN) {
+    return {
+      ...tip,
+      stake:      0,
+      tier:       'insight',
+      is_short_price: true,
+      notes: (tip.notes || '') + ` | Short Price Watch | Grade: ${grade} | Edge: ${edge >= 0 ? '+' : ''}${edge.toFixed(1)}%`,
+    };
   }
 
-  if (!grade) return null;
-  if (odds > ODDS_CORE_MAX && grade !== 'A+') return null;
-
+  // ── Normal bet tip ────────────────────────────────────────
   const conf = parseFloat(tip.confidence || 0);
   let stake;
-  if (conf < 80)       { stake = 1.0; }
-  else if (conf < 85)  { stake = grade === 'A+' ? 2.0 : 1.5; }
-  else                 { stake = grade === 'A+' ? 2.5 : 1.5; }
-  if (odds > ODDS_CORE_MAX && stake > 1.0) stake -= 0.5;
+  if      (conf >= 78) stake = 2.0;
+  else if (conf >= 72) stake = 1.5;
+  else                 stake = 1.0;
 
-  return { ...tip, stake, notes: (tip.notes || '') + ` | Grade: ${grade} | Edge: +${edge.toFixed(1)}%` };
+  const edgeStr = edge >= 0 ? `+${edge.toFixed(1)}%` : `${edge.toFixed(1)}%`;
+  return {
+    ...tip,
+    stake,
+    is_short_price: false,
+    notes: (tip.notes || '') + ` | Grade: ${grade} | Edge: ${edgeStr}`,
+  };
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -1244,13 +1578,21 @@ async function saveTips(tips) {
   for (const tip of tips) {
     try {
       const date = new Date(tip.event_time).toISOString().split('T')[0];
-      const { data: existing } = await supabase.from('tips').select('id, tip_ref, confidence, odds, best_odds, bookmaker')
+      const { data: existing } = await supabase.from('tips').select('id, tip_ref, confidence, odds, best_odds, bookmaker, status')
         .eq('home_team', tip.home_team).eq('away_team', tip.away_team)
         .gte('event_time', `${date}T00:00:00Z`).lte('event_time', `${date}T23:59:59Z`)
         .in('status', ['pending', 'won', 'lost', 'void']).maybeSingle();
 
       if (existing) {
         if (existing.status !== 'pending') { skipped++; continue; }
+
+        // FIX 5: Re-apply strict rules with existing best_odds for line movement check
+        const reapproved = applyStrictRules(tip, existing.best_odds || existing.odds || null);
+        if (!reapproved) {
+          console.log(`📉 Line move reject: [${existing.tip_ref}] ${tip.home_team} vs ${tip.away_team}`);
+          skipped++; continue;
+        }
+
         const oddsDiff     = Math.abs(tip.odds - existing.odds);
         const confDiff     = Math.abs(tip.confidence - existing.confidence);
         const bookChanged  = tip.bookmaker !== existing.bookmaker;
@@ -1265,6 +1607,10 @@ async function saveTips(tips) {
             odds: tip.odds, best_odds: newBest, bookmaker: tip.bookmaker,
             confidence: tip.confidence, stake: tip.stake,
             selection: tip.selection, market: tip.market, notes: tip.notes,
+            model_edge: tip.model_edge, model_prob: tip.model_prob,
+            implied_prob: tip.implied_prob, fair_odds: tip.fair_odds,
+            quality_score: tip.quality_score, book_count: tip.book_count,
+            event_id: tip.event_id,
             ...(existing.tip_ref ? {} : { tip_ref: tip.tip_ref }),
           }).eq(updateKey, updateVal);
           updated++;
@@ -1339,25 +1685,28 @@ async function settleResults() {
         continue;
       }
 
-      // Find the Sofascore event ID from our cache
-      const sport = SPORTS.find(s => s.league === tip.league);
-      if (!sport) continue;
-
-      const cachedEvents = sofascoreCache.events[sport.key] || [];
-      const cachedEvent  = cachedEvents.find(e =>
-        nameMatch(e.home_team, tip.home_team) && nameMatch(e.away_team, tip.away_team)
-      );
-
       let homeScore = null, awayScore = null;
 
-      if (cachedEvent?.id) {
-        const result = await fetchSofascoreResult(cachedEvent.id);
+      // Use stored event_id for direct Sofascore lookup — no name matching needed
+      const eventId = tip.event_id;
+      if (eventId) {
+        const result = await fetchSofascoreResult(eventId);
         if (!result) { console.log(`⏳ No result yet: ${tip.home_team} vs ${tip.away_team}`); continue; }
         homeScore = result.homeScore;
         awayScore = result.awayScore;
       } else {
-        console.log(`⏳ No cached event for: ${tip.home_team} vs ${tip.away_team}`);
-        continue;
+        // Fallback: name match from cache for tips created before event_id was stored
+        const sport = SPORTS.find(s => s.league === tip.league);
+        if (!sport) continue;
+        const cachedEvents = sofascoreCache.events[sport.key] || [];
+        const cachedEvent  = cachedEvents.find(e =>
+          nameMatch(e.home_team, tip.home_team) && nameMatch(e.away_team, tip.away_team)
+        );
+        if (!cachedEvent?.id) { console.log(`⏳ No cached event for: ${tip.home_team} vs ${tip.away_team}`); continue; }
+        const result = await fetchSofascoreResult(cachedEvent.id);
+        if (!result) { console.log(`⏳ No result yet: ${tip.home_team} vs ${tip.away_team}`); continue; }
+        homeScore = result.homeScore;
+        awayScore = result.awayScore;
       }
 
       if (homeScore === null || awayScore === null) continue;
@@ -1402,11 +1751,7 @@ async function settleResults() {
         result:     won ? 'WON' : 'LOST',
         profit_loss: pl,
         running_pl:  currentRunningPL,
-        settled_at:  (() => {
-          const d = new Date();
-          const ukDate = d.toLocaleDateString('en-CA', { timeZone: 'Europe/London' });
-          return ukDate + 'T12:00:00.000Z';
-        })(),
+        settled_at:  new Date().toISOString(),
         confidence: tip.confidence || 0,
       });
 
@@ -1565,11 +1910,11 @@ function buildWelcomeEmail({ userId, firstName }) {
 
 function buildProEmail({ tip, allTips, userId, firstName }) {
   const g    = firstName || 'there';
-  const edge = (parseFloat(tip.confidence||0) - (1/parseFloat(tip.odds||1))*100).toFixed(1);
+  const edge = parseFloat(tip.model_edge != null ? tip.model_edge : 0).toFixed(1);
   const ec   = parseFloat(edge) >= 0 ? '#18e07a' : '#ff3d5a';
   const es   = parseFloat(edge) >= 0 ? `+${edge}%` : `${edge}%`;
   const extras = allTips.slice(1, 9).map(t => {
-    const te  = (parseFloat(t.confidence||0) - (1/parseFloat(t.odds||1))*100).toFixed(1);
+    const te  = parseFloat(t.model_edge != null ? t.model_edge : 0).toFixed(1);
     const tec = parseFloat(te) >= 0 ? '#18e07a' : '#ff3d5a';
     return `<tr style="border-top:1px solid #1c2535;"><td style="padding:10px 14px;">
 <p style="font-size:10px;color:#4a5a70;margin:0 0 2px;font-family:monospace;text-transform:uppercase;">${t.sport} · ${t.league} · [${t.tip_ref}]</p>
@@ -1601,7 +1946,7 @@ ${extras ? `<table width="100%" cellpadding="0" cellspacing="0" style="backgroun
 
 function buildFreeEmail({ tip, proTipCount, userId, firstName }) {
   const g    = firstName || 'there';
-  const edge = (parseFloat(tip.confidence||0) - (1/parseFloat(tip.odds||1))*100).toFixed(1);
+  const edge = parseFloat(tip.model_edge != null ? tip.model_edge : 0).toFixed(1);
   const ec   = parseFloat(edge) >= 0 ? '#18e07a' : '#ff3d5a';
   const es   = parseFloat(edge) >= 0 ? `+${edge}%` : `${edge}%`;
   const content = `
@@ -1751,12 +2096,34 @@ async function tagDailyBestBet() {
     const ukTomorrow = new Date(now.getTime() + 86400000).toLocaleDateString('en-CA', { timeZone: 'Europe/London' });
     const s = ukTomorrow + 'T00:00:00Z';
     const e = ukTomorrow + 'T23:59:59Z';
-    const { data: existing } = await supabase.from('tips').select('id').eq('is_best_bet', true).gte('event_time', s).lte('event_time', e).maybeSingle();
+
+    const { data: existing } = await supabase.from('tips').select('id')
+      .eq('is_best_bet', true).gte('event_time', s).lte('event_time', e).maybeSingle();
     if (existing) return;
-    const { data: tips } = await supabase.from('tips').select('id, tip_ref, home_team, away_team, confidence, odds').eq('status', 'pending').gte('event_time', s).lte('event_time', e).order('confidence', { ascending: false }).order('odds', { ascending: false }).limit(1);
+
+    // Fetch candidates — select model_edge and quality_score for ranking
+    const { data: tips } = await supabase.from('tips')
+      .select('id, tip_ref, home_team, away_team, confidence, odds, model_edge, quality_score')
+      .eq('status', 'pending')
+      .gte('event_time', s)
+      .lte('event_time', e);
+
     if (!tips?.length) return;
-    await supabase.from('tips').update({ is_best_bet: true }).eq('id', tips[0].id);
-    console.log(`🏆 Best bet tagged [${ukTomorrow}]: ${tips[0].home_team} vs ${tips[0].away_team}`);
+
+    // Rank by real edge + quality score composite (item 10)
+    // 70% model_edge (normalised to 25% max) + 30% quality_score
+    const ranked = tips
+      .map(t => {
+        const edge = parseFloat(t.model_edge || 0);
+        const qs   = parseFloat(t.quality_score || 0);
+        const normEdge = Math.min(1, Math.max(0, edge) / 25);
+        return { ...t, composite: normEdge * 0.70 + qs * 0.30 };
+      })
+      .sort((a, b) => b.composite - a.composite);
+
+    const best = ranked[0];
+    await supabase.from('tips').update({ is_best_bet: true }).eq('id', best.id);
+    console.log(`🏆 Best bet tagged [${ukTomorrow}]: [${best.tip_ref}] ${best.home_team} vs ${best.away_team} (edge: ${best.model_edge}% qs: ${best.quality_score})`);
   } catch(e) { console.error('tagDailyBestBet error:', e.message); }
 }
 
