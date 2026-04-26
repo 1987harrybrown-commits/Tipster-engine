@@ -475,9 +475,7 @@ async function morningFetch() {
 }
 
 // ─── MATCH CONTEXT CACHE ─────────────────────────────────────
-// Populated during morning fetch for each fixture.
-// Keyed by Sofascore event ID.
-// Contains: form, injuries, H2H, lineups, rest days
+const teamStatsCache = {};
 const matchContextCache = {};
 
 // ─── FETCH MATCH CONTEXT (form, injuries, H2H) ───────────────
