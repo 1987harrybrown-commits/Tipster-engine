@@ -1,5 +1,5 @@
 // ============================================================
-// THE TIPSTER EDGE — Engine v8.4 (Sofascore Edition)
+// THE TIPSTER EDGE — Engine v9.0 (Sofascore Edition)
 // ============================================================
 // Data source:  Sofascore via RapidAPI (single source of truth)
 // Schedule:
@@ -422,7 +422,7 @@ async function morningFetch() {
 
       console.log(`  → ${upcoming.length} fixtures in next 48h`);
 
-      // Fetch odds in batches of 3 — respects 5 req/sec rate limit
+      // Fetch odds + match context in batches of 3
       const enriched = [];
       const BATCH = 3;
       for (let i = 0; i < upcoming.length; i += BATCH) {
@@ -434,6 +434,12 @@ async function morningFetch() {
           const oddsRaw    = await fetchEventOdds(event.id);
           const targetLine = sport.name === 'Football' ? '2.5' : sport.name === 'Ice Hockey' ? '5.5' : null;
           const bookmakers = parseSofascoreOdds(oddsRaw, homeTeam, awayTeam, targetLine);
+
+          // Fetch match context (form, injuries, H2H) for football and NHL
+          if (sport.name === 'Football' || sport.name === 'Ice Hockey') {
+            await fetchMatchContext(event.id, event.homeTeam?.id, event.awayTeam?.id, sport.name);
+          }
+
           return {
             id:            event.id,
             home_team:     homeTeam,
@@ -468,8 +474,215 @@ async function morningFetch() {
   console.log(`✅ Morning fetch complete. ${rapidApiCallCount} API calls used today.`);
 }
 
-// ─── FETCH FOOTBALL STATS ─────────────────────────────────────
-const teamStatsCache = {};
+// ─── MATCH CONTEXT CACHE ─────────────────────────────────────
+// Populated during morning fetch for each fixture.
+// Keyed by Sofascore event ID.
+// Contains: form, injuries, H2H, lineups, rest days
+const matchContextCache = {};
+
+// ─── FETCH MATCH CONTEXT (form, injuries, H2H) ───────────────
+// Called once per fixture during morning fetch.
+// Returns context object merged into the event cache.
+async function fetchMatchContext(eventId, homeTeamId, awayTeamId, sport) {
+  const ctx = {
+    homeForm:       null,  // { wins, draws, losses, goalsFor, goalsAgainst, restDays }
+    awayForm:       null,
+    injuries:       { home: [], away: [] },
+    h2h:            null,  // { homeWins, awayWins, draws, recentHomeGoals, recentAwayGoals }
+    lineups:        null,  // populated later at 21:00
+  };
+
+  try {
+    // ── H2H ─────────────────────────────────────────────────
+    await new Promise(r => setTimeout(r, 150));
+    const h2hData = await sofascoreFetch('/matches/get-h2h', { matchId: eventId });
+    if (h2hData?.events?.length) {
+      const recent = h2hData.events.slice(0, 10);
+      let hw = 0, aw = 0, dr = 0, hg = 0, ag = 0;
+      for (const e of recent) {
+        const hScore = e.homeScore?.current ?? 0;
+        const aScore = e.awayScore?.current ?? 0;
+        hg += hScore; ag += aScore;
+        if (hScore > aScore) hw++;
+        else if (hScore < aScore) aw++;
+        else dr++;
+      }
+      ctx.h2h = {
+        homeWins: hw, awayWins: aw, draws: dr, total: recent.length,
+        avgHomeGoals: hg / recent.length, avgAwayGoals: ag / recent.length,
+      };
+    }
+
+    // ── INJURIES ─────────────────────────────────────────────
+    await new Promise(r => setTimeout(r, 150));
+    const injuryData = await sofascoreFetch('/matches/get-incidents', { matchId: eventId });
+    // injuries come from team squad endpoint — use matches/get-lineups which has missing players
+    // For injuries we use teams/get-squad and check injury status
+    if (injuryData) {
+      // Parse any pre-match injury/suspension incidents
+      const incidents = injuryData.incidents || [];
+      for (const inc of incidents) {
+        if (inc.incidentType === 'injuryTime' || inc.incidentType === 'injury') {
+          // Tag to home or away based on team
+          const side = inc.isHome ? 'home' : 'away';
+          ctx.injuries[side].push({ player: inc.player?.name || 'Unknown', type: inc.text || 'Injury' });
+        }
+      }
+    }
+
+    // ── HOME FORM + REST DAYS ────────────────────────────────
+    await new Promise(r => setTimeout(r, 150));
+    const homeMatches = await sofascoreFetch('/teams/get-last-matches', { id: homeTeamId, page: 0 });
+    if (homeMatches?.events?.length) {
+      ctx.homeForm = parseTeamForm(homeMatches.events, homeTeamId);
+    }
+
+    // ── AWAY FORM + REST DAYS ────────────────────────────────
+    await new Promise(r => setTimeout(r, 150));
+    const awayMatches = await sofascoreFetch('/teams/get-last-matches', { id: awayTeamId, page: 0 });
+    if (awayMatches?.events?.length) {
+      ctx.awayForm = parseTeamForm(awayMatches.events, awayTeamId);
+    }
+
+  } catch(e) {
+    console.log(`  ⚠️ Match context error [${eventId}]: ${e.message}`);
+  }
+
+  matchContextCache[eventId] = ctx;
+  return ctx;
+}
+
+// ─── FETCH LINEUPS (called at 21:00 UK) ──────────────────────
+async function fetchLineupsForToday() {
+  const today = new Date().toLocaleDateString('en-CA', { timeZone: 'Europe/London' });
+  let fetched = 0;
+
+  for (const sport of SPORTS) {
+    const events = sofascoreCache.events[sport.key] || [];
+    for (const event of events) {
+      const eventDate = event.commence_time?.split('T')[0];
+      if (eventDate !== today && eventDate !== new Date(Date.now() + 86400000).toLocaleDateString('en-CA', { timeZone: 'Europe/London' })) continue;
+      try {
+        await new Promise(r => setTimeout(r, 200));
+        const lineupData = await sofascoreFetch('/matches/get-lineups', { matchId: event.id });
+        if (lineupData?.home && lineupData?.away) {
+          const ctx = matchContextCache[event.id] || {};
+          ctx.lineups = {
+            homeFormation: lineupData.home?.formation || null,
+            awayFormation: lineupData.away?.formation || null,
+            homeConfirmed: lineupData.confirmed || false,
+            homeMissing:   (lineupData.home?.missingPlayers || []).map(p => ({ name: p.player?.name, reason: p.type })),
+            awayMissing:   (lineupData.away?.missingPlayers || []).map(p => ({ name: p.player?.name, reason: p.type })),
+          };
+          matchContextCache[event.id] = ctx;
+          fetched++;
+          console.log(`  📋 Lineups: ${event.home_team} vs ${event.away_team} — confirmed: ${lineupData.confirmed}`);
+        }
+      } catch(e) { /* silent */ }
+    }
+  }
+  console.log(`  📋 Lineups fetched: ${fetched} matches`);
+}
+
+// ─── PARSE TEAM FORM FROM LAST MATCHES ───────────────────────
+function parseTeamForm(events, teamId) {
+  const last5 = events.slice(0, 5);
+  let wins = 0, draws = 0, losses = 0, goalsFor = 0, goalsAgainst = 0;
+  let lastMatchTimestamp = null;
+
+  for (const e of last5) {
+    const isHome   = e.homeTeam?.id === teamId;
+    const myScore  = isHome ? (e.homeScore?.current ?? 0) : (e.awayScore?.current ?? 0);
+    const oppScore = isHome ? (e.awayScore?.current ?? 0) : (e.homeScore?.current ?? 0);
+    goalsFor     += myScore;
+    goalsAgainst += oppScore;
+    if (myScore > oppScore)      wins++;
+    else if (myScore === oppScore) draws++;
+    else                          losses++;
+    if (!lastMatchTimestamp && e.startTimestamp) lastMatchTimestamp = e.startTimestamp;
+  }
+
+  const restDays = lastMatchTimestamp
+    ? Math.floor((Date.now() / 1000 - lastMatchTimestamp) / 86400)
+    : 7;
+
+  return {
+    wins, draws, losses,
+    gamesPlayed:    last5.length,
+    goalsFor:       last5.length > 0 ? goalsFor  / last5.length : 0,
+    goalsAgainst:   last5.length > 0 ? goalsAgainst / last5.length : 0,
+    formScore:      last5.length > 0 ? (wins * 3 + draws) / (last5.length * 3) : 0.5,
+    restDays,
+  };
+}
+
+// ─── CONTEXT MODIFIERS FOR MODEL ─────────────────────────────
+// Returns { attackMult, defenceMult, dataQuality, notes } for a team
+// based on form, rest, injuries and lineups.
+function getContextModifiers(teamSide, ctx, isHome) {
+  if (!ctx) return { attackMult: 1.0, defenceMult: 1.0, restPenalty: 0, dataQuality: 0.85, notes: 'No context' };
+
+  const form    = isHome ? ctx.homeForm    : ctx.awayForm;
+  const missing = ctx.lineups ? (isHome ? ctx.lineups.homeMissing : ctx.lineups.awayMissing) : [];
+  const notes   = [];
+  let attackMult  = 1.0;
+  let defenceMult = 1.0;
+  let dataQuality = 1.0;
+
+  // ── Form multiplier ───────────────────────────────────────
+  // formScore: 0=terrible, 0.5=average, 1.0=perfect
+  if (form) {
+    const formAdj = (form.formScore - 0.5) * 0.20; // ±10% max
+    attackMult  += formAdj;
+    defenceMult -= formAdj * 0.5;
+    notes.push(`Form: ${form.wins}W${form.draws}D${form.losses}L`);
+
+    // ── Rest days penalty ─────────────────────────────────
+    if (form.restDays <= 2) {
+      attackMult  *= 0.93; // fatigue reduces attacking output
+      defenceMult *= 1.05; // and weakens defence
+      notes.push(`Rest: ${form.restDays}d ⚠️`);
+    } else if (form.restDays <= 3) {
+      attackMult  *= 0.97;
+      notes.push(`Rest: ${form.restDays}d`);
+    } else {
+      notes.push(`Rest: ${form.restDays}d ✓`);
+    }
+
+    // ── Recent goals adjustment ────────────────────────────
+    // If team's recent form goals are very different from season avg,
+    // blend them in slightly
+    if (form.gamesPlayed >= 3) {
+      const recentAttAdj = (form.goalsFor - 1.3) * 0.10; // small nudge
+      attackMult = Math.max(0.7, Math.min(1.4, attackMult + recentAttAdj));
+    }
+  } else {
+    dataQuality = 0.90;
+    notes.push('No form data');
+  }
+
+  // ── Missing players (from lineups) ────────────────────────
+  // Position-weighted impact: forwards matter more for attack,
+  // defenders/GK for defence
+  if (missing.length > 0) {
+    const attackImpact  = missing.length * 0.03; // ~3% per missing player
+    const defenceImpact = missing.length * 0.02;
+    attackMult  = Math.max(0.75, attackMult  - attackImpact);
+    defenceMult = Math.max(0.80, defenceMult + defenceImpact);
+    notes.push(`Missing: ${missing.map(p => p.name).join(', ')}`);
+    dataQuality = Math.min(dataQuality, 0.95); // slight quality boost — we HAVE lineup data
+  } else if (ctx.lineups?.homeConfirmed) {
+    notes.push('Full squad ✓');
+  }
+
+  return {
+    attackMult:  parseFloat(attackMult.toFixed(3)),
+    defenceMult: parseFloat(defenceMult.toFixed(3)),
+    dataQuality: parseFloat(dataQuality.toFixed(3)),
+    notes:       notes.join(' | '),
+    restDays:    form?.restDays || null,
+  };
+}
 
 async function fetchFootballStats() {
   console.log('  ⚽ Fetching football team stats...');
@@ -1174,8 +1387,29 @@ async function analyseFootballFixture(event, sport) {
     }
 
     const matrix = buildScoreMatrix(lH, lA);
-    const { homeWin, draw, awayWin, over25 } = calcOutcomes(matrix);
+    // Apply match context modifiers (form, rest, injuries, lineups)
+    const ctx      = matchContextCache[event.id] || null;
+    const homeMod  = getContextModifiers('home', ctx, true);
+    const awayMod  = getContextModifiers('away', ctx, false);
+
+    // Apply multipliers to expected goals
+    let lHmod = Math.max(0.3, Math.min(4.0, lH * homeMod.attackMult * awayMod.defenceMult));
+    let lAmod = Math.max(0.3, Math.min(4.0, lA * awayMod.attackMult * homeMod.defenceMult));
+
+    // H2H adjustment — if one team dominates historically, nudge lambda slightly
+    if (ctx?.h2h && ctx.h2h.total >= 5) {
+      const h2hHomeRate = ctx.h2h.homeWins / ctx.h2h.total;
+      const h2hAwayRate = ctx.h2h.awayWins / ctx.h2h.total;
+      const h2hAdj = (h2hHomeRate - h2hAwayRate) * 0.08; // max ±8% nudge
+      lHmod = Math.max(0.3, Math.min(4.0, lHmod * (1 + h2hAdj)));
+      lAmod = Math.max(0.3, Math.min(4.0, lAmod * (1 - h2hAdj)));
+    }
+
+    const dataQuality = Math.min(homeMod.dataQuality, awayMod.dataQuality);
+    const modMatrix = buildScoreMatrix(lHmod, lAmod);
+    const { homeWin, draw, awayWin, over25 } = calcOutcomes(modMatrix);
     const over25IP = market.over25Odds > 0 ? 1 / market.over25Odds : 0;
+    const contextNote = `Form H:${homeMod.notes} | A:${awayMod.notes}`;
 
     const candidates = [];
 
@@ -1184,9 +1418,9 @@ async function analyseFootballFixture(event, sport) {
       const edge = calcEdge(homeWin, market.trueHome);
       const kelly = kellyStake(homeWin, market.homeOdds);
       const games = Math.min(hStats?.homeGames || 0, aStats?.awayGames || 0);
-      const conf  = confidenceFromSignals({ modelProb: homeWin, dataQualityTier: 1.0, sport: 'Football', gamesPlayed: games });
-      const qs    = scoreCandidate({ edgePct: edge, modelProb: homeWin, dataQualityTier: 1.0 });
-      const c = { market: 'home', edge, modelProb: homeWin, trueImplied: market.trueHome, dataQualityTier: 1.0,
+      const conf  = confidenceFromSignals({ modelProb: homeWin, dataQualityTier: dataQuality, sport: 'Football', gamesPlayed: games });
+      const qs    = scoreCandidate({ edgePct: edge, modelProb: homeWin, dataQualityTier: dataQuality });
+      const c = { market: 'home', edge, modelProb: homeWin, trueImplied: market.trueHome, dataQualityTier: dataQuality,
         fairPrice: fairOdds(homeWin), bookOdds: market.homeOdds, bookmaker: market.homeBook,
         stake: kelly, conf, qualityScore: qs, selection: `${event.home_team} Win` };
       if (conf >= MIN_CONFIDENCE && falseEdgeCheck(c, market)) candidates.push(c);
@@ -1197,9 +1431,9 @@ async function analyseFootballFixture(event, sport) {
       const edge = calcEdge(awayWin, market.trueAway);
       const kelly = kellyStake(awayWin, market.awayOdds);
       const games = Math.min(aStats?.awayGames || 0, hStats?.homeGames || 0);
-      const conf  = confidenceFromSignals({ modelProb: awayWin, dataQualityTier: 1.0, sport: 'Football', gamesPlayed: games });
-      const qs    = scoreCandidate({ edgePct: edge, modelProb: awayWin, dataQualityTier: 1.0 });
-      const c = { market: 'away', edge, modelProb: awayWin, trueImplied: market.trueAway, dataQualityTier: 1.0,
+      const conf  = confidenceFromSignals({ modelProb: awayWin, dataQualityTier: dataQuality, sport: 'Football', gamesPlayed: games });
+      const qs    = scoreCandidate({ edgePct: edge, modelProb: awayWin, dataQualityTier: dataQuality });
+      const c = { market: 'away', edge, modelProb: awayWin, trueImplied: market.trueAway, dataQualityTier: dataQuality,
         fairPrice: fairOdds(awayWin), bookOdds: market.awayOdds, bookmaker: market.awayBook,
         stake: kelly, conf, qualityScore: qs, selection: `${event.away_team} Win` };
       if (conf >= MIN_CONFIDENCE && falseEdgeCheck(c, market)) candidates.push(c);
@@ -1210,9 +1444,9 @@ async function analyseFootballFixture(event, sport) {
       const edge = calcEdge(draw, market.trueDraw);
       const kelly = kellyStake(draw, market.drawOdds);
       const games = Math.min(hStats?.homeGames || 0, aStats?.awayGames || 0);
-      const conf  = confidenceFromSignals({ modelProb: draw, dataQualityTier: 1.0, sport: 'Football', gamesPlayed: games });
-      const qs    = scoreCandidate({ edgePct: edge, modelProb: draw, dataQualityTier: 1.0 });
-      const c = { market: 'draw', edge, modelProb: draw, trueImplied: market.trueDraw, dataQualityTier: 1.0,
+      const conf  = confidenceFromSignals({ modelProb: draw, dataQualityTier: dataQuality, sport: 'Football', gamesPlayed: games });
+      const qs    = scoreCandidate({ edgePct: edge, modelProb: draw, dataQualityTier: dataQuality });
+      const c = { market: 'draw', edge, modelProb: draw, trueImplied: market.trueDraw, dataQualityTier: dataQuality,
         fairPrice: fairOdds(draw), bookOdds: market.drawOdds, bookmaker: market.drawBook,
         stake: kelly, conf, qualityScore: qs, selection: 'Draw' };
       if (conf >= MIN_CONFIDENCE && falseEdgeCheck(c, market)) candidates.push(c);
@@ -1251,7 +1485,7 @@ async function analyseFootballFixture(event, sport) {
       fair_odds:     pick.fairPrice,
       quality_score: parseFloat((pick.qualityScore || 0).toFixed(3)),
       book_count:    market.bookCount,
-      notes:         `Model goals: ${lH.toFixed(2)}-${lA.toFixed(2)} | Model: ${(pick.modelProb*100).toFixed(1)}% | Fair: ${pick.fairPrice} | Book: ${pick.bookOdds} | Edge: ${pick.edge >= 0 ? '+' : ''}${pick.edge.toFixed(1)}%`,
+      notes:         `Model goals: ${lH.toFixed(2)}-${lA.toFixed(2)} (adj: ${lHmod.toFixed(2)}-${lAmod.toFixed(2)}) | Model: ${(pick.modelProb*100).toFixed(1)}% | Fair: ${pick.fairPrice} | Edge: ${pick.edge >= 0 ? '+' : ''}${pick.edge.toFixed(1)}% | ${contextNote}`,
     };
   } catch(e) {
     console.error(`Football model error [${event.home_team} vs ${event.away_team}]:`, e.message);
@@ -1291,11 +1525,29 @@ async function analyseNHLFixture(event, sport) {
 
     // Data quality tier — lower if goalie data absent (less confident model)
     const hasGoalieData = homeGoalie.label && awayGoalie.label;
-    const dataQualityTier = hasGoalieData ? 1.0 : 0.85;
+    let dataQualityTier = hasGoalieData ? 1.0 : 0.85;
 
     const goalieNote = hasGoalieData
       ? `H: ${homeGoalie.label} | A: ${awayGoalie.label}`
       : 'No goalie data';
+
+    // Apply match context (form, rest, H2H) to NHL lambda
+    const ctx     = matchContextCache[event.id] || null;
+    const homeMod = getContextModifiers('home', ctx, true);
+    const awayMod = getContextModifiers('away', ctx, false);
+
+    lH = Math.max(0.5, Math.min(6.0, lH * homeMod.attackMult * awayMod.defenceMult));
+    lA = Math.max(0.5, Math.min(6.0, lA * awayMod.attackMult * homeMod.defenceMult));
+
+    // H2H adjustment for NHL
+    if (ctx?.h2h && ctx.h2h.total >= 5) {
+      const h2hAdj = ((ctx.h2h.homeWins - ctx.h2h.awayWins) / ctx.h2h.total) * 0.06;
+      lH = Math.max(0.5, Math.min(6.0, lH * (1 + h2hAdj)));
+      lA = Math.max(0.5, Math.min(6.0, lA * (1 - h2hAdj)));
+    }
+
+    // Merge context data quality with goalie data quality
+    dataQualityTier = Math.min(dataQualityTier, Math.min(homeMod.dataQuality, awayMod.dataQuality));
 
     const N = NHL_MATRIX_MAX;
     const matrix = [];
@@ -1858,7 +2110,7 @@ async function updateStatsCache() {
 // ═══════════════════════════════════════════════════════════════
 
 async function runEngine() {
-  console.log(`\n🚀 Engine v8.4 — ${new Date().toLocaleString('en-GB', { timeZone: 'Europe/London' })}`);
+  console.log(`\n🚀 Engine v9.0 — ${new Date().toLocaleString('en-GB', { timeZone: 'Europe/London' })}`);
   console.log('═'.repeat(52));
 
   // Safety: if cache is empty (engine just started), don't run until morning fetch completes
@@ -2329,13 +2581,14 @@ function startScheduler() {
       await middayOddsRefresh();
     }
 
-    // Evening goalie refresh: 21:00 UK
-    // NHL starters confirmed ~4pm ET = 9pm UK, well before puck drop
+    // Evening goalie + lineup refresh: 21:00 UK
+    // NHL starters confirmed ~4pm ET = 9pm UK, football lineups confirmed ~1-2hr pre-kickoff
     if (h === 21 && m === 0) {
-      console.log('🥅 Evening goalie refresh...');
+      console.log('🥅 Evening goalie + lineup refresh...');
       Object.keys(nhlGoalieCache).forEach(k => delete nhlGoalieCache[k]);
       nhlGoalieCacheDate = '';
       await fetchNHLGoalieData();
+      await fetchLineupsForToday();
     }
 
   }, 60 * 1000);
@@ -2343,12 +2596,12 @@ function startScheduler() {
   setInterval(settleResults, 60 * 60 * 1000);
 
   console.log('⏰ Scheduler active:');
-  console.log('   06:00 UK — Morning data fetch (fixtures + odds + stats)');
+  console.log('   06:00 UK — Morning data fetch (fixtures + odds + form + injuries + H2H)');
   console.log('   07:00 UK — Pro emails + daily acca');
   console.log('   08:00 UK Sat — Saturday acca');
   console.log('   08:30 UK — Free emails');
   console.log('   13:00 UK — Midday odds refresh');
-  console.log('   21:00 UK — NHL goalie refresh (starters confirmed)');
+  console.log('   21:00 UK — Goalie + lineup refresh (starters confirmed)');
   console.log('   Every 60 min — Settler');
   console.log('   Every 15 min — Tip generation (cache only)');
 }
@@ -2575,7 +2828,7 @@ http.createServer(async (req, res) => {
 // ═══════════════════════════════════════════════════════════════
 
 (async () => {
-  console.log(`\n🟢 The Tipster Engine v8.4 starting...`);
+  console.log(`\n🟢 The Tipster Engine v9.0 starting...`);
   console.log(`   Season: ${currentSeason()}/${currentSeason()+1}`);
   console.log(`   Data source: Sofascore (RapidAPI Pro)`);
   console.log(`   Schedule: Morning fetch 06:00 | Midday refresh 13:00 | Tips every 15min`);
