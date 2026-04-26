@@ -1,5 +1,5 @@
 // ============================================================
-// THE TIPSTER EDGE — Engine v9.1 (Sofascore Edition)
+// THE TIPSTER EDGE — Engine v9.2 (Sofascore Edition)
 // ============================================================
 // Data source:  Sofascore via RapidAPI (single source of truth)
 // Schedule:
@@ -422,7 +422,7 @@ async function morningFetch() {
 
       console.log(`  → ${upcoming.length} fixtures in next 48h`);
 
-      // Fetch odds + match context in batches of 3
+      // Fetch odds in batches of 3
       const enriched = [];
       const BATCH = 3;
       for (let i = 0; i < upcoming.length; i += BATCH) {
@@ -434,14 +434,6 @@ async function morningFetch() {
           const oddsRaw    = await fetchEventOdds(event.id);
           const targetLine = sport.name === 'Football' ? '2.5' : sport.name === 'Ice Hockey' ? '5.5' : null;
           const bookmakers = parseSofascoreOdds(oddsRaw, homeTeam, awayTeam, targetLine);
-
-          // Fetch match context (form, injuries, H2H) for football and NHL
-          const hTeamId = event.homeTeam?.id;
-          const aTeamId = event.awayTeam?.id;
-          if ((sport.name === 'Football' || sport.name === 'Ice Hockey') && hTeamId && aTeamId) {
-            await fetchMatchContext(event.id, hTeamId, aTeamId, sport.name);
-          }
-
           return {
             id:            event.id,
             home_team:     homeTeam,
@@ -457,6 +449,24 @@ async function morningFetch() {
         if (i + BATCH < upcoming.length) await new Promise(r => setTimeout(r, 700));
       }
       console.log(`  ✅ ${sport.league}: ${enriched.filter(e => e.bookmakers.length).length}/${enriched.length} with odds`);
+
+      // Fetch match context sequentially AFTER odds — avoids rate limit collisions
+      // Only for football and NHL — NBA uses its own stats source
+      if (sport.name === 'Football' || sport.name === 'Ice Hockey') {
+        let ctxLoaded = 0;
+        for (const event of enriched) {
+          const hId = event.home_team_id;
+          const aId = event.away_team_id;
+          if (!hId || !aId) {
+            console.log(`  ⚠️ No team IDs for ${event.home_team} vs ${event.away_team}`);
+            continue;
+          }
+          await fetchMatchContext(event.id, hId, aId, sport.name);
+          ctxLoaded++;
+          await new Promise(r => setTimeout(r, 400)); // 400ms between fixtures
+        }
+        console.log(`  📊 ${sport.league}: context loaded for ${ctxLoaded}/${enriched.length} fixtures`);
+      }
 
       sofascoreCache.events[sport.key] = enriched;
 
@@ -540,6 +550,9 @@ async function fetchMatchContext(eventId, homeTeamId, awayTeamId, sport) {
     const homeMatches = await sofascoreFetch('/teams/get-last-matches', { id: homeTeamId, page: 0 });
     if (homeMatches?.events?.length) {
       ctx.homeForm = parseTeamForm(homeMatches.events, homeTeamId);
+      if (ctx.homeForm) console.log(`  📊 Home [${homeTeamId}]: ${ctx.homeForm.wins}W${ctx.homeForm.draws}D${ctx.homeForm.losses}L rest:${ctx.homeForm.restDays}d`);
+    } else {
+      console.log(`  ⚠️ No form data for home team ${homeTeamId}`);
     }
 
     // ── AWAY FORM + REST DAYS ────────────────────────────────
@@ -547,6 +560,9 @@ async function fetchMatchContext(eventId, homeTeamId, awayTeamId, sport) {
     const awayMatches = await sofascoreFetch('/teams/get-last-matches', { id: awayTeamId, page: 0 });
     if (awayMatches?.events?.length) {
       ctx.awayForm = parseTeamForm(awayMatches.events, awayTeamId);
+      if (ctx.awayForm) console.log(`  📊 Away [${awayTeamId}]: ${ctx.awayForm.wins}W${ctx.awayForm.draws}D${ctx.awayForm.losses}L rest:${ctx.awayForm.restDays}d`);
+    } else {
+      console.log(`  ⚠️ No form data for away team ${awayTeamId}`);
     }
 
   } catch(e) {
@@ -591,7 +607,13 @@ async function fetchLineupsForToday() {
 
 // ─── PARSE TEAM FORM FROM LAST MATCHES ───────────────────────
 function parseTeamForm(events, teamId) {
-  const last5 = events.slice(0, 5);
+  // Filter to finished matches only
+  const finished = events.filter(e =>
+    e.status?.type === 'finished' && e.homeScore?.current != null
+  );
+  const last5 = finished.slice(0, 5);
+  if (!last5.length) return null;
+
   let wins = 0, draws = 0, losses = 0, goalsFor = 0, goalsAgainst = 0;
   let lastMatchTimestamp = null;
 
@@ -601,9 +623,9 @@ function parseTeamForm(events, teamId) {
     const oppScore = isHome ? (e.awayScore?.current ?? 0) : (e.homeScore?.current ?? 0);
     goalsFor     += myScore;
     goalsAgainst += oppScore;
-    if (myScore > oppScore)      wins++;
-    else if (myScore === oppScore) draws++;
-    else                          losses++;
+    if      (myScore > oppScore) wins++;
+    else if (myScore < oppScore) losses++;
+    else                         draws++;
     if (!lastMatchTimestamp && e.startTimestamp) lastMatchTimestamp = e.startTimestamp;
   }
 
@@ -613,10 +635,10 @@ function parseTeamForm(events, teamId) {
 
   return {
     wins, draws, losses,
-    gamesPlayed:    last5.length,
-    goalsFor:       last5.length > 0 ? goalsFor  / last5.length : 0,
-    goalsAgainst:   last5.length > 0 ? goalsAgainst / last5.length : 0,
-    formScore:      last5.length > 0 ? (wins * 3 + draws) / (last5.length * 3) : 0.5,
+    gamesPlayed:  last5.length,
+    goalsFor:     goalsFor  / last5.length,
+    goalsAgainst: goalsAgainst / last5.length,
+    formScore:    (wins * 3 + draws) / (last5.length * 3), // 0=poor, 1=perfect
     restDays,
   };
 }
@@ -2115,7 +2137,7 @@ async function updateStatsCache() {
 // ═══════════════════════════════════════════════════════════════
 
 async function runEngine() {
-  console.log(`\n🚀 Engine v9.1 — ${new Date().toLocaleString('en-GB', { timeZone: 'Europe/London' })}`);
+  console.log(`\n🚀 Engine v9.2 — ${new Date().toLocaleString('en-GB', { timeZone: 'Europe/London' })}`);
   console.log('═'.repeat(52));
 
   // Safety: if cache is empty (engine just started), don't run until morning fetch completes
@@ -2833,7 +2855,7 @@ http.createServer(async (req, res) => {
 // ═══════════════════════════════════════════════════════════════
 
 (async () => {
-  console.log(`\n🟢 The Tipster Engine v9.1 starting...`);
+  console.log(`\n🟢 The Tipster Engine v9.2 starting...`);
   console.log(`   Season: ${currentSeason()}/${currentSeason()+1}`);
   console.log(`   Data source: Sofascore (RapidAPI Pro)`);
   console.log(`   Schedule: Morning fetch 06:00 | Midday refresh 13:00 | Tips every 15min`);
