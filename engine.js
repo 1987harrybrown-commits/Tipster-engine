@@ -1,5 +1,5 @@
 // ============================================================
-// THE TIPSTER EDGE — Engine v8.3 (Sofascore Edition)
+// THE TIPSTER EDGE — Engine v8.4 (Sofascore Edition)
 // ============================================================
 // Data source:  Sofascore via RapidAPI (single source of truth)
 // Schedule:
@@ -1422,10 +1422,7 @@ async function analyseNBAFixture(event, sport) {
       fetchNBATeamStats(event.home_team),
       fetchNBATeamStats(event.away_team),
     ]);
-    if (!homeStats || !awayStats) {
-      console.log(`  🏀 NBA ${event.home_team} vs ${event.away_team}: stats missing (home:${!!homeStats} away:${!!awayStats})`);
-      return null;
-    }
+    if (!homeStats || !awayStats) return null;
 
     const homeOff = homeStats.ptsFor     / NBA_LEAGUE_AVG_PTS;
     const homeDef = homeStats.ptsAgainst / NBA_LEAGUE_AVG_PTS;
@@ -1439,9 +1436,7 @@ async function analyseNBAFixture(event, sport) {
     const awayWinP = 1 - homeWinP;
 
     const market = extractMarketData(event);
-    if (!market) { console.log(`  🏀 NBA ${event.home_team} vs ${event.away_team}: no market data`); return null; }
-
-    console.log(`  🏀 NBA ${event.home_team} vs ${event.away_team}: home ${(homeWinP*100).toFixed(1)}% / away ${(awayWinP*100).toFixed(1)}% | market H:${market.homeOdds} A:${market.awayOdds} | trueH:${(market.trueHome*100).toFixed(1)}% trueA:${(market.trueAway*100).toFixed(1)}%`);
+    if (!market) return null;
 
     const candidates = [];
 
@@ -1449,7 +1444,6 @@ async function analyseNBAFixture(event, sport) {
       const edge = calcEdge(homeWinP, market.trueHome);
       const conf  = confidenceFromSignals({ modelProb: homeWinP, dataQualityTier: 1.0, sport: 'Basketball', gamesPlayed: homeStats.gamesPlayed });
       const fec   = falseEdgeCheck({ edge, modelProb: homeWinP, trueImplied: market.trueHome }, market);
-      console.log(`    home: edge ${edge.toFixed(1)}% conf ${conf} fec ${fec ? 'pass' : 'FAIL'} confMin ${NBA_MIN_CONFIDENCE}`);
       const stake = kellyStake(homeWinP, market.homeOdds);
       const qs    = scoreCandidate({ edgePct: edge, modelProb: homeWinP, dataQualityTier: 1.0 });
       const c = { selection: `${event.home_team} Win`, market: 'home', edge,
@@ -1464,7 +1458,6 @@ async function analyseNBAFixture(event, sport) {
       const edge = calcEdge(awayWinP, market.trueAway);
       const conf  = confidenceFromSignals({ modelProb: awayWinP, dataQualityTier: 1.0, sport: 'Basketball', gamesPlayed: awayStats.gamesPlayed });
       const fec   = falseEdgeCheck({ edge, modelProb: awayWinP, trueImplied: market.trueAway }, market);
-      console.log(`    away: edge ${edge.toFixed(1)}% conf ${conf} fec ${fec ? 'pass' : 'FAIL'} confMin ${NBA_MIN_CONFIDENCE}`);
       const stake = kellyStake(awayWinP, market.awayOdds);
       const qs    = scoreCandidate({ edgePct: edge, modelProb: awayWinP, dataQualityTier: 1.0 });
       const c = { selection: `${event.away_team} Win`, market: 'away', edge,
@@ -1865,7 +1858,7 @@ async function updateStatsCache() {
 // ═══════════════════════════════════════════════════════════════
 
 async function runEngine() {
-  console.log(`\n🚀 Engine v8.3 — ${new Date().toLocaleString('en-GB', { timeZone: 'Europe/London' })}`);
+  console.log(`\n🚀 Engine v8.4 — ${new Date().toLocaleString('en-GB', { timeZone: 'Europe/London' })}`);
   console.log('═'.repeat(52));
 
   // Safety: if cache is empty (engine just started), don't run until morning fetch completes
@@ -2582,7 +2575,7 @@ http.createServer(async (req, res) => {
 // ═══════════════════════════════════════════════════════════════
 
 (async () => {
-  console.log(`\n🟢 The Tipster Engine v8.3 starting...`);
+  console.log(`\n🟢 The Tipster Engine v8.4 starting...`);
   console.log(`   Season: ${currentSeason()}/${currentSeason()+1}`);
   console.log(`   Data source: Sofascore (RapidAPI Pro)`);
   console.log(`   Schedule: Morning fetch 06:00 | Midday refresh 13:00 | Tips every 15min`);
