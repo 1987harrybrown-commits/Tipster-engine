@@ -1,5 +1,5 @@
 // ============================================================
-// THE TIPSTER EDGE — Engine v9.0 (Sofascore Edition)
+// THE TIPSTER EDGE — Engine v9.1 (Sofascore Edition)
 // ============================================================
 // Data source:  Sofascore via RapidAPI (single source of truth)
 // Schedule:
@@ -436,8 +436,10 @@ async function morningFetch() {
           const bookmakers = parseSofascoreOdds(oddsRaw, homeTeam, awayTeam, targetLine);
 
           // Fetch match context (form, injuries, H2H) for football and NHL
-          if (sport.name === 'Football' || sport.name === 'Ice Hockey') {
-            await fetchMatchContext(event.id, event.homeTeam?.id, event.awayTeam?.id, sport.name);
+          const hTeamId = event.homeTeam?.id;
+          const aTeamId = event.awayTeam?.id;
+          if ((sport.name === 'Football' || sport.name === 'Ice Hockey') && hTeamId && aTeamId) {
+            await fetchMatchContext(event.id, hTeamId, aTeamId, sport.name);
           }
 
           return {
@@ -482,12 +484,17 @@ const matchContextCache = {};
 // Called once per fixture during morning fetch.
 // Returns context object merged into the event cache.
 async function fetchMatchContext(eventId, homeTeamId, awayTeamId, sport) {
+  if (!homeTeamId || !awayTeamId) {
+    console.log(`  ⚠️ fetchMatchContext [${eventId}]: missing team IDs (home:${homeTeamId} away:${awayTeamId})`);
+    return {};
+  }
+
   const ctx = {
-    homeForm:       null,  // { wins, draws, losses, goalsFor, goalsAgainst, restDays }
+    homeForm:       null,
     awayForm:       null,
     injuries:       { home: [], away: [] },
-    h2h:            null,  // { homeWins, awayWins, draws, recentHomeGoals, recentAwayGoals }
-    lineups:        null,  // populated later at 21:00
+    h2h:            null,
+    lineups:        null,
   };
 
   try {
@@ -2108,7 +2115,7 @@ async function updateStatsCache() {
 // ═══════════════════════════════════════════════════════════════
 
 async function runEngine() {
-  console.log(`\n🚀 Engine v9.0 — ${new Date().toLocaleString('en-GB', { timeZone: 'Europe/London' })}`);
+  console.log(`\n🚀 Engine v9.1 — ${new Date().toLocaleString('en-GB', { timeZone: 'Europe/London' })}`);
   console.log('═'.repeat(52));
 
   // Safety: if cache is empty (engine just started), don't run until morning fetch completes
@@ -2826,7 +2833,7 @@ http.createServer(async (req, res) => {
 // ═══════════════════════════════════════════════════════════════
 
 (async () => {
-  console.log(`\n🟢 The Tipster Engine v9.0 starting...`);
+  console.log(`\n🟢 The Tipster Engine v9.1 starting...`);
   console.log(`   Season: ${currentSeason()}/${currentSeason()+1}`);
   console.log(`   Data source: Sofascore (RapidAPI Pro)`);
   console.log(`   Schedule: Morning fetch 06:00 | Midday refresh 13:00 | Tips every 15min`);
