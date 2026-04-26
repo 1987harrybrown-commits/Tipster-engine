@@ -1,5 +1,5 @@
 // ============================================================
-// THE TIPSTER EDGE — Engine v8.1 (Sofascore Edition)
+// THE TIPSTER EDGE — Engine v8.2 (Sofascore Edition)
 // ============================================================
 // Data source:  Sofascore via RapidAPI (single source of truth)
 // Schedule:
@@ -739,18 +739,18 @@ async function fetchNBATeamStats(teamName) {
   const season = currentSeason();
   const cacheKey = `${teamName}_${season}`;
   if (nbaTeamCache[cacheKey]) return nbaTeamCache[cacheKey];
-  if (!checkBDLBudget(1)) return null;
+  if (!checkBDLBudget(1)) { console.log(`  🏀 BDL budget exhausted for ${teamName}`); return null; }
   try {
     const teamId = await fetchBDLNBATeamId(teamName);
-    if (!teamId) return null;
+    if (!teamId) { console.log(`  🏀 BDL: no team ID for "${teamName}"`); return null; }
     const res = await fetch(
       `${BDL_BASE}/nba/v1/games?team_ids[]=${teamId}&seasons[]=${season}&per_page=15`,
       { headers: BDL_API_KEY ? { 'Authorization': BDL_API_KEY } : {} }
     );
-    if (!res.ok) return null;
+    if (!res.ok) { console.log(`  🏀 BDL games HTTP ${res.status} for ${teamName}`); return null; }
     const data = await res.json();
     const games = (data.data || []).filter(g => g.status === 'Final');
-    if (games.length < 5) return null;
+    if (games.length < 5) { console.log(`  🏀 BDL: only ${games.length} games for ${teamName} (need 5)`); return null; }
     let ptsFor = 0, ptsAgainst = 0;
     for (const g of games) {
       const isHome = g.home_team?.id === teamId;
@@ -762,7 +762,7 @@ async function fetchNBATeamStats(teamName) {
     nbaTeamCache[cacheKey] = result;
     console.log(`  🏀 NBA ${teamName} [${n}gm]: ${result.ptsFor.toFixed(1)} pts, ${result.ptsAgainst.toFixed(1)} allowed`);
     return result;
-  } catch(e) { return null; }
+  } catch(e) { console.log(`  🏀 BDL error for ${teamName}: ${e.message}`); return null; }
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -1348,7 +1348,10 @@ async function analyseNBAFixture(event, sport) {
       fetchNBATeamStats(event.home_team),
       fetchNBATeamStats(event.away_team),
     ]);
-    if (!homeStats || !awayStats) return null;
+    if (!homeStats || !awayStats) {
+      console.log(`  🏀 NBA ${event.home_team} vs ${event.away_team}: stats missing (home:${!!homeStats} away:${!!awayStats})`);
+      return null;
+    }
 
     const homeOff = homeStats.ptsFor     / NBA_LEAGUE_AVG_PTS;
     const homeDef = homeStats.ptsAgainst / NBA_LEAGUE_AVG_PTS;
@@ -1788,7 +1791,7 @@ async function updateStatsCache() {
 // ═══════════════════════════════════════════════════════════════
 
 async function runEngine() {
-  console.log(`\n🚀 Engine v8.1 — ${new Date().toLocaleString('en-GB', { timeZone: 'Europe/London' })}`);
+  console.log(`\n🚀 Engine v8.2 — ${new Date().toLocaleString('en-GB', { timeZone: 'Europe/London' })}`);
   console.log('═'.repeat(52));
 
   // Safety: if cache is empty (engine just started), don't run until morning fetch completes
@@ -2505,7 +2508,7 @@ http.createServer(async (req, res) => {
 // ═══════════════════════════════════════════════════════════════
 
 (async () => {
-  console.log(`\n🟢 The Tipster Engine v8.1 starting...`);
+  console.log(`\n🟢 The Tipster Engine v8.2 starting...`);
   console.log(`   Season: ${currentSeason()}/${currentSeason()+1}`);
   console.log(`   Data source: Sofascore (RapidAPI Pro)`);
   console.log(`   Schedule: Morning fetch 06:00 | Midday refresh 13:00 | Tips every 15min`);
