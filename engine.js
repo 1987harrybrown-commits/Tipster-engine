@@ -550,117 +550,76 @@ const nhlGoalieCache = {};
 let nhlGoalieCacheDate = '';
 
 // ─── FETCH TODAY'S NHL GOALIE STARTERS ───────────────────────
-// Uses api-web.nhle.com/v1/schedule/now to get today's games
-// then fetches each game's boxscore for probable/confirmed starters.
-// Falls back gracefully — if no goalie data, model runs without adjustment.
+// Uses api-web.nhle.com/v1/score/{date} which includes startingGoalie
+// pre-game — boxscore (FUT state) has no player data before puck drop.
 async function fetchNHLGoalieData() {
-  const today = new Date().toISOString().split('T')[0];
+  const today = new Date().toLocaleDateString('en-CA', { timeZone: 'Europe/London' });
   if (nhlGoalieCacheDate === today && Object.keys(nhlGoalieCache).length > 0) return;
 
   try {
-    // Step 1: Get today's schedule
-    const schedRes = await fetch('https://api-web.nhle.com/v1/schedule/now', {
+    const scoreRes = await fetch(`https://api-web.nhle.com/v1/score/${today}`, {
       headers: { 'User-Agent': 'TipsterEdge/1.0' }
     });
-    if (!schedRes.ok) { console.log('  🏒 NHL goalie fetch: schedule unavailable'); return; }
-    const schedData = await schedRes.json();
+    if (!scoreRes.ok) {
+      console.log(`  🥅 NHL score endpoint unavailable (HTTP ${scoreRes.status})`);
+      nhlGoalieCacheDate = today;
+      return;
+    }
+    const scoreData = await scoreRes.json();
+    const games = scoreData.games || [];
 
-    const todayGames = (schedData.gameWeek || [])
-      .find(d => d.date === today)?.games || [];
-
-    if (!todayGames.length) {
-      console.log('  🏒 NHL goalie fetch: no games today');
+    if (!games.length) {
+      console.log(`  🥅 NHL: no games on ${today}`);
+      nhlGoalieCacheDate = today;
       return;
     }
 
     let found = 0;
-    for (const game of todayGames) {
-      try {
-        await new Promise(r => setTimeout(r, 200));
-        const boxRes = await fetch(`https://api-web.nhle.com/v1/gamecenter/${game.id}/boxscore`, {
-          headers: { 'User-Agent': 'TipsterEdge/1.0' }
-        });
-        if (!boxRes.ok) {
-          console.log(`  🥅 Boxscore unavailable for game ${game.id}`);
+    for (const game of games) {
+      for (const side of ['homeTeam', 'awayTeam']) {
+        const team = game[side];
+        if (!team) continue;
+        const teamName = team.name?.default || team.commonName?.default || team.placeName?.default || '';
+        if (!teamName) continue;
+
+        const goalie = team.startingGoalie;
+        if (!goalie) {
+          console.log(`  🥅 ${teamName}: no starter confirmed yet`);
           continue;
         }
-        const box = await boxRes.json();
-        const gameState = box.gameState || box.gameType || 'unknown';
-        console.log(`  🥅 Game ${game.id} state: ${gameState}`);
 
-        // Extract goalie info for home and away
-        for (const side of ['homeTeam', 'awayTeam']) {
-          const team     = box[side];
-          const teamName = team?.name?.default || team?.commonName?.default || '';
-          if (!teamName) continue;
+        const fullName = `${goalie.firstName?.default || ''} ${goalie.lastName?.default || ''}`.trim();
+        let savePct  = parseFloat(goalie.savePctg  || goalie.savePct || 0);
+        let gaa      = parseFloat(goalie.goalsAgainstAverage || goalie.gaa || 0);
+        let gamesP   = parseInt(goalie.gamesPlayed || 0);
 
-          // Probable starter from pregame roster
-          // Try boxscore goalies first, fall back to landing endpoint pre-game
-          let goalies = box.playerByGameStats?.[side]?.goalies || [];
-          if (!goalies.length) {
-            try {
-              await new Promise(r => setTimeout(r, 150));
-              const pgRes = await fetch(`https://api-web.nhle.com/v1/gamecenter/${game.id}/landing`, {
-                headers: { 'User-Agent': 'TipsterEdge/1.0' }
-              });
-              if (pgRes.ok) {
-                const pgData = await pgRes.json();
-                const sideKey = side === 'homeTeam' ? 'homeTeam' : 'awayTeam';
-                goalies = pgData.matchup?.[sideKey]?.goalies || [];
-                if (goalies.length) console.log(`  🥅 Landing fallback for ${teamName}: ${goalies.length} goalie(s)`);
-              }
-            } catch(e) { /* silent */ }
-          }
-          const players  = box.rosterSpots || [];
-
-          // Try pregame probable goalie first
-          const probable = team?.skaters
-            ? null
-            : team?.goalies?.[0];
-
-          // Fall back to boxscore goalies list
-          const starter = goalies[0];
-          if (!starter) continue;
-
-          // Fetch goalie season stats
-          const playerId = starter.playerId;
-          if (!playerId) continue;
-
-          await new Promise(r => setTimeout(r, 150));
-          const pRes = await fetch(`https://api-web.nhle.com/v1/player/${playerId}/landing`, {
-            headers: { 'User-Agent': 'TipsterEdge/1.0' }
-          });
-          if (!pRes.ok) continue;
-          const pData = await pRes.json();
-
-          // Get current season regular season goalie stats
-          const seasonStats = pData.seasonTotals?.find(s =>
-            s.season === parseInt(`${currentSeason()}${currentSeason()+1}`) &&
-            s.gameTypeId === 2
-          );
-
-          const savePct  = seasonStats?.savePctg    || pData.featuredStats?.regularSeason?.subSeason?.savePctg    || 0;
-          const gaa      = seasonStats?.goalsAgainstAverage || pData.featuredStats?.regularSeason?.subSeason?.goalsAgainstAvg || 0;
-          const gamesP   = seasonStats?.gamesPlayed || 0;
-          const fullName = `${pData.firstName?.default || ''} ${pData.lastName?.default || ''}`.trim();
-
-          nhlGoalieCache[teamName] = {
-            starter:     fullName,
-            savePercent: parseFloat(savePct)  || 0,
-            gaa:         parseFloat(gaa)      || 0,
-            gamesPlayed: parseInt(gamesP)     || 0,
-            isConfirmed: true,
-          };
-          console.log(`  🥅 ${teamName}: ${fullName} (SV%: ${parseFloat(savePct).toFixed(3)}, GAA: ${parseFloat(gaa).toFixed(2)}, GP: ${gamesP})`);
-          found++;
+        // If stats not on starter object, fetch from player landing
+        if (!savePct && goalie.playerId) {
+          try {
+            await new Promise(r => setTimeout(r, 200));
+            const pRes = await fetch(`https://api-web.nhle.com/v1/player/${goalie.playerId}/landing`, {
+              headers: { 'User-Agent': 'TipsterEdge/1.0' }
+            });
+            if (pRes.ok) {
+              const pData = await pRes.json();
+              const seasonStats = pData.seasonTotals?.find(s =>
+                s.season === parseInt(`${currentSeason()}${currentSeason()+1}`) && s.gameTypeId === 2
+              );
+              savePct = parseFloat(seasonStats?.savePctg || pData.featuredStats?.regularSeason?.subSeason?.savePctg || 0);
+              gaa     = parseFloat(seasonStats?.goalsAgainstAverage || pData.featuredStats?.regularSeason?.subSeason?.goalsAgainstAvg || 0);
+              gamesP  = parseInt(seasonStats?.gamesPlayed || 0);
+            }
+          } catch(e) { /* silent */ }
         }
-      } catch(e) {
-        // Silent — individual game failures don't break the batch
+
+        nhlGoalieCache[teamName] = { starter: fullName, savePercent: savePct, gaa, gamesPlayed: gamesP, isConfirmed: true };
+        console.log(`  🥅 ${teamName}: ${fullName} (SV%: ${savePct.toFixed(3)}, GAA: ${gaa.toFixed(2)}, GP: ${gamesP})`);
+        found++;
       }
     }
 
     nhlGoalieCacheDate = today;
-    console.log(`  🥅 NHL goalies loaded: ${found} confirmed starters for ${todayGames.length} games`);
+    console.log(`  🥅 NHL goalies loaded: ${found} confirmed starters for ${games.length} games`);
   } catch(e) {
     console.log(`  🥅 NHL goalie fetch failed: ${e.message} — model running without goalie data`);
   }
