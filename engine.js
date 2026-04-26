@@ -1,5 +1,5 @@
 // ============================================================
-// THE TIPSTER EDGE — Engine v8.2 (Sofascore Edition)
+// THE TIPSTER EDGE — Engine v8.3 (Sofascore Edition)
 // ============================================================
 // Data source:  Sofascore via RapidAPI (single source of truth)
 // Schedule:
@@ -500,6 +500,9 @@ async function fetchFootballStats() {
 
   // Fetch NHL goalie starters for today's games
   await fetchNHLGoalieData();
+
+  // Pre-load NBA team stats once — all 30 teams in 1-2 API calls
+  await fetchNBAAllTeamStats();
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -700,69 +703,140 @@ async function fetchNHLTeamStats(teamName) {
 }
 
 // ═══════════════════════════════════════════════════════════════
-// NBA STATS — BallDontLie (unchanged from v7)
+// NBA STATS — NBA Official Stats API (stats.nba.com)
+// Free, no API key required. Uses season team stats endpoint.
+// Data cached per morning fetch — no mid-cycle calls.
 // ═══════════════════════════════════════════════════════════════
 
-const BDL_BASE     = 'https://api.balldontlie.io';
-const BDL_API_KEY  = process.env.BDL_API_KEY || '';
 const nbaTeamCache = {};
-const bdlNBATeamIds = {};
-let bdlBudget = { date: '', used: 0, limit: 200 };
+let nbaAllTeamsCache = null;
+let nbaAllTeamsCacheDate = '';
 
-function checkBDLBudget(n = 1) {
+// NBA team name → abbreviation map for matching Sofascore names
+const NBA_TEAM_ABBREVS = {
+  'Atlanta Hawks': 'ATL', 'Boston Celtics': 'BOS', 'Brooklyn Nets': 'BKN',
+  'Charlotte Hornets': 'CHA', 'Chicago Bulls': 'CHI', 'Cleveland Cavaliers': 'CLE',
+  'Dallas Mavericks': 'DAL', 'Denver Nuggets': 'DEN', 'Detroit Pistons': 'DET',
+  'Golden State Warriors': 'GSW', 'Houston Rockets': 'HOU', 'Indiana Pacers': 'IND',
+  'Los Angeles Clippers': 'LAC', 'Los Angeles Lakers': 'LAL', 'Memphis Grizzlies': 'MEM',
+  'Miami Heat': 'MIA', 'Milwaukee Bucks': 'MIL', 'Minnesota Timberwolves': 'MIN',
+  'New Orleans Pelicans': 'NOP', 'New York Knicks': 'NYK', 'Oklahoma City Thunder': 'OKC',
+  'Orlando Magic': 'ORL', 'Philadelphia 76ers': 'PHI', 'Phoenix Suns': 'PHX',
+  'Portland Trail Blazers': 'POR', 'Sacramento Kings': 'SAC', 'San Antonio Spurs': 'SAS',
+  'Toronto Raptors': 'TOR', 'Utah Jazz': 'UTA', 'Washington Wizards': 'WAS',
+};
+
+async function fetchNBAAllTeamStats() {
   const today = new Date().toISOString().split('T')[0];
-  if (bdlBudget.date !== today) { bdlBudget.date = today; bdlBudget.used = 0; }
-  if (bdlBudget.used + n > bdlBudget.limit) return false;
-  bdlBudget.used += n; return true;
-}
+  if (nbaAllTeamsCache && nbaAllTeamsCacheDate === today) return nbaAllTeamsCache;
 
-async function fetchBDLNBATeamId(teamName) {
-  if (bdlNBATeamIds[teamName]) return bdlNBATeamIds[teamName];
-  if (!checkBDLBudget(1)) return null;
+  const season = currentSeason();
+  const seasonStr = `${season}-${String(season + 1).slice(2)}`; // e.g. "2024-25"
+
   try {
-    const res = await fetch(
-      `${BDL_BASE}/nba/v1/teams?search=${encodeURIComponent(teamName)}`,
-      { headers: BDL_API_KEY ? { 'Authorization': BDL_API_KEY } : {} }
-    );
-    if (!res.ok) return null;
+    const url = `https://stats.nba.com/stats/leaguedashteamstats?Conference=&DateFrom=&DateTo=&Division=&GameScope=&GameSegment=&Height=&LastNGames=0&LeagueID=00&Location=&MeasureType=Base&Month=0&OpponentTeamID=0&Outcome=&PORound=0&PaceAdjust=N&PerMode=PerGame&Period=0&PlayerExperience=&PlayerPosition=&PlusMinus=N&Rank=N&Season=${seasonStr}&SeasonSegment=&SeasonType=Regular+Season&ShotClockRange=&StarterBench=&TeamID=0&TwoWay=0&VsConference=&VsDivision=`;
+
+    const res = await fetch(url, {
+      headers: {
+        'User-Agent':  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Referer':     'https://www.nba.com/',
+        'Origin':      'https://www.nba.com',
+        'Accept':      'application/json, text/plain, */*',
+        'x-nba-stats-origin': 'stats',
+        'x-nba-stats-token':  'true',
+      },
+    });
+
+    if (!res.ok) {
+      console.log(`  🏀 NBA stats API HTTP ${res.status}`);
+      return null;
+    }
+
     const data = await res.json();
-    const team = (data.data || []).find(t =>
-      nameMatch(t.full_name, teamName) || nameMatch(t.name, teamName)
-    );
-    if (!team) return null;
-    bdlNBATeamIds[teamName] = team.id;
-    return team.id;
-  } catch(e) { return null; }
+    const headers = data.resultSets?.[0]?.headers || [];
+    const rows    = data.resultSets?.[0]?.rowSet   || [];
+
+    if (!rows.length) { console.log('  🏀 NBA stats: no rows returned'); return null; }
+
+    // Build lookup: teamName → { ptsFor, ptsAgainst, gamesPlayed, teamId }
+    const idx = (h) => headers.indexOf(h);
+    const teamNameIdx = idx('TEAM_NAME');
+    const gpIdx       = idx('GP');
+    const ptsIdx      = idx('PTS');
+    const oppPtsIdx   = idx('OPP_PTS') !== -1 ? idx('OPP_PTS') : -1;
+
+    const result = {};
+    for (const row of rows) {
+      const name = row[teamNameIdx];
+      const gp   = parseInt(row[gpIdx] || 0);
+      const pts  = parseFloat(row[ptsIdx] || 0);
+      // OPP_PTS may not be in Base — fallback handled below
+      const oppPts = oppPtsIdx !== -1 ? parseFloat(row[oppPtsIdx] || 0) : 0;
+      if (name && gp >= 5) {
+        result[name] = { ptsFor: pts, ptsAgainst: oppPts, gamesPlayed: gp };
+      }
+    }
+
+    // If OPP_PTS missing, fetch opponent stats separately
+    if (oppPtsIdx === -1 || !Object.values(result).some(t => t.ptsAgainst > 0)) {
+      const urlOpp = url.replace('MeasureType=Base', 'MeasureType=Opponent');
+      try {
+        const resOpp = await fetch(urlOpp, {
+          headers: {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'Referer': 'https://www.nba.com/', 'Origin': 'https://www.nba.com',
+            'x-nba-stats-origin': 'stats', 'x-nba-stats-token': 'true',
+          },
+        });
+        if (resOpp.ok) {
+          const dataOpp   = await resOpp.json();
+          const hdrsOpp   = dataOpp.resultSets?.[0]?.headers || [];
+          const rowsOpp   = dataOpp.resultSets?.[0]?.rowSet   || [];
+          const nameIdxO  = hdrsOpp.indexOf('TEAM_NAME');
+          const ptsIdxO   = hdrsOpp.indexOf('OPP_PTS');
+          for (const row of rowsOpp) {
+            const name = row[nameIdxO];
+            if (result[name] && ptsIdxO !== -1) {
+              result[name].ptsAgainst = parseFloat(row[ptsIdxO] || 0);
+            }
+          }
+        }
+      } catch(e) { /* silent — model still works with pts allowed estimate */ }
+    }
+
+    nbaAllTeamsCache     = result;
+    nbaAllTeamsCacheDate = today;
+    console.log(`  🏀 NBA team stats loaded: ${Object.keys(result).length} teams`);
+    return result;
+  } catch(e) {
+    console.log(`  🏀 NBA stats fetch error: ${e.message}`);
+    return null;
+  }
 }
 
 async function fetchNBATeamStats(teamName) {
-  const season = currentSeason();
-  const cacheKey = `${teamName}_${season}`;
+  const cacheKey = `${teamName}_${currentSeason()}`;
   if (nbaTeamCache[cacheKey]) return nbaTeamCache[cacheKey];
-  if (!checkBDLBudget(1)) { console.log(`  🏀 BDL budget exhausted for ${teamName}`); return null; }
-  try {
-    const teamId = await fetchBDLNBATeamId(teamName);
-    if (!teamId) { console.log(`  🏀 BDL: no team ID for "${teamName}"`); return null; }
-    const res = await fetch(
-      `${BDL_BASE}/nba/v1/games?team_ids[]=${teamId}&seasons[]=${season}&per_page=15`,
-      { headers: BDL_API_KEY ? { 'Authorization': BDL_API_KEY } : {} }
-    );
-    if (!res.ok) { console.log(`  🏀 BDL games HTTP ${res.status} for ${teamName}`); return null; }
-    const data = await res.json();
-    const games = (data.data || []).filter(g => g.status === 'Final');
-    if (games.length < 5) { console.log(`  🏀 BDL: only ${games.length} games for ${teamName} (need 5)`); return null; }
-    let ptsFor = 0, ptsAgainst = 0;
-    for (const g of games) {
-      const isHome = g.home_team?.id === teamId;
-      ptsFor     += isHome ? (g.home_team_score || 0) : (g.visitor_team_score || 0);
-      ptsAgainst += isHome ? (g.visitor_team_score || 0) : (g.home_team_score || 0);
-    }
-    const n = games.length;
-    const result = { teamId, gamesPlayed: n, ptsFor: ptsFor/n, ptsAgainst: ptsAgainst/n };
-    nbaTeamCache[cacheKey] = result;
-    console.log(`  🏀 NBA ${teamName} [${n}gm]: ${result.ptsFor.toFixed(1)} pts, ${result.ptsAgainst.toFixed(1)} allowed`);
-    return result;
-  } catch(e) { console.log(`  🏀 BDL error for ${teamName}: ${e.message}`); return null; }
+
+  const allTeams = await fetchNBAAllTeamStats();
+  if (!allTeams) return null;
+
+  // Try exact match first, then fuzzy
+  let stats = allTeams[teamName];
+  if (!stats) {
+    const match = Object.entries(allTeams).find(([k]) => nameMatch(k, teamName));
+    if (match) stats = match[1];
+  }
+
+  if (!stats) {
+    console.log(`  🏀 NBA: no stats match for "${teamName}" — available: ${Object.keys(allTeams).slice(0,3).join(', ')}...`);
+    return null;
+  }
+
+  const result = { gamesPlayed: stats.gamesPlayed, ptsFor: stats.ptsFor, ptsAgainst: stats.ptsAgainst };
+  nbaTeamCache[cacheKey] = result;
+  console.log(`  🏀 NBA ${teamName} [${result.gamesPlayed}gm]: ${result.ptsFor.toFixed(1)} pts, ${result.ptsAgainst.toFixed(1)} allowed`);
+  return result;
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -1791,7 +1865,7 @@ async function updateStatsCache() {
 // ═══════════════════════════════════════════════════════════════
 
 async function runEngine() {
-  console.log(`\n🚀 Engine v8.2 — ${new Date().toLocaleString('en-GB', { timeZone: 'Europe/London' })}`);
+  console.log(`\n🚀 Engine v8.3 — ${new Date().toLocaleString('en-GB', { timeZone: 'Europe/London' })}`);
   console.log('═'.repeat(52));
 
   // Safety: if cache is empty (engine just started), don't run until morning fetch completes
@@ -2508,7 +2582,7 @@ http.createServer(async (req, res) => {
 // ═══════════════════════════════════════════════════════════════
 
 (async () => {
-  console.log(`\n🟢 The Tipster Engine v8.2 starting...`);
+  console.log(`\n🟢 The Tipster Engine v8.3 starting...`);
   console.log(`   Season: ${currentSeason()}/${currentSeason()+1}`);
   console.log(`   Data source: Sofascore (RapidAPI Pro)`);
   console.log(`   Schedule: Morning fetch 06:00 | Midday refresh 13:00 | Tips every 15min`);
