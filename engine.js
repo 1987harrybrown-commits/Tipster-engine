@@ -1,5 +1,5 @@
 // ============================================================
-// THE TIPSTER EDGE — Engine v9.7 (Sofascore Edition)
+// THE TIPSTER EDGE — Engine v9.8 (Sofascore Edition)
 // ============================================================
 // Data source:  Sofascore via RapidAPI (single source of truth)
 // Schedule:
@@ -2066,8 +2066,14 @@ async function settleResults() {
               if (sd?.seasons?.length) {
                 const season2 = sd.seasons[0];
                 await new Promise(r => setTimeout(r, 250));
-                const ld = await sofascoreFetch(`/tournaments/get-last-matches`, { tournamentId: sport2.tournamentId, seasonId: season2.id, page: 0 });
-                const lev = (ld?.events || []).find(e => String(e.id) === String(eventId));
+                let ldEvents = [];
+                for (let pg = 0; pg <= 2; pg++) {
+                  const ld = await sofascoreFetch(`/tournaments/get-last-matches`, { tournamentId: sport2.tournamentId, seasonId: season2.id, page: pg });
+                  ldEvents = ldEvents.concat(ld?.events || []);
+                  if ((ld?.events || []).length === 0) break;
+                  await new Promise(r => setTimeout(r, 200));
+                }
+                const lev = ldEvents.find(e => String(e.id) === String(eventId));
                 if (lev) {
                   homeScore = lev.homeScore?.current ?? lev.homeScore?.normaltime ?? null;
                   awayScore = lev.awayScore?.current ?? lev.awayScore?.normaltime ?? null;
@@ -2097,12 +2103,17 @@ async function settleResults() {
             if (seasonsData?.seasons?.length) {
               const season = seasonsData.seasons[0];
               await new Promise(r => setTimeout(r, 250));
-              const lastData = await sofascoreFetch(`/tournaments/get-last-matches`, {
-                tournamentId: sport.tournamentId,
-                seasonId: season.id,
-                page: 0,
-              });
-              const lastEvents = lastData?.events || [];
+              let lastEvents = [];
+              for (let pg = 0; pg <= 2; pg++) {
+                const lastData = await sofascoreFetch(`/tournaments/get-last-matches`, {
+                  tournamentId: sport.tournamentId,
+                  seasonId: season.id,
+                  page: pg,
+                });
+                lastEvents = lastEvents.concat(lastData?.events || []);
+                if ((lastData?.events || []).length === 0) break;
+                await new Promise(r => setTimeout(r, 200));
+              }
               const found = lastEvents.find(e => {
                 const ht = e.homeTeam?.name || e.home_team || '';
                 const at = e.awayTeam?.name || e.away_team || '';
@@ -2259,7 +2270,7 @@ async function updateStatsCache() {
 // ═══════════════════════════════════════════════════════════════
 
 async function runEngine() {
-  console.log(`\n🚀 Engine v9.7 — ${new Date().toLocaleString('en-GB', { timeZone: 'Europe/London' })}`);
+  console.log(`\n🚀 Engine v9.8 — ${new Date().toLocaleString('en-GB', { timeZone: 'Europe/London' })}`);
   console.log('═'.repeat(52));
 
   // Safety: if cache is empty (engine just started), don't run until morning fetch completes
@@ -2977,7 +2988,7 @@ http.createServer(async (req, res) => {
 // ═══════════════════════════════════════════════════════════════
 
 (async () => {
-  console.log(`\n🟢 The Tipster Engine v9.7 starting...`);
+  console.log(`\n🟢 The Tipster Engine v9.8 starting...`);
   console.log(`   Season: ${currentSeason()}/${currentSeason()+1}`);
   console.log(`   Data source: Sofascore (RapidAPI Pro)`);
   console.log(`   Schedule: Morning fetch 06:00 | Midday refresh 13:00 | Tips every 15min`);
