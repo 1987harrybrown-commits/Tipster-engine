@@ -3338,9 +3338,27 @@ http.createServer(async (req, res) => {
         const { data: { user }, error: authErr } = await supabase.auth.getUser(token);
         if (!authErr && user) {
           const { data: profile } = await supabase.from('users').select('subscription_status, stripe_subscription_id').eq('id', user.id).single();
-          if (profile?.stripe_subscription_id) {
+
+          // subscription_status is what the Stripe webhook maintains — both
+          // 'active' and 'trialing' map to 'pro' — so it is the fast path: one
+          // indexed read instead of a Stripe round trip on every page load of
+          // the busiest endpoint on the site.
+          //
+          // It was previously selected and then ignored: isPro was only ever
+          // set inside the stripe_subscription_id branch, so anyone marked pro
+          // without a subscription id on file — set by hand, or after the id
+          // was cleared on a lapse and they resubscribed — was served the free
+          // card despite the column saying otherwise.
+          isPro = profile?.subscription_status === 'pro';
+
+          // Fall back to a live check only when the column says NOT pro but a
+          // subscription exists. That covers a missed upgrade webhook, which is
+          // the failure that wrongly denies someone who has paid. The opposite
+          // staleness costs nothing and self-heals, since Stripe retries
+          // webhook delivery for days.
+          if (!isPro && profile?.stripe_subscription_id) {
             const sub = await stripeRequest(`/subscriptions/${profile.stripe_subscription_id}`);
-            isPro = sub && (sub.status === 'active' || sub.status === 'trialing');
+            if (sub && (sub.status === 'active' || sub.status === 'trialing')) isPro = true;
           }
         }
       }
