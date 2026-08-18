@@ -1,0 +1,20 @@
+# Dependencies
+node_modules/
+
+# Environment — this app reads SUPABASE_SERVICE_KEY, ADMIN_KEY, RAPIDAPI_KEY
+# and the Stripe secrets from the environment. Never commit a local .env.
+.env
+.env.*
+!.env.example
+
+# Logs
+*.log
+npm-debug.log*
+
+# Editors
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
