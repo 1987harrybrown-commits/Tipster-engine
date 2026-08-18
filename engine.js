@@ -1170,6 +1170,30 @@ function nameMatch(a, b) {
 //
 // formatToParts avoids parsing a formatted string back into a Date. The `now`
 // parameter exists so this can be tested against fixed instants.
+// Start of the current UK day, as a real instant.
+//
+// Vercel runs in UTC, so `new Date(); d.setHours(0,0,0,0)` anchors to UTC
+// midnight — which is 01:00 UK during BST. Between 00:00 and 01:00 UK the
+// window therefore still covered the previous day, so these pages queried
+// yesterday's tips and advertised yesterday's date in the title, the H1 and
+// the structured data.
+function ukDayStart(now = new Date()) {
+  // The calendar date as London sees it, e.g. "2026-08-18".
+  const ymd = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Europe/London', year: 'numeric', month: '2-digit', day: '2-digit',
+  }).format(now);
+
+  // Take UTC midnight of that date, then subtract whatever offset London was
+  // on at that instant. Reading the offset from the guess (rather than assuming
+  // GMT or BST) keeps this correct across both transitions.
+  const guess = new Date(ymd + 'T00:00:00Z');
+  const hourInLondon = Number(new Intl.DateTimeFormat('en-GB', {
+    timeZone: 'Europe/London', hour: '2-digit', hour12: false,
+  }).format(guess)) % 24;
+
+  return new Date(guess.getTime() - hourInLondon * 3600000);
+}
+
 function ukTime(now = new Date()) {
   const parts = new Intl.DateTimeFormat('en-GB', {
     timeZone: 'Europe/London',
@@ -2760,8 +2784,11 @@ async function getSubscribers(type = 'daily', tier = 'all') {
 }
 
 async function getTodaysTips(limit = 15) {
-  const s = new Date(); s.setHours(0,0,0,0);
-  const e = new Date(); e.setHours(23,59,59,999);
+  // Render runs in UTC; setHours anchors to the server's day, which is an hour
+  // off the UK day during BST. A fixture kicking off between 00:00 and 01:00 UK
+  // fell outside "today" and never made the card.
+  const s = ukDayStart();
+  const e = new Date(s.getTime() + 24 * 3600000 - 1);
   const { data } = await supabase.from('tips').select('*').eq('status','pending')
     .gte('event_time', s.toISOString()).lte('event_time', e.toISOString())
     .order('confidence', { ascending: false }).limit(limit);
@@ -2780,7 +2807,9 @@ async function getSaturdayAcca() {
   const today = new Date().toISOString().split('T')[0];
   const { data: ov } = await supabase.from('email_overrides').select('*').eq('date', today).eq('type','saturday').maybeSingle();
   if (ov?.acca_selections) return { selections: ov.acca_selections, combinedOdds: ov.acca_combined_odds||0, reasoning: ov.acca_reasoning||'' };
-  const s = new Date(); s.setHours(6,0,0,0); const e = new Date(); e.setHours(23,59,59,999);
+  const dayStart = ukDayStart();
+  const s = new Date(dayStart.getTime() + 6 * 3600000);          // 06:00 UK
+  const e = new Date(dayStart.getTime() + 24 * 3600000 - 1);     // 23:59:59 UK
   const { data: tips } = await supabase.from('tips').select('*').eq('status','pending').eq('sport','Football')
     .gte('event_time', s.toISOString()).lte('event_time', e.toISOString())
     .gte('confidence', 72).order('confidence', { ascending: false }).limit(4);
@@ -3300,8 +3329,8 @@ http.createServer(async (req, res) => {
           }
         }
       }
-      const today = new Date(); today.setHours(0,0,0,0);
-      const tom = new Date(today); tom.setDate(tom.getDate() + 3);
+      const today = ukDayStart();
+      const tom = new Date(today.getTime() + 3 * 24 * 3600000);
       const { data: allTips } = await supabase.from('tips').select('*').gte('event_time', today.toISOString()).lte('event_time', tom.toISOString()).eq('status', 'pending').order('confidence', { ascending: false }).limit(50);
       const tips = (allTips || []).map((tip, i) => {
         const isLocked = !isPro && i >= 3;
