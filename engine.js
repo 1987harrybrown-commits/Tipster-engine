@@ -14,7 +14,16 @@
 //   Markets: H2H win markets + Overs (secondary, stricter rules)
 //   Odds:    1.40–2.20 core | 2.21–2.50 elite only | reject outside
 //   Edge:    H2H ≥ 8% | Overs ≥ 12% | Elite grade requires ≥ 10% (H2H) / 14% (Overs)
-//   Grades:  A+ (2–2.5u) | A (1.5u) | below A = no bet
+//   Grades:  A+ / A / B — edge bands only, for display. Grades do NOT set the
+//            stake: that is quarter-Kelly (see KELLY_TIERS), which depends on
+//            odds as well as edge, so the two correlate but do not map onto
+//            each other. Measured across the publishable band, A+ averages
+//            1.34u and A averages 0.75u, with both spanning 0.5u to 3u.
+//            (This line previously read "A+ (2–2.5u) | A (1.5u)", which the
+//            code has never done.)
+//   Stakes:  0.5u–3.0u, quarter-Kelly. No cap on total daily exposure — each
+//            tip is sized independently, so a heavy fixture list means a
+//            proportionally heavier day.
 //   Line:    Reject if odds moved ≥ 0.10 against; allow if improved
 //
 // v9.9 — DATA INTEGRITY & SECURITY PASS
