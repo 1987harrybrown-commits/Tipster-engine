@@ -46,6 +46,13 @@ const RAPIDAPI_KEY         = process.env.RAPIDAPI_KEY || '';
 if (!RAPIDAPI_KEY) throw new Error('FATAL: RAPIDAPI_KEY env var is not set');
 const ADMIN_KEY            = process.env.ADMIN_KEY || '';
 if (!ADMIN_KEY) throw new Error('FATAL: ADMIN_KEY env var is not set');
+// Unsubscribe links are signed so nobody can opt another subscriber out by
+// guessing their UUID. Prefer a dedicated secret; fall back to the Stripe
+// webhook secret so links already sitting in inboxes keep verifying. There is
+// deliberately NO literal default — this repository is public, so a published
+// fallback would make every unsubscribe token forgeable by anyone reading it.
+const UNSUB_SECRET         = process.env.UNSUB_SECRET || process.env.STRIPE_WEBHOOK_SECRET || '';
+if (!UNSUB_SECRET) throw new Error('FATAL: set UNSUB_SECRET (or STRIPE_WEBHOOK_SECRET) — unsubscribe links cannot be signed without it');
 const RAPIDAPI_HOST        = 'sofascore.p.rapidapi.com';
 const SOFASCORE_BASE       = `https://${RAPIDAPI_HOST}`;
 
@@ -2559,11 +2566,13 @@ async function sendEmail({ to, subject, html, type = 'general' }) {
 }
 
 function generateUnsubToken(uid) {
-  return crypto.createHmac('sha256', process.env.STRIPE_WEBHOOK_SECRET || 'unsub-secret').update(uid).digest('hex').slice(0, 16);
+  // Message format is deliberately unchanged (bare uid): altering it would
+  // invalidate every unsubscribe link already sent out.
+  return crypto.createHmac('sha256', UNSUB_SECRET).update(uid).digest('hex').slice(0, 16);
 }
 
 function verifyUnsubToken(token, uid) {
-  return token === generateUnsubToken(uid);
+  return safeEqual(token, generateUnsubToken(uid));
 }
 
 function emailBase(content, userId) {
