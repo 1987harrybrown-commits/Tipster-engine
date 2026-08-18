@@ -2527,9 +2527,9 @@ async function settleResultsInner() {
           console.error(`🚨 Acca ${acca.date} has invalid combined odds (${combinedAdvised}) — left pending`);
           continue;
         }
-        pl = parseFloat(((combinedAdvised - 1) * parseFloat(acca.stake || 1)).toFixed(2));
+        pl = parseFloat(((combinedAdvised - 1) * parseFloat(acca.stake ?? 1)).toFixed(2));
       } else {
-        pl = parseFloat((-parseFloat(acca.stake || 1)).toFixed(2));
+        pl = parseFloat((-parseFloat(acca.stake ?? 1)).toFixed(2));
       }
       await supabase.from('daily_accas').update({ result, profit_loss: pl }).eq('id', acca.id);
       console.log(`📋 Acca ${acca.date} settled: ${result} (${pl >= 0 ? '+' : ''}${pl}u)`);
@@ -2554,7 +2554,7 @@ async function updateStatsCache() {
     const lost  = data.filter(r => r.result === 'LOST').length;
     const total = won + lost;
     const pl    = data.reduce((s,r) => s + parseFloat(r.profit_loss || 0), 0);
-    const stk   = data.reduce((s,r) => s + parseFloat(r.stake || 1), 0);
+    const stk   = data.reduce((s,r) => s + parseFloat(r.stake ?? 1), 0);
     await supabase.from('stats_cache').update({
       total_tips:   total, total_won: won, total_lost: lost,
       win_rate:     total > 0 ? parseFloat((won/total*100).toFixed(1)) : 0,
