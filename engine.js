@@ -1448,10 +1448,20 @@ function extractMarketData(event) {
 function falseEdgeCheck(candidate, market) {
   const { edge, modelProb, trueImplied } = candidate;
 
-  // Reject if edge > 20% without strong multi-book confirmation
+  // NOTE: this clause is currently unreachable and has no effect.
+  // The intent reads as "allow a >20% edge if at least three books confirm it",
+  // but edge is (modelProb - trueImplied) * 100, so edge > 20 implies
+  // divergence > 0.20 and the check below rejects the candidate regardless of
+  // bookCount. Verified over 8,100 probability pairs: bookCount never changes
+  // the verdict, and nothing with edge > 20 is ever accepted.
+  //
+  // Left in place rather than deleted, because restoring the intended
+  // behaviour means loosening a rejection filter — a decision about which bets
+  // get published, not a tidy-up.
   if (edge > 20 && market.bookCount < 3) return null;
 
   // Reject if model probability diverges from market by > 20 percentage points
+  // in EITHER direction. This is what actually caps extreme edges.
   const divergence = Math.abs(modelProb - trueImplied);
   if (divergence > 0.20) return null;
 
