@@ -2592,6 +2592,7 @@ async function runEngine() {
   }
   console.log(`\n💾 Saving ${all.length} tips...`);
   await saveTips(all);
+  await tagFreeTips();
   console.log('✅ Cycle complete.\n');
 }
 
@@ -2898,6 +2899,63 @@ async function sendTestEmail(to, type) {
 // ═══════════════════════════════════════════════════════════════
 // BEST BET TAGGER + DAILY ACCA
 // ═══════════════════════════════════════════════════════════════
+
+// How many tips a day are given away. Every surface already assumes three.
+const FREE_TIPS_PER_DAY = 3;
+
+// Record which tips are free ON THE ROW.
+//
+// The free/Pro boundary is currently positional and recomputed independently in
+// six places: the engine's /tips route and the four sport pages all take the
+// top three by confidence, while index.html takes indices 1-3. Because it is
+// derived rather than stored, Row Level Security has no predicate for it — so
+// the Pro card cannot be protected at the database level, and index.html
+// currently fetches every pending tip with the public anon key and hides the
+// Pro ones with a CSS overlay.
+//
+// This writes the boundary down. It codifies the rule five of the six surfaces
+// already use, so nothing about which tips are free changes for them.
+//
+// Deliberately fault-tolerant: if the is_free column has not been added yet
+// this warns once and returns, leaving everything else working. The column and
+// the policies that use it are in rls-policies.sql.
+let warnedNoIsFree = false;
+async function tagFreeTips() {
+  try {
+    const dayStart = ukDayStart();
+    const s = dayStart.toISOString();
+    const e = new Date(dayStart.getTime() + 24 * 3600000 - 1).toISOString();
+
+    const { data: tips, error: readErr } = await supabase.from('tips')
+      .select('id, confidence')
+      .eq('status', 'pending')
+      .gte('event_time', s).lte('event_time', e)
+      .order('confidence', { ascending: false });
+    if (readErr) { console.error('tagFreeTips read:', readErr.message); return; }
+    if (!tips || !tips.length) return;
+
+    const freeIds = tips.slice(0, FREE_TIPS_PER_DAY).map(t => t.id);
+    const proIds  = tips.slice(FREE_TIPS_PER_DAY).map(t => t.id);
+
+    if (freeIds.length) {
+      const { error } = await supabase.from('tips').update({ is_free: true }).in('id', freeIds);
+      if (error) {
+        if (/is_free/i.test(error.message || '')) {
+          if (!warnedNoIsFree) {
+            warnedNoIsFree = true;
+            console.warn('⚠️ tagFreeTips: tips.is_free does not exist yet — skipping. See rls-policies.sql.');
+          }
+        } else console.error('tagFreeTips update (free):', error.message);
+        return;
+      }
+    }
+    if (proIds.length) {
+      const { error } = await supabase.from('tips').update({ is_free: false }).in('id', proIds);
+      if (error) { console.error('tagFreeTips update (pro):', error.message); return; }
+    }
+    console.log(`🔓 Tagged ${freeIds.length} free / ${proIds.length} pro tips for today.`);
+  } catch(e) { console.error('tagFreeTips error:', e.message); }
+}
 
 async function tagDailyBestBet() {
   try {
