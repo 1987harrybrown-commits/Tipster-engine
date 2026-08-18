@@ -608,7 +608,13 @@ async function fetchMatchContext(eventId, homeTeamId, awayTeamId, sport) {
     await new Promise(r => setTimeout(r, 150));
     const h2hData = await sofascoreFetch('/matches/get-h2h', { matchId: eventId });
     if (h2hData?.events?.length) {
-      const recent = h2hData.events.slice(0, 10);
+      // Newest first before slicing. Head-to-head history can stretch back
+      // years, so taking whatever order the feed returns risks weighting a
+      // rivalry on meetings from a decade ago rather than recent ones.
+      const recent = h2hData.events
+        .slice()
+        .sort((a, b) => (b.startTimestamp || 0) - (a.startTimestamp || 0))
+        .slice(0, 10);
       let hw = 0, aw = 0, dr = 0, hg = 0, ag = 0;
       for (const e of recent) {
         const hScore = e.homeScore?.current ?? 0;
