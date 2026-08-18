@@ -1323,6 +1323,36 @@ function calcEdge(modelProb, trueImpliedProb) {
   return parseFloat(((modelProb - trueImpliedProb) * 100).toFixed(2));
 }
 
+// Stake tiers, keyed on the quarter-Kelly fraction.
+//
+// These used to be [0.40, 0.28, 0.18, 0.11, 0.06]. Those are full-Kelly
+// numbers, but they were compared against the QUARTER-Kelly value, which can
+// never exceed 0.25 (full Kelly is p - q/b, bounded by 1). So the 3.0u and
+// 2.5u tiers were unreachable and 66% of publishable bets collapsed onto the
+// 0.5u floor — the model's discrimination was being thrown away.
+//
+// Rescaled against the actual distribution of quarter-Kelly values across the
+// band this engine publishes (odds 1.10-6.00, edge 8-20 points), so the tiers
+// separate meaningfully and 2u+ stays reserved for the strongest bets, in line
+// with "A+ (2-2.5u) | A (1.5u)" in the header:
+//
+//     0.5u 20%   1u 35%   1.5u 30%   2u 8%   2.5u 5%   3u 2%
+//
+// Average stake moves from 0.71u to 1.25u. That is a deliberate increase in
+// exposure, taken on the basis that the model's inputs are now correct — the
+// earlier record was produced against a stale odds cache, moneyline markets
+// that could be inverted, and form that could be computed from the oldest
+// matches rather than the newest. Lower every threshold to stake less; this
+// table is the single place to tune it.
+const KELLY_TIERS = [
+  [0.1725, 3.0],
+  [0.1079, 2.5],
+  [0.0786, 2.0],
+  [0.0546, 1.5],
+  [0.0371, 1.0],
+];
+const KELLY_MIN_STAKE = 0.5;
+
 function kellyStake(modelProb, decimalOdds, fraction = 0.25) {
   const b = decimalOdds - 1;
   // Degenerate input means we cannot size a bet, so stake nothing. This
@@ -1337,12 +1367,10 @@ function kellyStake(modelProb, decimalOdds, fraction = 0.25) {
   const full = (b * modelProb - q) / b;
   if (full <= 0) return 0;
   const sized = full * fraction;
-  if (sized >= 0.40) return 3.0;
-  if (sized >= 0.28) return 2.5;
-  if (sized >= 0.18) return 2.0;
-  if (sized >= 0.11) return 1.5;
-  if (sized >= 0.06) return 1.0;
-  return 0.5;
+  for (const [threshold, units] of KELLY_TIERS) {
+    if (sized >= threshold) return units;
+  }
+  return KELLY_MIN_STAKE;
 }
 
 function normalCDF(x) {
