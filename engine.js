@@ -452,8 +452,14 @@ function buildTeamStatsFromStandings(standings, tournamentId) {
 // ─── BUILD FORM FROM RECENT MATCHES ───────────────────────────
 function buildFormFromMatches(matches, teamId) {
   if (!matches?.length) return null;
+  // Sort explicitly rather than trusting the feed's order. "Last five" has to
+  // mean the five most recent; taking slice(0,5) off however the endpoint
+  // happens to return them would quietly compute form from the OLDEST matches
+  // if the page is ascending, and stale form degrades every tip that uses it.
   const relevant = matches
     .filter(m => m.status?.type === 'finished' || m.status?.description === 'Ended')
+    .slice()
+    .sort((a, b) => (b.startTimestamp || 0) - (a.startTimestamp || 0))
     .slice(0, 5);
 
   if (relevant.length < 3) return null;
@@ -701,6 +707,9 @@ function parseTeamForm(events, teamId) {
   const finished = events.filter(e =>
     e.status?.type === 'finished' && e.homeScore?.current != null
   );
+  // Newest first, explicitly. lastMatchTimestamp below reads the first element
+  // and calls it the most recent match, which is only true if this is sorted.
+  finished.sort((a, b) => (b.startTimestamp || 0) - (a.startTimestamp || 0));
   const last5 = finished.slice(0, 5);
   if (!last5.length) return null;
 
