@@ -2952,6 +2952,39 @@ function verifyStripeWebhook(payload, sig) {
   } catch(e) { return null; }
 }
 
+// Stripe subscription status -> the value stored on users.subscription_status.
+//
+// One mapping, used by every branch below. /verify-pro, /tips and the checkout
+// guard all ask Stripe directly and treat trialing as Pro, but this handler
+// only ever wrote 'pro' for 'active'. A trialing subscriber therefore had the
+// API serving them Pro data while the site — which reads this column — showed
+// them the locked free experience.
+//
+// null means "leave the column alone": 'incomplete' and 'paused' are transient
+// and should not downgrade someone mid-flow.
+function mapSubStatus(stripeStatus) {
+  switch (stripeStatus) {
+    case 'active':
+    case 'trialing':           return 'pro';
+    case 'past_due':           return 'past_due';
+    case 'canceled':
+    case 'unpaid':
+    case 'incomplete_expired': return 'free';
+    default:                   return null;
+  }
+}
+
+// Updates keyed on stripe_customer_id silently match zero rows if that id has
+// not been written yet — Stripe does not guarantee checkout.session.completed
+// arrives before customer.subscription.updated. Surface it instead of losing
+// the event without trace.
+async function updateUserByCustomer(customerId, patch, label) {
+  if (!customerId) { console.error(`Stripe ${label}: event carried no customer id`); return; }
+  const { data, error } = await supabase.from('users').update(patch).eq('stripe_customer_id', customerId).select('id');
+  if (error) { console.error(`Stripe ${label} update failed:`, error.message); return; }
+  if (!data || !data.length) console.warn(`⚠️ Stripe ${label}: no user with stripe_customer_id=${customerId} — not applied`);
+}
+
 async function handleStripeWebhook(event) {
   console.log('Stripe:', event.type);
   switch(event.type) {
@@ -2966,19 +2999,24 @@ async function handleStripeWebhook(event) {
     }
     case 'customer.subscription.updated': {
       const sub = event.data.object;
-      if (sub.status === 'active') await supabase.from('users').update({ subscription_status:'pro' }).eq('stripe_customer_id', sub.customer);
-      else if (sub.status === 'past_due') await supabase.from('users').update({ subscription_status:'past_due' }).eq('stripe_customer_id', sub.customer);
+      const mapped = mapSubStatus(sub.status);
+      if (!mapped) break;
+      // A subscription cancelled at period end stays 'active' until it lapses,
+      // so access correctly continues until subscription.deleted arrives.
+      const patch = { subscription_status: mapped };
+      if (mapped === 'free') patch.stripe_subscription_id = null;
+      await updateUserByCustomer(sub.customer, patch, `subscription.updated(${sub.status})`);
       break;
     }
     case 'customer.subscription.deleted':
-      await supabase.from('users').update({ subscription_status:'free', stripe_subscription_id: null }).eq('stripe_customer_id', event.data.object.customer);
+      await updateUserByCustomer(event.data.object.customer, { subscription_status:'free', stripe_subscription_id: null }, 'subscription.deleted');
       break;
     case 'invoice.payment_failed':
-      await supabase.from('users').update({ subscription_status:'past_due' }).eq('stripe_customer_id', event.data.object.customer);
+      await updateUserByCustomer(event.data.object.customer, { subscription_status:'past_due' }, 'payment_failed');
       break;
     case 'invoice.payment_succeeded':
       if (event.data.object.billing_reason === 'subscription_cycle')
-        await supabase.from('users').update({ subscription_status:'pro' }).eq('stripe_customer_id', event.data.object.customer);
+        await updateUserByCustomer(event.data.object.customer, { subscription_status:'pro' }, 'payment_succeeded');
       break;
   }
 }
