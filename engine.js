@@ -1325,7 +1325,14 @@ function calcEdge(modelProb, trueImpliedProb) {
 
 function kellyStake(modelProb, decimalOdds, fraction = 0.25) {
   const b = decimalOdds - 1;
-  if (b <= 0 || modelProb <= 0 || modelProb >= 1) return 1.0;
+  // Degenerate input means we cannot size a bet, so stake nothing. This
+  // returned 1.0 — a full unit staked off odds <= 1.00 or a probability
+  // outside (0,1), which is exactly the input you least want to bet on.
+  // Note this runs during analysis, BEFORE applyStrictRules filters the odds
+  // range, so a bad price from the feed reached it directly. Returning 0 is
+  // also what the negative-edge branch below already does.
+  if (!Number.isFinite(b) || b <= 0) return 0;
+  if (!Number.isFinite(modelProb) || modelProb <= 0 || modelProb >= 1) return 0;
   const q    = 1 - modelProb;
   const full = (b * modelProb - q) / b;
   if (full <= 0) return 0;
@@ -1339,7 +1346,11 @@ function kellyStake(modelProb, decimalOdds, fraction = 0.25) {
 }
 
 function normalCDF(x) {
-  const t = 1 / (1 + 0.2315419 * Math.abs(x));
+  // Abramowitz & Stegun 26.2.17 specifies 0.2316419; this had 0.2315419.
+  // The error was tiny — at most 4.3e-5 of probability, against edges measured
+  // in whole percentage points — so this is correctness housekeeping rather
+  // than a behaviour change.
+  const t = 1 / (1 + 0.2316419 * Math.abs(x));
   const d = 0.3989423 * Math.exp(-x * x / 2);
   const p = d * t * (0.3193815 + t * (-0.3565638 + t * (1.7814779 + t * (-1.8212560 + t * 1.3302744))));
   return x >= 0 ? 1 - p : p;
