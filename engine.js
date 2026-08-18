@@ -1155,8 +1155,38 @@ function nameMatch(a, b) {
   return ac === bc || ac.includes(bc) || bc.includes(ac);
 }
 
-function ukTime() {
-  return new Date(new Date().toLocaleString('en-GB', { timeZone: 'Europe/London' }));
+// Wall-clock time in London, as a Date whose local Y/M/D/H/M/S fields hold the
+// UK values. The scheduler reads getHours/getMinutes/getDay/toDateString off it.
+//
+// This previously did:
+//     new Date(new Date().toLocaleString('en-GB', { timeZone: 'Europe/London' }))
+// en-GB formats as DD/MM/YYYY, but V8's legacy string parser reads a
+// slash-separated date as MM/DD/YYYY. So on days 1-12 it silently produced the
+// WRONG date (11/08 became 8 November, breaking the Saturday check), and on
+// days 13-31 the month was out of range and it returned Invalid Date — where
+// getHours() is NaN, every `h === 6/7/8/13/21` comparison is false, and no
+// scheduled job fired at all. That is 19 days in every month with no morning
+// fetch, no Pro emails, no free emails, no acca and no odds refresh.
+//
+// formatToParts avoids parsing a formatted string back into a Date. The `now`
+// parameter exists so this can be tested against fixed instants.
+function ukTime(now = new Date()) {
+  const parts = new Intl.DateTimeFormat('en-GB', {
+    timeZone: 'Europe/London',
+    year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit',
+    hour12: false,
+  }).formatToParts(now).reduce((acc, p) => { acc[p.type] = p.value; return acc; }, {});
+
+  return new Date(
+    Number(parts.year),
+    Number(parts.month) - 1,
+    Number(parts.day),
+    // Some ICU builds render midnight as "24" under hour12:false.
+    Number(parts.hour) % 24,
+    Number(parts.minute),
+    Number(parts.second)
+  );
 }
 
 function generateTipRef(sport) {
@@ -3025,7 +3055,7 @@ async function handleStripeWebhook(event) {
 // SCHEDULER
 // ═══════════════════════════════════════════════════════════════
 
-let lastProDate = '', lastFreeDate = '', lastSatDate = '', lastMorningDate = '', lastMiddayDate = '';
+let lastProDate = '', lastFreeDate = '', lastSatDate = '', lastMorningDate = '', lastMiddayDate = '', lastEveningDate = '';
 
 function startScheduler() {
   setInterval(async () => {
@@ -3036,14 +3066,14 @@ function startScheduler() {
     const isSat = uk.getDay() === 6;
 
     // Morning fetch: 06:00 UK — full data pull
-    if (h === 6 && m === 0 && lastMorningDate !== today) {
+    if (h === 6 && m < 5 && lastMorningDate !== today) {
       lastMorningDate = today;
       await morningFetch();
       await tagDailyBestBet();
     }
 
     // Pro emails + acca: 07:00
-    if (h === 7 && m === 0 && lastProDate !== today) {
+    if (h === 7 && m < 5 && lastProDate !== today) {
       lastProDate = today;
       await tagDailyBestBet();
       await sendProEmails();
@@ -3051,26 +3081,27 @@ function startScheduler() {
     }
 
     // Free emails: 08:30
-    if (h === 8 && m === 30 && lastFreeDate !== today) {
+    if (h === 8 && m >= 30 && m < 35 && lastFreeDate !== today) {
       lastFreeDate = today;
       await sendDailyEmails();
     }
 
     // Saturday acca: 08:00 Sat
-    if (isSat && h === 8 && m === 0 && lastSatDate !== today) {
+    if (isSat && h === 8 && m < 5 && lastSatDate !== today) {
       lastSatDate = today;
       await sendSaturdayEmails();
     }
 
     // Midday odds refresh: 13:00
-    if (h === 13 && m === 0 && lastMiddayDate !== today) {
+    if (h === 13 && m < 5 && lastMiddayDate !== today) {
       lastMiddayDate = today;
       await middayOddsRefresh();
     }
 
     // Evening goalie + lineup refresh: 21:00 UK
     // NHL starters confirmed ~4pm ET = 9pm UK, football lineups confirmed ~1-2hr pre-kickoff
-    if (h === 21 && m === 0) {
+    if (h === 21 && m < 5 && lastEveningDate !== today) {
+      lastEveningDate = today;
       console.log('🥅 Evening goalie + lineup refresh...');
       Object.keys(nhlGoalieCache).forEach(k => delete nhlGoalieCache[k]);
       nhlGoalieCacheDate = '';
