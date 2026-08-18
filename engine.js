@@ -2552,6 +2552,7 @@ const SITE_URL        = 'https://www.thetipsteredge.com';
 
 async function sendEmail({ to, subject, html, type = 'general' }) {
   if (!RESEND_API_KEY) { console.log(`📧 No RESEND key — skipping email to ${to}`); return false; }
+  let ok = false;
   try {
     const res = await fetch('https://api.resend.com/emails', {
       method: 'POST',
@@ -2559,10 +2560,28 @@ async function sendEmail({ to, subject, html, type = 'general' }) {
       body: JSON.stringify({ from: `${FROM_NAME} <${FROM_EMAIL}>`, to, subject, html }),
     });
     const data = await res.json();
-    if (!res.ok) { console.error(`Email error (${type}):`, data.message || data); return false; }
-    console.log(`📧 Sent (${type}) → ${to}`);
-    return true;
-  } catch(e) { console.error(`Email error (${type}):`, e.message); return false; }
+    if (!res.ok) console.error(`Email error (${type}):`, data.message || data);
+    else { console.log(`📧 Sent (${type}) → ${to}`); ok = true; }
+  } catch(e) { console.error(`Email error (${type}):`, e.message); }
+
+  // Record the attempt. The admin dashboard reads email_log for its recent-email
+  // table and its total-sent counter, but nothing ever wrote to it, so both were
+  // permanently empty. Only the columns the dashboard actually reads are written.
+  //
+  // Deliberately non-fatal and non-blocking on failure: a delivered email must
+  // not be reported as failed because the log row could not be inserted.
+  try {
+    const { error } = await supabase.from('email_log').insert({
+      recipient: to,
+      subject,
+      type,
+      status: ok ? 'sent' : 'failed',
+      sent_at: new Date().toISOString(),
+    });
+    if (error) console.error('email_log write failed:', error.message);
+  } catch(e) { console.error('email_log write failed:', e.message); }
+
+  return ok;
 }
 
 function generateUnsubToken(uid) {
