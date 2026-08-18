@@ -363,14 +363,21 @@ function parseSofascoreOdds(markets, homeTeam, awayTeam, targetTotalsLine = null
     );
 
     if (moneylineMarket?.choices) {
-      for (const choice of moneylineMarket.choices) {
+      // Resolve the side by name first, and fall back to the choice's position
+      // in the SOURCE array — not to h2hOutcomes.length, which counts only the
+      // choices parsed so far. If the first choice had no usable price, the
+      // second one was landing at length 0 and being labelled home, so the away
+      // price was attached to the home team and every edge computed from it was
+      // for the wrong side of the game.
+      moneylineMarket.choices.forEach((choice, idx) => {
         const price = getChoicePrice(choice);
-        if (!price) continue;
-        if      (choice.name === '1')           h2hOutcomes.push({ name: homeTeam, price });
-        else if (choice.name === '2')           h2hOutcomes.push({ name: awayTeam, price });
-        else if (h2hOutcomes.length === 0)      h2hOutcomes.push({ name: homeTeam, price });
-        else if (h2hOutcomes.length === 1)      h2hOutcomes.push({ name: awayTeam, price });
-      }
+        if (!price) return;
+        const label = String(choice.name || '').trim();
+        if      (label === '1' || nameMatch(label, homeTeam)) h2hOutcomes.push({ name: homeTeam, price });
+        else if (label === '2' || nameMatch(label, awayTeam)) h2hOutcomes.push({ name: awayTeam, price });
+        else if (idx === 0)                                   h2hOutcomes.push({ name: homeTeam, price });
+        else if (idx === 1)                                   h2hOutcomes.push({ name: awayTeam, price });
+      });
     }
   }
 
