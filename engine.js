@@ -3266,6 +3266,24 @@ http.createServer(async (req, res) => {
         catch(e) { res.writeHead(413, cors); res.end('Payload too large'); return; }
         const { userId, email, plan } = JSON.parse(raw.toString('utf8'));
         if (!userId || !email || !plan) { res.writeHead(400, cors); res.end('Missing params'); return; }
+
+        // Refuse a second checkout for someone who is already subscribed.
+        // createCheckoutSession passes customer_email rather than customer, so
+        // Stripe mints a NEW customer each time; the webhook then overwrites
+        // stripe_customer_id/stripe_subscription_id with the new pair and the
+        // original subscription keeps billing with nothing in the app pointing
+        // at it. The user is charged twice and cancelling only stops the second.
+        const { data: existing } = await supabase.from('users')
+          .select('stripe_subscription_id').eq('id', userId).maybeSingle();
+        if (existing?.stripe_subscription_id) {
+          const current = await stripeRequest(`/subscriptions/${existing.stripe_subscription_id}`);
+          if (current && (current.status === 'active' || current.status === 'trialing')) {
+            res.writeHead(409, { ...cors, 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'You already have an active subscription.', alreadySubscribed: true }));
+            return;
+          }
+        }
+
         const session = await createCheckoutSession(userId, email, plan === 'annual' ? STRIPE_PRICE_ANNUAL : STRIPE_PRICE_MONTHLY, plan);
         if (!session) { res.writeHead(500, { ...cors, 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'Failed' })); return; }
         res.writeHead(200, { ...cors, 'Content-Type': 'application/json' });
