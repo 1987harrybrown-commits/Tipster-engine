@@ -192,13 +192,33 @@ function trackApiCall() {
   if (rapidApiCallCount % 10 === 0) console.log(`📡 RapidAPI calls today: ${rapidApiCallCount}`);
 }
 
-async function sofascoreFetch(path, params = {}) {
+// How many times a single Sofascore request is attempted before giving up.
+const SOFASCORE_MAX_ATTEMPTS = 3;
+
+async function sofascoreFetch(path, params = {}, attempt = 1) {
   const url = new URL(`${SOFASCORE_BASE}${path}`);
   for (const [k, v] of Object.entries(params)) url.searchParams.set(k, v);
   trackApiCall();
+
+  // Retry transient failures. morningFetch runs once a day and a failed call
+  // makes it `continue` past that league, so before this a single blip at 06:00
+  // cost a whole competition's fixtures until the next morning — and with the
+  // scheduler firing exactly once a day, there was no second chance.
+  const retry = async (why) => {
+    if (attempt >= SOFASCORE_MAX_ATTEMPTS) {
+      console.log(`⚠️ Sofascore ${path}: ${why} — gave up after ${attempt} attempts`);
+      return null;
+    }
+    const wait = 500 * Math.pow(2, attempt - 1);   // 500ms, then 1000ms
+    console.log(`⚠️ Sofascore ${path}: ${why} — retrying in ${wait}ms (${attempt + 1}/${SOFASCORE_MAX_ATTEMPTS})`);
+    await new Promise(r => setTimeout(r, wait));
+    return sofascoreFetch(path, params, attempt + 1);
+  };
+
+  let timeout;
   try {
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 10000); // 10s timeout
+    timeout = setTimeout(() => controller.abort(), 10000); // 10s timeout
     const res = await fetch(url.toString(), {
       signal: controller.signal,
       headers: {
@@ -207,37 +227,35 @@ async function sofascoreFetch(path, params = {}) {
         'Content-Type':    'application/json',
       },
     });
-    clearTimeout(timeout);
+
     if (!res.ok) {
+      // 429 and 5xx are worth another go. 401/403/404 are not: the key is wrong
+      // or the path does not exist, and retrying only burns quota.
+      if (res.status === 429 || res.status >= 500) return retry(`HTTP ${res.status}`);
       console.log(`⚠️ Sofascore ${path}: ${res.status}`);
       return null;
     }
+
     const text = await res.text();
-    if (!res.ok) {
-      console.error(`Sofascore ${path}: HTTP ${res.status} — ${text.slice(0, 150)}`);
-      return null;
-    }
-    if (!text || text.trim() === '') {
-      console.log(`⚠️ Sofascore ${path}: empty response (HTTP ${res.status})`);
-      return null;
-    }
+    if (!text || text.trim() === '') return retry('empty response');
+
     if (!text.trim().startsWith('{') && !text.trim().startsWith('[')) {
+      // A well-formed non-JSON body is a contract problem, not a blip.
       console.error(`Sofascore ${path}: unexpected body — ${text.slice(0, 150)}`);
       return null;
     }
     try {
       return JSON.parse(text);
     } catch(parseErr) {
-      console.log(`⚠️ Sofascore ${path}: JSON parse error — ${text.slice(0, 150)}`);
-      return null;
+      return retry('JSON parse error');
     }
   } catch(e) {
-    if (e.name === 'AbortError') {
-      console.log(`⚠️ Sofascore ${path}: timeout`);
-    } else {
-      console.error(`Sofascore fetch error (${path}):`, e.message);
-    }
-    return null;
+    if (e.name === 'AbortError') return retry('timeout');
+    return retry(`fetch error: ${e.message}`);
+  } finally {
+    // Previously only cleared on the success path, so a thrown request left a
+    // live 10s timer behind on every failure.
+    clearTimeout(timeout);
   }
 }
 
