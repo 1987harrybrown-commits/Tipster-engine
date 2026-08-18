@@ -2789,10 +2789,25 @@ async function getTodaysTips(limit = 15) {
   // fell outside "today" and never made the card.
   const s = ukDayStart();
   const e = new Date(s.getTime() + 24 * 3600000 - 1);
+
+  // Over-fetch, because the informational picks filtered out below would
+  // otherwise eat into the limit.
   const { data } = await supabase.from('tips').select('*').eq('status','pending')
     .gte('event_time', s.toISOString()).lte('event_time', e.toISOString())
-    .order('confidence', { ascending: false }).limit(limit);
-  return data || [];
+    .order('confidence', { ascending: false }).limit(limit * 3);
+
+  // Every caller of this function builds an email that recommends bets.
+  // applyStrictRules publishes short-price selections with stake 0 and tier
+  // 'insight' — explicitly not bets — but nothing downstream distinguished
+  // them, so one could be emailed as the headline pick. Worse, they are
+  // short-priced and therefore high-confidence, and this list is ordered by
+  // confidence, so an un-staked pick was MORE likely than average to land at
+  // the top and become the Bet of the Day.
+  //
+  // A missing stake counts as staked (defaulting to 1), matching how stakes are
+  // read everywhere else; only an explicit 0 is treated as informational.
+  const staked = (data || []).filter(t => parseFloat(t.stake ?? 1) > 0);
+  return staked.slice(0, limit);
 }
 
 async function getBetOfTheDay() {
