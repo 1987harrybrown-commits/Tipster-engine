@@ -1,5 +1,5 @@
 // ============================================================
-// THE TIPSTER EDGE — Engine v9.8 (Sofascore Edition)
+// THE TIPSTER EDGE — Engine v9.9 (Sofascore Edition)
 // ============================================================
 // Data source:  Sofascore via RapidAPI (single source of truth)
 // Schedule:
@@ -16,6 +16,22 @@
 //   Edge:    H2H ≥ 8% | Overs ≥ 12% | Elite grade requires ≥ 10% (H2H) / 14% (Overs)
 //   Grades:  A+ (2–2.5u) | A (1.5u) | below A = no bet
 //   Line:    Reject if odds moved ≥ 0.10 against; allow if improved
+//
+// v9.9 — DATA INTEGRITY & SECURITY PASS
+//   [FIX] Settler no longer voids already-graded tips during history
+//         backfill. Backfill is now a separate, API-free path that
+//         writes the missing ledger row from the stored result.
+//   [FIX] All results_history reads paginate. PostgREST caps at 1000
+//         rows; past that the old code silently truncated, which made
+//         every older tip look "missing" and mass-voided the ledger.
+//   [FIX] Settlement now pays out at advised_odds (the price published
+//         at tip time), not best_odds (the peak price ever observed).
+//         best_odds is display-only from here on.
+//   [FIX] Win/loss grading verifies the selection against BOTH teams.
+//         A fuzzy-match miss used to silently grade the opposite side.
+//   [FIX] updateStatsCache moved out of the settle loop.
+//   [SEC] /stripe/portal and /verify-pro now require a valid JWT.
+//   [ADD] /admin/resettle route (admin.html has always called it).
 // ============================================================
 
 const { createClient } = require('@supabase/supabase-js');
@@ -28,10 +44,52 @@ const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY || '';
 if (!SUPABASE_SERVICE_KEY) throw new Error('FATAL: SUPABASE_SERVICE_KEY env var is not set');
 const RAPIDAPI_KEY         = process.env.RAPIDAPI_KEY || '';
 if (!RAPIDAPI_KEY) throw new Error('FATAL: RAPIDAPI_KEY env var is not set');
+const ADMIN_KEY            = process.env.ADMIN_KEY || '';
+if (!ADMIN_KEY) throw new Error('FATAL: ADMIN_KEY env var is not set');
 const RAPIDAPI_HOST        = 'sofascore.p.rapidapi.com';
 const SOFASCORE_BASE       = `https://${RAPIDAPI_HOST}`;
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
+
+// Constant-time string compare — avoids leaking secrets via response timing.
+function safeEqual(a, b) {
+  const ba = Buffer.from(String(a || ''), 'utf8');
+  const bb = Buffer.from(String(b || ''), 'utf8');
+  if (ba.length !== bb.length || ba.length === 0) return false;
+  return crypto.timingSafeEqual(ba, bb);
+}
+
+// ─── PAGINATED SELECT ─────────────────────────────────────────
+// PostgREST caps every response at 1000 rows. Any query whose result
+// set can grow past that MUST paginate or it truncates silently — which
+// is how the settler started treating a full ledger as "missing".
+async function selectAll(table, columns, applyFilters = null) {
+  const PAGE = 1000;
+  let out = [], from = 0;
+  for (;;) {
+    let q = supabase.from(table).select(columns).order('id', { ascending: true }).range(from, from + PAGE - 1);
+    if (applyFilters) q = applyFilters(q);
+    const { data, error } = await q;
+    if (error) throw new Error(`selectAll(${table}) failed at offset ${from}: ${error.message}`);
+    if (!data || !data.length) break;
+    out = out.concat(data);
+    if (data.length < PAGE) break;
+    from += PAGE;
+  }
+  return out;
+}
+
+// ─── ADVISED PRICE ────────────────────────────────────────────
+// The single definition of "the price" for a tip: what we advised at
+// publication. Display and settlement MUST read the same number — if the
+// emails quote one price and the ledger settles at another, the published
+// ROI describes bets nobody was actually told to place.
+// Legacy rows (pre-v9.9) have no advised_odds and fall back to `odds`.
+// Returns NaN for unusable input, matching bare parseFloat: callers already
+// guard with Number.isFinite (settlement) or a falsy check (backfill).
+function advisedPrice(tip) {
+  return parseFloat(tip?.advised_odds ?? tip?.odds);
+}
 
 // ─── SOFASCORE TOURNAMENT IDs ─────────────────────────────────
 // These are Sofascore's internal tournament IDs
@@ -1946,7 +2004,11 @@ async function saveTips(tips) {
         continue;
       }
 
-      const { error } = await supabase.from('tips').insert({ ...tip, best_odds: tip.odds });
+      // advised_odds is written once at publication and NEVER updated.
+      // It is the price we told subscribers to take, and the only honest
+      // basis for settlement. `odds` tracks the live price; `best_odds`
+      // tracks the peak seen — neither is what we actually advised.
+      const { error } = await supabase.from('tips').insert({ ...tip, best_odds: tip.odds, advised_odds: tip.odds });
       if (error) { if (error.code === '23505') skipped++; else console.error('Insert error:', error.message); }
       else saved++;
     } catch(e) { console.error('saveTips error:', e.message); }
@@ -2010,41 +2072,178 @@ async function fetchSofascoreResult(eventId) {
   return null;
 }
 
+// ─── RUNNING P/L RENUMBER ─────────────────────────────────────
+// running_pl is a cumulative sum, so it is only meaningful if every row's
+// value equals the sum of all profit_loss up to and including it, in
+// chronological order. Backfilled rows are inserted with a HISTORICAL
+// settled_at, so they land in the middle of the ledger and invalidate every
+// running_pl after them. Recompute the column in (settled_at, id) order.
+// Returns the true cumulative total so the caller can re-seed from it.
+async function recomputeRunningPL() {
+  const rows = await selectAll('results_history', 'id, profit_loss, running_pl, settled_at');
+  rows.sort((a, b) => {
+    const ta = new Date(a.settled_at).getTime();
+    const tb = new Date(b.settled_at).getTime();
+    if (ta !== tb) return ta - tb;
+    return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;   // stable tiebreak on PK
+  });
+
+  let acc = 0, fixed = 0;
+  for (const r of rows) {
+    acc = parseFloat((acc + parseFloat(r.profit_loss || 0)).toFixed(2));
+    if (parseFloat(r.running_pl) === acc) continue;   // NaN on NULL -> always rewrites
+    const { error } = await supabase.from('results_history').update({ running_pl: acc }).eq('id', r.id);
+    if (error) { console.error(`  ❌ running_pl renumber [id ${r.id}]:`, error.message); continue; }
+    fixed++;
+  }
+  if (fixed) console.log(`  🔢 Renumbered running_pl on ${fixed}/${rows.length} ledger rows.`);
+  return { total: rows.length, fixed, final: acc };
+}
+
+// Concurrency guard. The hourly scheduler, the startup run and /admin/resettle
+// all reach this function. Two overlapping runs read the same ledger snapshot,
+// race each other's results_history inserts, and can interleave the running_pl
+// renumber with a concurrent append — corrupting the column the renumber exists
+// to repair.
+let settleInFlight = false;
+
 async function settleResults() {
-  const { data: pendingTips } = await supabase.from('tips').select('*').eq('status','pending').lt('event_time', new Date().toISOString());
+  if (settleInFlight) {
+    console.log('⏸️ Settle already in progress — skipping this run.');
+    return { settled: 0, backfilled: 0, skipped: true };
+  }
+  settleInFlight = true;
+  try { return await settleResultsInner(); }
+  finally { settleInFlight = false; }
+}
 
-  const { data: rhRows } = await supabase.from('results_history').select('tip_ref');
-  const inHistory = new Set((rhRows || []).map(r => r.tip_ref));
+async function settleResultsInner() {
+  const nowIso = new Date().toISOString();
 
-  const { data: missingFromHistory } = await supabase.from('tips')
-    .select('*').in('status', ['won', 'lost']).lt('event_time', new Date().toISOString());
+  // PAGINATED — these feed the settler and the backfill. The tips table grows
+  // without bound, so an unbounded select here hits the same PostgREST 1000-row
+  // cap as the ledger did, and (with no ORDER BY) silently returns an arbitrary
+  // subset — meaning some graded tips would never be backfilled at all.
+  const pendingTips = await selectAll('tips', '*',
+    q => q.eq('status', 'pending').lt('event_time', nowIso));
 
-  const missing = (missingFromHistory || []).filter(t => t.tip_ref && !inHistory.has(t.tip_ref));
-  const pending  = [...(pendingTips || []), ...missing];
+  const rhRows    = await selectAll('results_history', 'tip_ref');
+  const inHistory = new Set(rhRows.map(r => r.tip_ref));
 
-  if (!pending?.length) { console.log('🏁 Nothing to settle.'); return; }
+  const alreadyGraded = await selectAll('tips', '*',
+    q => q.in('status', ['won', 'lost']).lt('event_time', nowIso));
 
-  // Backfill NULL tip_refs
-  for (const t of pending.filter(t => !t.tip_ref)) {
+  // Assign a tip_ref to ANY tip lacking one — graded tips included. tip_ref is
+  // the only key linking a tip to its ledger row, so a graded tip with a NULL
+  // ref cannot be matched against results_history: it was filtered out of the
+  // backfill with no log line and stayed invisible permanently.
+  for (const t of [...pendingTips, ...alreadyGraded].filter(t => !t.tip_ref)) {
     const prefixes = { 'Football':'FB','Basketball':'BB','Ice Hockey':'IH' };
     const ref = `${prefixes[t.sport]||'TT'}-${Date.now().toString(36).toUpperCase().slice(-4)}${Math.random().toString(36).toUpperCase().slice(-4)}`;
-    await supabase.from('tips').update({ tip_ref: ref }).eq('id', t.id);
+    const { error } = await supabase.from('tips').update({ tip_ref: ref }).eq('id', t.id);
+    // Leave t.tip_ref NULL on failure — a ref we did not persist must not be
+    // treated as backfillable, or the ledger row would reference nothing.
+    if (error) { console.error(`  ❌ tip_ref assign [id ${t.id}]:`, error.message); continue; }
     t.tip_ref = ref;
+    if (t.status !== 'pending') console.log(`  🏷️ Assigned ${ref} to graded tip id ${t.id} (was NULL) — now eligible for backfill`);
   }
 
-  console.log(`🏁 Settling ${pending.length} tips...`);
+  // Computed AFTER ref assignment, so graded tips that just received one are
+  // included rather than silently skipped.
+  const missing = alreadyGraded.filter(t => t.tip_ref && !inHistory.has(t.tip_ref));
+  const pending = pendingTips;
+
+  // Same shape on every return path — the caller logs these counts, and
+  // `ok: !!result` on /admin/resettle read a bare return as a failure.
+  if (!pending.length && !missing.length) { console.log('🏁 Nothing to settle.'); return { settled: 0, backfilled: 0 }; }
 
   const { data: lastRow } = await supabase.from('results_history').select('running_pl').order('settled_at', { ascending: false }).limit(1).maybeSingle();
   let currentRunningPL = parseFloat(lastRow?.running_pl || 0);
   const now = Date.now();
-  let count = 0;
+  let count = 0, backfilled = 0, dirty = false;
+
+  // ═══════════════════════════════════════════════════════════
+  // PASS 1 — LEDGER BACKFILL (no API calls, no re-grading)
+  // ═══════════════════════════════════════════════════════════
+  // These tips already carry a verified result. They are NOT candidates
+  // for voiding or re-grading — the only thing missing is the ledger row.
+  // The old code fed them through the main loop, where the >72h staleness
+  // check flipped them to 'void' and permanently erased the result.
+  if (missing.length) {
+    console.log(`🩹 Backfilling ${missing.length} graded tips missing from results_history...`);
+    missing.sort((a, b) => new Date(a.event_time) - new Date(b.event_time));
+
+    for (const tip of missing) {
+      try {
+        const oddsUsed = advisedPrice(tip);
+        const stake    = parseFloat(tip.stake ?? 0);
+        if (!oddsUsed || !stake) {
+          console.log(`  ⚠️ Skipping backfill [${tip.tip_ref}] — missing odds/stake`);
+          continue;
+        }
+
+        let pl = tip.profit_loss;
+        if (pl === null || pl === undefined) {
+          pl = tip.status === 'won'
+            ? parseFloat(((oddsUsed - 1) * stake).toFixed(2))
+            : parseFloat((-stake).toFixed(2));
+          await supabase.from('tips').update({ profit_loss: pl }).eq('tip_ref', tip.tip_ref);
+        }
+        pl = parseFloat(pl);
+
+        currentRunningPL = parseFloat((currentRunningPL + pl).toFixed(2));
+
+        const { error: insErr } = await supabase.from('results_history').insert({
+          tip_ref:     tip.tip_ref,
+          sport:       tip.sport,
+          event:       `${tip.home_team} vs ${tip.away_team}`,
+          selection:   tip.selection,
+          odds:        oddsUsed,
+          stake:       stake,
+          tier:        tip.tier || 'pro',
+          result:      tip.status === 'won' ? 'WON' : 'LOST',
+          profit_loss: pl,
+          // PROVISIONAL — settled_at below is historical, so this row does not
+          // belong at the end of the ledger. recomputeRunningPL() below rewrites
+          // this to the true cumulative value for its chronological position.
+          running_pl:  currentRunningPL,
+          settled_at:  tip.result_updated_at || tip.event_time || nowIso,
+          confidence:  tip.confidence || 0,
+        });
+        if (insErr) {
+          // Unique violation = another cycle got there first; roll back our tally.
+          if (insErr.code === '23505') currentRunningPL = parseFloat((currentRunningPL - pl).toFixed(2));
+          else console.error(`  ❌ Backfill insert [${tip.tip_ref}]:`, insErr.message);
+          continue;
+        }
+        backfilled++; dirty = true;
+        console.log(`  🩹 Restored [${tip.tip_ref}] ${tip.home_team} vs ${tip.away_team} — ${tip.status.toUpperCase()} (${pl >= 0 ? '+' : ''}${pl}u)`);
+      } catch(e) { console.error(`Backfill error [${tip.tip_ref}]:`, e.message); }
+    }
+
+    // Backfilled rows carry historical settled_at values, so they were inserted
+    // into the MIDDLE of the ledger. Rebuild the cumulative column, then re-seed
+    // the tally from the true total — otherwise the next append is computed from
+    // a stale head row and the backfilled P/L is dropped from running_pl forever.
+    if (backfilled) {
+      try {
+        const { final } = await recomputeRunningPL();
+        currentRunningPL = final;
+      } catch(e) { console.error('running_pl renumber failed:', e.message); }
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════════
+  // PASS 2 — GRADE PENDING TIPS
+  // ═══════════════════════════════════════════════════════════
+  if (pending.length) console.log(`🏁 Settling ${pending.length} pending tips...`);
 
   for (const tip of pending) {
     try {
       const hoursOld = (now - new Date(tip.event_time).getTime()) / 3600000;
       if (hoursOld > 72) {
         await supabase.from('tips').update({ status: 'void' }).eq('tip_ref', tip.tip_ref);
-        console.log(`⚪ VOID: [${tip.tip_ref}] ${tip.home_team} vs ${tip.away_team}`);
+        console.log(`⚪ VOID (no result after 72h): [${tip.tip_ref}] ${tip.home_team} vs ${tip.away_team}`);
         continue;
       }
 
@@ -2158,20 +2357,45 @@ async function settleResults() {
 
       if (homeScore === null || awayScore === null) continue;
 
-      let won = false;
-      const sel = tip.selection.toLowerCase();
-      if (sel.includes('win')) {
-        const team = tip.selection.replace(/ win$/i,'').trim();
-        won = nameMatch(team, tip.home_team) ? homeScore > awayScore : awayScore > homeScore;
+      // Grade the selection. Resolve the side against BOTH teams — the old
+      // ternary treated "not a home-name match" as "must be away", so a single
+      // fuzzy-match miss silently graded the opposite team.
+      let won = false, graded = true;
+      const sel = (tip.selection || '').toLowerCase().trim();
+
+      if (/ win$/i.test(tip.selection || '')) {
+        const team   = tip.selection.replace(/ win$/i, '').trim();
+        const isHome = nameMatch(team, tip.home_team);
+        const isAway = nameMatch(team, tip.away_team);
+        if (isHome && !isAway)      won = homeScore > awayScore;
+        else if (isAway && !isHome) won = awayScore > homeScore;
+        else {
+          console.error(`🚨 UNGRADEABLE [${tip.tip_ref}] "${tip.selection}" matches ${isHome && isAway ? 'BOTH' : 'NEITHER'} of "${tip.home_team}" / "${tip.away_team}" — left pending for manual review`);
+          graded = false;
+        }
       } else if (sel === 'draw') {
         won = homeScore === awayScore;
       } else if (sel.startsWith('over')) {
-        won = (homeScore + awayScore) > parseFloat(sel.replace('over ',''));
+        const line = parseFloat(sel.replace('over ', ''));
+        if (Number.isFinite(line)) won = (homeScore + awayScore) > line; else graded = false;
       } else if (sel.startsWith('under')) {
-        won = (homeScore + awayScore) < parseFloat(sel.replace('under ',''));
+        const line = parseFloat(sel.replace('under ', ''));
+        if (Number.isFinite(line)) won = (homeScore + awayScore) < line; else graded = false;
+      } else {
+        console.error(`🚨 UNGRADEABLE [${tip.tip_ref}] unrecognised selection "${tip.selection}"`);
+        graded = false;
       }
+      if (!graded) continue;
 
-      const settlementOdds = parseFloat(tip.best_odds || tip.odds);
+      // Settle at the price we ACTUALLY ADVISED, not the peak price ever seen.
+      // best_odds is the max observed across refreshes; paying wins at the peak
+      // while losing full stake on losers systematically overstates ROI.
+      // Legacy rows (pre-v9.9) have no advised_odds and fall back to `odds`.
+      const settlementOdds = advisedPrice(tip);
+      if (!Number.isFinite(settlementOdds) || settlementOdds <= 1) {
+        console.error(`🚨 [${tip.tip_ref}] invalid settlement odds (${settlementOdds}) — skipping`);
+        continue;
+      }
       const pl = won
         ? parseFloat(((settlementOdds - 1) * tip.stake).toFixed(2))
         : parseFloat((-tip.stake).toFixed(2));
@@ -2203,11 +2427,13 @@ async function settleResults() {
       });
 
       console.log(`${won ? '✅ WON' : '❌ LOST'}: [${tip.tip_ref}] ${tip.home_team} vs ${tip.away_team} — ${tip.selection} @ ${settlementOdds} (${pl >= 0 ? '+' : ''}${pl}u)`);
-      count++;
-      await updateStatsCache();
+      count++; dirty = true;
 
     } catch(e) { console.error(`Settle error [${tip.tip_ref}]:`, e.message); }
   }
+
+  // Recompute stats ONCE, not once per settled tip.
+  if (dirty) await updateStatsCache();
 
   // Settle daily accas
   try {
@@ -2215,8 +2441,11 @@ async function settleResults() {
     for (const acca of (pendingAccas || [])) {
       const tipRefs = (acca.selections || []).map(s => s.tip_ref).filter(Boolean);
       if (!tipRefs.length) continue;
-      const { data: legTips } = await supabase.from('tips').select('tip_ref, status, odds, best_odds').in('tip_ref', tipRefs);
-      if (!legTips || legTips.length < tipRefs.length) continue;
+      const { data: legTips } = await supabase.from('tips').select('tip_ref, status, odds, best_odds, advised_odds').in('tip_ref', tipRefs);
+      if (!legTips || legTips.length < tipRefs.length) {
+        console.warn(`⚠️ Acca ${acca.date}: ${tipRefs.length - (legTips?.length || 0)} leg tip(s) missing from tips table — cannot settle, needs manual review`);
+        continue;
+      }
       const allSettled = legTips.every(t => ['won','lost','void'].includes(t.status));
       if (!allSettled) continue;
       const activeLegs = legTips.filter(t => t.status !== 'void');
@@ -2228,8 +2457,16 @@ async function settleResults() {
       const result = allWon ? 'WON' : 'LOST';
       let pl;
       if (allWon) {
-        const combinedBest = activeLegs.reduce((acc, t) => acc * parseFloat(t.best_odds || t.odds), 1);
-        pl = parseFloat(((combinedBest - 1) * parseFloat(acca.stake || 1)).toFixed(2));
+        // Accas settle at advised_odds for the same reason single tips do.
+        // Using best_odds here compounds the peak-price overstatement across
+        // every leg, and would leave the acca ledger and the single-tip ledger
+        // reporting ROI on two different definitions of "the price".
+        const combinedAdvised = activeLegs.reduce((acc, t) => acc * advisedPrice(t), 1);
+        if (!Number.isFinite(combinedAdvised) || combinedAdvised <= 1) {
+          console.error(`🚨 Acca ${acca.date} has invalid combined odds (${combinedAdvised}) — left pending`);
+          continue;
+        }
+        pl = parseFloat(((combinedAdvised - 1) * parseFloat(acca.stake || 1)).toFixed(2));
       } else {
         pl = parseFloat((-parseFloat(acca.stake || 1)).toFixed(2));
       }
@@ -2238,7 +2475,8 @@ async function settleResults() {
     }
   } catch(e) { console.error('Acca settlement error:', e.message); }
 
-  console.log(`🏁 Settled ${count} tips.`);
+  console.log(`🏁 Settled ${count} tips${backfilled ? `, backfilled ${backfilled}` : ''}.`);
+  return { settled: count, backfilled };
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -2247,8 +2485,10 @@ async function settleResults() {
 
 async function updateStatsCache() {
   try {
-    const { data } = await supabase.from('results_history').select('result, profit_loss, stake');
-    if (!data) return;
+    // PAGINATED — an unbounded select caps at 1000 rows, so published
+    // win rate and ROI would silently be computed from a partial ledger.
+    const data = await selectAll('results_history', 'result, profit_loss, stake');
+    if (!data.length) return;
     const won   = data.filter(r => r.result === 'WON').length;
     const lost  = data.filter(r => r.result === 'LOST').length;
     const total = won + lost;
@@ -2270,7 +2510,7 @@ async function updateStatsCache() {
 // ═══════════════════════════════════════════════════════════════
 
 async function runEngine() {
-  console.log(`\n🚀 Engine v9.8 — ${new Date().toLocaleString('en-GB', { timeZone: 'Europe/London' })}`);
+  console.log(`\n🚀 Engine v9.9 — ${new Date().toLocaleString('en-GB', { timeZone: 'Europe/London' })}`);
   console.log('═'.repeat(52));
 
   // Safety: if cache is empty (engine just started), don't run until morning fetch completes
@@ -2355,6 +2595,24 @@ function buildWelcomeEmail({ userId, firstName }) {
   return emailBase(content, userId);
 }
 
+// Emails lead with the advised price — the number settlement pays out at.
+// When the market has moved since publication, show the live price beside it
+// rather than quoting a figure the reader can no longer get. Rendered ONLY on
+// a real move (>0.01, the same threshold saveTips treats as a change), so an
+// unmoved tip — the common case — stays uncluttered.
+function livePriceNote(tip, { block = false } = {}) {
+  const advised = advisedPrice(tip);
+  const live    = parseFloat(tip?.odds);
+  if (!Number.isFinite(advised) || !Number.isFinite(live)) return '';
+  if (Math.abs(live - advised) <= 0.01) return '';
+  return block
+    ? `<p style="font-family:monospace;font-size:10px;color:#7a8fa6;margin:3px 0 0;">now ${live.toFixed(2)}</p>`
+    : ` <span style="color:#4a5a70;">· now ${live.toFixed(2)}</span>`;
+}
+
+// Stated once per email so the headline number needs no per-tip label.
+const PRICE_FOOTNOTE = '<p style="font-size:10px;color:#4a5a70;margin:18px 0 0;text-align:center;line-height:1.5;">Odds shown are the prices advised at publication — the same prices our published results are settled at.</p>';
+
 function buildProEmail({ tip, allTips, userId, firstName }) {
   const g    = firstName || 'there';
   const edge = parseFloat(tip.model_edge != null ? tip.model_edge : 0).toFixed(1);
@@ -2366,7 +2624,7 @@ function buildProEmail({ tip, allTips, userId, firstName }) {
     return `<tr style="border-top:1px solid #1c2535;"><td style="padding:10px 14px;">
 <p style="font-size:10px;color:#4a5a70;margin:0 0 2px;font-family:monospace;text-transform:uppercase;">${t.sport} · ${t.league} · [${t.tip_ref}]</p>
 <p style="font-size:13px;font-weight:700;color:#dde6f0;margin:0 0 2px;">${t.home_team} vs ${t.away_team}</p>
-<p style="font-size:12px;color:#18e07a;margin:0;">${t.selection} <span style="color:#4a5a70;">@</span> <span style="color:#f0b429;font-family:monospace;">${parseFloat(t.odds).toFixed(2)}</span></p>
+<p style="font-size:12px;color:#18e07a;margin:0;">${t.selection} <span style="color:#4a5a70;">@</span> <span style="color:#f0b429;font-family:monospace;">${advisedPrice(t).toFixed(2)}</span>${livePriceNote(t)}</p>
 </td><td style="padding:10px 14px;text-align:right;white-space:nowrap;">
 <p style="font-family:monospace;font-size:11px;color:${tec};margin:0;">${parseFloat(te)>=0?'+':''}${te}% edge</p>
 <p style="font-family:monospace;font-size:11px;color:#4a5a70;margin:2px 0;">${t.confidence}% conf · ${t.stake}u</p>
@@ -2383,11 +2641,12 @@ function buildProEmail({ tip, allTips, userId, firstName }) {
 <p style="font-size:17px;font-weight:800;color:#dde6f0;margin:0 0 2px;">${tip.home_team} vs ${tip.away_team}</p>
 <p style="font-size:14px;color:#18e07a;margin:0;">${tip.selection}</p>
 </td><td style="padding:14px 16px;text-align:right;">
-<p style="font-family:monospace;font-size:26px;font-weight:700;color:#f0b429;margin:0;line-height:1;">${parseFloat(tip.odds).toFixed(2)}</p>
+<p style="font-family:monospace;font-size:26px;font-weight:700;color:#f0b429;margin:0;line-height:1;">${advisedPrice(tip).toFixed(2)}</p>
+${livePriceNote(tip, { block: true })}
 <p style="font-family:monospace;font-size:10px;color:${ec};margin:4px 0 0;">${es} edge · ${tip.stake}u stake</p>
 </td></tr></table>
 ${extras ? `<table width="100%" cellpadding="0" cellspacing="0" style="background:#0c0f15;border:1px solid #1c2535;border-radius:7px;margin-bottom:20px;">${extras}</table>` : ''}
-<div style="text-align:center;"><a href="${SITE_URL}/#tips" style="display:inline-block;background:#f0b429;color:#07090d;font-size:13px;font-weight:700;padding:12px 28px;border-radius:5px;text-decoration:none;">View Full Card</a></div>`;
+<div style="text-align:center;"><a href="${SITE_URL}/#tips" style="display:inline-block;background:#f0b429;color:#07090d;font-size:13px;font-weight:700;padding:12px 28px;border-radius:5px;text-decoration:none;">View Full Card</a></div>${PRICE_FOOTNOTE}`;
   return emailBase(content, userId);
 }
 
@@ -2406,7 +2665,8 @@ function buildFreeEmail({ tip, proTipCount, userId, firstName }) {
 <p style="font-size:17px;font-weight:800;color:#dde6f0;margin:0 0 2px;">${tip.home_team} vs ${tip.away_team}</p>
 <p style="font-size:14px;color:#18e07a;margin:0;">${tip.selection}</p>
 </td><td style="padding:14px 16px;text-align:right;">
-<p style="font-family:monospace;font-size:26px;font-weight:700;color:#f0b429;margin:0;line-height:1;">${parseFloat(tip.odds).toFixed(2)}</p>
+<p style="font-family:monospace;font-size:26px;font-weight:700;color:#f0b429;margin:0;line-height:1;">${advisedPrice(tip).toFixed(2)}</p>
+${livePriceNote(tip, { block: true })}
 <p style="font-family:monospace;font-size:10px;color:${ec};margin:4px 0 0;">${es} edge</p>
 </td></tr></table>
 <table width="100%" cellpadding="0" cellspacing="0" style="background:#0c0f15;border:1px solid rgba(240,180,41,0.25);border-radius:7px;margin-bottom:20px;">
@@ -2414,7 +2674,7 @@ function buildFreeEmail({ tip, proTipCount, userId, firstName }) {
 <p style="font-family:monospace;font-size:9px;text-transform:uppercase;letter-spacing:2px;color:#f0b429;margin:0 0 8px;">Pro members got ${proTipCount} more tips at 07:00</p>
 <a href="${SITE_URL}/#pricing" style="display:inline-block;background:#f0b429;color:#07090d;font-size:12px;font-weight:700;padding:9px 20px;border-radius:4px;text-decoration:none;">Go Pro — £9.99/mo</a>
 </td></tr></table>
-<div style="text-align:center;"><a href="${SITE_URL}/#tips" style="display:inline-block;background:#18e07a;color:#07090d;font-size:13px;font-weight:700;padding:12px 28px;border-radius:5px;text-decoration:none;">View Today's Tips</a></div>`;
+<div style="text-align:center;"><a href="${SITE_URL}/#tips" style="display:inline-block;background:#18e07a;color:#07090d;font-size:13px;font-weight:700;padding:12px 28px;border-radius:5px;text-decoration:none;">View Today's Tips</a></div>${PRICE_FOOTNOTE}`;
   return emailBase(content, userId);
 }
 
@@ -2467,7 +2727,7 @@ async function getSaturdayAcca() {
     .gte('event_time', s.toISOString()).lte('event_time', e.toISOString())
     .gte('confidence', 72).order('confidence', { ascending: false }).limit(4);
   if (!tips || tips.length < 3) return null;
-  const sels = tips.map(t => ({ match: `${t.home_team} vs ${t.away_team}`, selection: t.selection, odds: t.odds }));
+  const sels = tips.map(t => ({ match: `${t.home_team} vs ${t.away_team}`, selection: t.selection, odds: advisedPrice(t) }));
   return { selections: sels, combinedOdds: sels.reduce((a,s) => a * parseFloat(s.odds), 1), reasoning: `${sels.length} high-confidence selections from today's card.` };
 }
 
@@ -2587,8 +2847,9 @@ async function generateDailyAcca() {
     const sportCounts = legs.reduce((acc, t) => { acc[t.sport] = (acc[t.sport] || 0) + 1; return acc; }, {});
     const dominantSport = Object.entries(sportCounts).sort((a, b) => b[1] - a[1])[0][0];
     const sportLabel = Object.keys(sportCounts).length > 1 ? 'Mixed' : dominantSport;
-    const combinedOdds = parseFloat(legs.reduce((acc, t) => acc * parseFloat(t.odds), 1).toFixed(4));
-    const selections = legs.map(t => ({ match: `${t.home_team} vs ${t.away_team}`, selection: t.selection, odds: t.odds, tip_ref: t.tip_ref, confidence: t.confidence }));
+    // Built from advised prices so the quoted acca matches what settlement pays.
+    const combinedOdds = parseFloat(legs.reduce((acc, t) => acc * advisedPrice(t), 1).toFixed(4));
+    const selections = legs.map(t => ({ match: `${t.home_team} vs ${t.away_team}`, selection: t.selection, odds: advisedPrice(t), tip_ref: t.tip_ref, confidence: t.confidence }));
     const { error } = await supabase.from('daily_accas').insert({ date: today, sport: sportLabel, legs: legs.length, selections, combined_odds: combinedOdds, stake: 1, result: 'pending', profit_loss: null });
     if (error) return { generated: false, error: error.message };
     console.log(`📋 Daily acca: ${legs.length} legs @ ${combinedOdds}`);
@@ -2658,7 +2919,7 @@ function verifyStripeWebhook(payload, sig) {
     const ts   = parts.find(p => p.startsWith('t=')).split('=')[1];
     const wsig = parts.find(p => p.startsWith('v1=')).split('=').slice(1).join('=');
     const exp  = crypto.createHmac('sha256', STRIPE_WEBHOOK_SECRET).update(`${ts}.${payload}`,'utf8').digest('hex');
-    if (exp !== wsig || Math.abs(Date.now()/1000 - parseInt(ts)) > 300) return null;
+    if (!safeEqual(exp, wsig) || Math.abs(Date.now()/1000 - parseInt(ts)) > 300) return null;
     return JSON.parse(payload);
   } catch(e) { return null; }
 }
@@ -2753,7 +3014,7 @@ function startScheduler() {
 
   }, 60 * 1000);
 
-  setInterval(settleResults, 60 * 60 * 1000);
+  setInterval(() => settleResults().catch(e => console.error('Scheduled settle error:', e.message)), 60 * 60 * 1000);
 
   console.log('⏰ Scheduler active:');
   console.log('   06:00 UK — Morning data fetch (fixtures + odds + form + injuries + H2H)');
@@ -2790,6 +3051,38 @@ function isRateLimited(ip) {
   return entry.count > RATE_LIMIT;
 }
 
+// Resolve the caller from their Supabase JWT. Returns null if unauthenticated.
+// Any endpoint acting on a specific user's data MUST go through this rather
+// than trusting an ID supplied in the request body.
+async function authedUser(req) {
+  const header = req.headers['authorization'] || '';
+  if (!header.startsWith('Bearer ')) return null;
+  const token = header.slice(7).trim();
+  if (!token) return null;
+  try {
+    const { data, error } = await supabase.auth.getUser(token);
+    if (error || !data?.user) return null;
+    return data.user;
+  } catch(e) { return null; }
+}
+
+// Read a request body with a hard size cap. Returns a Buffer so multibyte
+// UTF-8 split across chunk boundaries is not corrupted (which would break
+// Stripe signature verification non-deterministically).
+function readBody(req, maxBytes = 1048576) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let size = 0;
+    req.on('data', c => {
+      size += c.length;
+      if (size > maxBytes) { reject(new Error('Body too large')); req.destroy(); return; }
+      chunks.push(c);
+    });
+    req.on('end', () => resolve(Buffer.concat(chunks)));
+    req.on('error', reject);
+  });
+}
+
 http.createServer(async (req, res) => {
   const url    = new URL(req.url, 'http://localhost');
   const origin = req.headers['origin'] || '';
@@ -2804,56 +3097,75 @@ http.createServer(async (req, res) => {
 
   if (url.pathname === '/') {
     res.writeHead(200, { ...cors, 'Content-Type': 'text/plain' });
-    res.end(`The Tipster Engine v8 | Cache: ${sofascoreCache.fetchedDate || 'not fetched'} | API calls today: ${rapidApiCallCount}`);
+    res.end(`The Tipster Engine v9.9 | Cache: ${sofascoreCache.fetchedDate || 'not fetched'} | API calls today: ${rapidApiCallCount}`);
     return;
   }
 
   const adminKey = (req.headers['authorization'] || '').replace('Bearer ', '').trim();
 
   if (url.pathname === '/admin/morning-fetch') {
-    if (adminKey !== process.env.ADMIN_KEY) { res.writeHead(403); res.end('Forbidden'); return; }
+    if (!safeEqual(adminKey, ADMIN_KEY)) { res.writeHead(403); res.end('Forbidden'); return; }
     morningFetch().catch(e => console.error('Manual morning fetch error:', e.message));
     res.writeHead(200, { ...cors, 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ started: true })); return;
   }
 
   if (url.pathname === '/admin/midday-refresh') {
-    if (adminKey !== process.env.ADMIN_KEY) { res.writeHead(403); res.end('Forbidden'); return; }
+    if (!safeEqual(adminKey, ADMIN_KEY)) { res.writeHead(403); res.end('Forbidden'); return; }
     middayOddsRefresh().catch(e => console.error('Manual midday refresh error:', e.message));
     res.writeHead(200, { ...cors, 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ started: true })); return;
   }
 
   if (url.pathname === '/admin/generate-acca') {
-    if (adminKey !== process.env.ADMIN_KEY) { res.writeHead(403); res.end('Forbidden'); return; }
+    if (!safeEqual(adminKey, ADMIN_KEY)) { res.writeHead(403); res.end('Forbidden'); return; }
     const result = await generateDailyAcca();
     res.writeHead(200, { ...cors, 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ started: true, ...result })); return;
   }
 
   if (url.pathname === '/admin/test-email') {
-    if (adminKey !== process.env.ADMIN_KEY) { res.writeHead(403); res.end('Forbidden'); return; }
+    if (!safeEqual(adminKey, ADMIN_KEY)) { res.writeHead(403); res.end('Forbidden'); return; }
     const r = await sendTestEmail(url.searchParams.get('to'), url.searchParams.get('type')||'daily');
     res.writeHead(200, { ...cors, 'Content-Type': 'application/json' });
     res.end(JSON.stringify(r)); return;
   }
 
   if (url.pathname === '/admin/send-daily') {
-    if (adminKey !== process.env.ADMIN_KEY) { res.writeHead(403); res.end('Forbidden'); return; }
+    if (!safeEqual(adminKey, ADMIN_KEY)) { res.writeHead(403); res.end('Forbidden'); return; }
     sendDailyEmails();
     res.writeHead(200, { ...cors, 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ started: true })); return;
   }
 
   if (url.pathname === '/admin/send-saturday') {
-    if (adminKey !== process.env.ADMIN_KEY) { res.writeHead(403); res.end('Forbidden'); return; }
+    if (!safeEqual(adminKey, ADMIN_KEY)) { res.writeHead(403); res.end('Forbidden'); return; }
     sendSaturdayEmails();
     res.writeHead(200, { ...cors, 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ started: true })); return;
   }
 
+  if (url.pathname === '/admin/resettle') {
+    if (!safeEqual(adminKey, ADMIN_KEY)) { res.writeHead(403); res.end('Forbidden'); return; }
+    // Runs the settler on demand: grades anything pending and repairs any
+    // graded tip missing its results_history row. A full settle can run for
+    // minutes behind the Sofascore fallbacks, so it is dispatched in the
+    // background — awaiting it here hits the platform request timeout and
+    // reports a failure for a job that actually succeeded. Counts go to the
+    // logs, matching how the other long-running admin routes behave.
+    if (settleInFlight) {
+      res.writeHead(409, { ...cors, 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Settle already in progress' })); return;
+    }
+    settleResults()
+      .then(r => console.log(`🔁 Manual resettle finished — settled ${r.settled}, backfilled ${r.backfilled}.`))
+      .catch(e => console.error('Manual resettle error:', e.message));
+    res.writeHead(200, { ...cors, 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ started: true })); return;
+  }
+
   if (url.pathname === '/admin/cache-status') {
-    if (adminKey !== process.env.ADMIN_KEY) { res.writeHead(403); res.end('Forbidden'); return; }
+    if (!safeEqual(adminKey, ADMIN_KEY)) { res.writeHead(403); res.end('Forbidden'); return; }
     const status = {};
     for (const sport of SPORTS) {
       status[sport.league] = (sofascoreCache.events[sport.key] || []).length;
@@ -2908,12 +3220,14 @@ http.createServer(async (req, res) => {
   }
 
   if (url.pathname === '/verify-pro' && req.method === 'POST') {
-    let body = '';
-    req.on('data', c => { body += c.toString(); });
-    req.on('end', async () => {
+    (async () => {
       try {
-        const { userId } = JSON.parse(body);
-        if (!userId) { res.writeHead(400, cors); res.end('Missing userId'); return; }
+        // The caller's identity comes from their JWT, never from the body.
+        // Previously any unauthenticated request could probe — and downgrade —
+        // an arbitrary account by guessing its user id.
+        const caller = await authedUser(req);
+        if (!caller) { res.writeHead(401, { ...cors, 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'Unauthorized' })); return; }
+        const userId = caller.id;
         const { data: user } = await supabase.from('users').select('stripe_customer_id, stripe_subscription_id, subscription_status').eq('id', userId).single();
         if (!user?.stripe_subscription_id) { res.writeHead(200, { ...cors, 'Content-Type': 'application/json' }); res.end(JSON.stringify({ isPro: false })); return; }
         const sub = await stripeRequest(`/subscriptions/${user.stripe_subscription_id}`);
@@ -2922,14 +3236,17 @@ http.createServer(async (req, res) => {
         res.writeHead(200, { ...cors, 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ isPro: !!isPro }));
       } catch(e) { res.writeHead(500, cors); res.end(JSON.stringify({ error: 'Internal error' })); }
-    });
+    })();
     return;
   }
 
   if (url.pathname === '/stripe/webhook' && req.method === 'POST') {
-    let body = '';
-    req.on('data', c => { body += c.toString(); });
-    req.on('end', async () => {
+    (async () => {
+      let raw;
+      try { raw = await readBody(req); }
+      catch(e) { res.writeHead(413); res.end('Payload too large'); return; }
+      // Verify against the exact bytes received — re-encoding breaks the HMAC.
+      const body = raw.toString('utf8');
       const sig = req.headers['stripe-signature'];
       if (!sig) { res.writeHead(400); res.end('Missing signature'); return; }
       const event = verifyStripeWebhook(body, sig);
@@ -2937,23 +3254,24 @@ http.createServer(async (req, res) => {
       res.writeHead(200, { ...cors, 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ received: true }));
       handleStripeWebhook(event).catch(e => console.error('Webhook error:', e.message));
-    });
+    })();
     return;
   }
 
   if (url.pathname === '/stripe/checkout' && req.method === 'POST') {
-    let body = '';
-    req.on('data', c => { body += c.toString(); });
-    req.on('end', async () => {
+    (async () => {
       try {
-        const { userId, email, plan } = JSON.parse(body);
+        let raw;
+        try { raw = await readBody(req, 16384); }
+        catch(e) { res.writeHead(413, cors); res.end('Payload too large'); return; }
+        const { userId, email, plan } = JSON.parse(raw.toString('utf8'));
         if (!userId || !email || !plan) { res.writeHead(400, cors); res.end('Missing params'); return; }
         const session = await createCheckoutSession(userId, email, plan === 'annual' ? STRIPE_PRICE_ANNUAL : STRIPE_PRICE_MONTHLY, plan);
         if (!session) { res.writeHead(500, { ...cors, 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'Failed' })); return; }
         res.writeHead(200, { ...cors, 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ url: session.url }));
       } catch(e) { res.writeHead(500, cors); res.end('Server error'); }
-    });
+    })();
     return;
   }
 
@@ -2963,17 +3281,24 @@ http.createServer(async (req, res) => {
   }
 
   if (url.pathname === '/stripe/portal' && req.method === 'POST') {
-    let body = '';
-    req.on('data', c => { body += c.toString(); });
-    req.on('end', async () => {
+    (async () => {
       try {
-        const { customerId } = JSON.parse(body);
-        const session = await stripeRequest('/billing_portal/sessions', 'POST', { customer: customerId, return_url: 'https://thetipsteredge.com/account.html' });
-        if (!session) { res.writeHead(500, cors); res.end('Failed'); return; }
+        // The customer id is resolved from the authenticated user's own row.
+        // It is NEVER taken from the request body: customer ids are not secret
+        // and the old code handed a billing portal session — invoices, card
+        // details, cancellation — to anyone who could supply one.
+        const caller = await authedUser(req);
+        if (!caller) { res.writeHead(401, { ...cors, 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'Unauthorized' })); return; }
+
+        const { data: user } = await supabase.from('users').select('stripe_customer_id').eq('id', caller.id).single();
+        if (!user?.stripe_customer_id) { res.writeHead(404, { ...cors, 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'No billing account' })); return; }
+
+        const session = await stripeRequest('/billing_portal/sessions', 'POST', { customer: user.stripe_customer_id, return_url: 'https://thetipsteredge.com/account.html' });
+        if (!session) { res.writeHead(502, { ...cors, 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'Failed' })); return; }
         res.writeHead(200, { ...cors, 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ url: session.url }));
-      } catch(e) { res.writeHead(500, cors); res.end('Server error'); }
-    });
+      } catch(e) { res.writeHead(500, { ...cors, 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'Server error' })); }
+    })();
     return;
   }
 
@@ -2988,14 +3313,14 @@ http.createServer(async (req, res) => {
 // ═══════════════════════════════════════════════════════════════
 
 (async () => {
-  console.log(`\n🟢 The Tipster Engine v9.8 starting...`);
+  console.log(`\n🟢 The Tipster Engine v9.9 starting...`);
   console.log(`   Season: ${currentSeason()}/${currentSeason()+1}`);
   console.log(`   Data source: Sofascore (RapidAPI Pro)`);
   console.log(`   Schedule: Morning fetch 06:00 | Midday refresh 13:00 | Tips every 15min`);
 
   // On startup, run morning fetch immediately to populate cache
   await morningFetch();
-  await settleResults();
+  await settleResults().catch(e => console.error('Startup settle error:', e.message));
 
   // Start 15-min tip generation cycle
   setInterval(runEngine, 15 * 60 * 1000);
