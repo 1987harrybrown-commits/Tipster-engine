@@ -3360,6 +3360,53 @@ http.createServer(async (req, res) => {
     }
   }
 
+  // Nothing in either codebase creates the users row. Signup calls
+  // supabase.auth.signUp, which writes to auth.users, and the public.users row
+  // is assumed to appear via a database trigger. If that trigger is absent — or
+  // ever fails — the subscriber has an auth record and no profile: getSubscribers
+  // never sees them, so they get no emails, and subscription_status has nowhere
+  // to live, so they can never resolve as Pro even after paying.
+  //
+  // This closes that by construction rather than by assumption. It runs with the
+  // service role, so it works whatever the RLS policy is, and it is idempotent —
+  // harmless if a trigger already created the row.
+  if (url.pathname === '/ensure-profile' && req.method === 'POST') {
+    (async () => {
+      try {
+        const caller = await authedUser(req);
+        if (!caller) { res.writeHead(401, { ...cors, 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'Unauthorized' })); return; }
+
+        const { data: existing } = await supabase.from('users').select('id').eq('id', caller.id).maybeSingle();
+        if (existing) {
+          res.writeHead(200, { ...cors, 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true, created: false })); return;
+        }
+
+        const { error } = await supabase.from('users').insert({
+          id:                  caller.id,
+          email:               caller.email,
+          first_name:          caller.user_metadata?.first_name || null,
+          subscription_status: 'free',
+          email_opt_in:        true,
+        });
+        // 23505 means a trigger won the race — the row exists, which is the goal.
+        if (error && error.code !== '23505') {
+          console.error('ensure-profile insert failed:', error.message);
+          res.writeHead(500, { ...cors, 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'Could not create profile' })); return;
+        }
+        if (!error) console.log(`👤 Created missing profile row for ${caller.email}`);
+        res.writeHead(200, { ...cors, 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, created: !error }));
+      } catch(e) {
+        console.error('ensure-profile error:', e.message);
+        res.writeHead(500, { ...cors, 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Server error' }));
+      }
+    })();
+    return;
+  }
+
   if (url.pathname === '/verify-pro' && req.method === 'POST') {
     (async () => {
       try {
