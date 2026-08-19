@@ -1404,6 +1404,7 @@ function extractMarketData(event) {
   const books1x2  = [];
   const books2way = [];
   let bestOver25 = 0, bestOver25Book = '';
+  let bestOver25True = 0;   // de-vigged P(Over) from the same book
 
   for (const book of (event.bookmakers || [])) {
     const h2h = book.markets?.find(m => m.key === 'h2h');
@@ -1431,12 +1432,25 @@ function extractMarketData(event) {
         books2way.push({ title: book.title, home: bHome, away: bAway });
       }
     }
+    // Totals. The Over price alone is not enough: every other market here is
+    // de-vigged against the rest of its own book's line, and the Over was not,
+    // so its "true implied" carried the bookmaker's margin while the moneyline
+    // markets did not. The published edge then meant two different things
+    // depending on the market.
+    //
+    // The Under is already in the feed — the parser only emits a totals market
+    // when both sides are present — it was simply never read. De-vig against
+    // the SAME book, which is the only pairing that yields a real overround.
     const totals = book.markets?.find(m => m.key === 'totals');
     if (totals) {
-      for (const o of totals.outcomes) {
-        if (o.name === 'Over' && (o.price || 0) > bestOver25) {
-          bestOver25 = o.price; bestOver25Book = book.title;
-        }
+      const over  = totals.outcomes.find(o => o.name === 'Over'  && (o.price || 0) > 0);
+      const under = totals.outcomes.find(o => o.name === 'Under' && (o.price || 0) > 0);
+      if (over && over.price > bestOver25) {
+        bestOver25 = over.price;
+        bestOver25Book = book.title;
+        bestOver25True = under
+          ? (1 / over.price) / ((1 / over.price) + (1 / under.price))
+          : 0;   // no Under from this book — cannot de-vig, so do not price it
       }
     }
   }
@@ -1451,6 +1465,7 @@ function extractMarketData(event) {
       trueAway:   (1/b.away) / totalIP,
       homeOdds:   b.home, drawOdds: b.draw, awayOdds: b.away,
       over25Odds: bestOver25,
+      over25True: bestOver25True,
       homeBook:   b.title, drawBook: b.title, awayBook: b.title, over25Book: bestOver25Book,
       bookCount:  books1x2.length,
       avgMargin:  parseFloat(((totalIP - 1) * 100).toFixed(2)),
@@ -1468,6 +1483,7 @@ function extractMarketData(event) {
       trueAway:   (1/b.away) / totalIP,
       homeOdds:   b.home, drawOdds: 0, awayOdds: b.away,
       over25Odds: bestOver25,
+      over25True: bestOver25True,
       homeBook:   b.title, drawBook: '', awayBook: b.title, over25Book: bestOver25Book,
       bookCount:  books2way.length,
       avgMargin:  parseFloat(((totalIP - 1) * 100).toFixed(2)),
@@ -1651,8 +1667,14 @@ async function analyseFootballFixture(event, sport) {
 
     const dataQuality = Math.min(homeMod.dataQuality, awayMod.dataQuality);
     const modMatrix = buildScoreMatrix(lHmod, lAmod);
-    const { homeWin, draw, awayWin, over25 } = calcOutcomes(modMatrix);
-    const over25IP = market.over25Odds > 0 ? 1 / market.over25Odds : 0;
+    const { homeWin, draw, awayWin } = calcOutcomes(modMatrix);
+    // No over-2.5 candidate is built for football. calcOutcomes still returns
+    // the probability and the market still carries the price, so finishing that
+    // market is a matter of adding a candidate here — but publishing a new
+    // market changes what subscribers are advised to bet, so it is left as a
+    // decision rather than switched on. The unused locals that used to sit here
+    // read as though the market were live.
+    
     const contextNote = `Form H:${homeMod.notes} | A:${awayMod.notes}`;
 
     const candidates = [];
@@ -1855,8 +1877,16 @@ async function analyseNHLFixture(event, sport) {
       if (conf >= NHL_MIN_CONFIDENCE && falseEdgeCheck(c, market)) candidates.push(c);
     }
 
-    if (market.over25Odds >= INSIGHT_ODDS_MIN && market.over25Odds <= ODDS_ELITE_MAX) {
-      const over55IP = 1 / market.over25Odds;
+    // over25True is the de-vigged P(Over) from the same book as the price.
+    // It was 1 / over25Odds — the raw implied probability, margin included —
+    // while every other market here was de-vigged. That understated the edge on
+    // this market and made the published "+x% edge" incomparable between an
+    // Over 5.5 tip and a moneyline tip, even though both are shown as one
+    // number in the email and on the site. A line with no Under price cannot be
+    // de-vigged, and is skipped rather than priced off a vigged number.
+    if (market.over25Odds >= INSIGHT_ODDS_MIN && market.over25Odds <= ODDS_ELITE_MAX
+        && market.over25True > 0) {
+      const over55IP = market.over25True;
       const edge = calcEdge(over55, over55IP);
       const conf  = confidenceFromSignals({ modelProb: over55, dataQualityTier, sport: 'Ice Hockey', gamesPlayed: Math.min(homeStats.gamesPlayed, awayStats.gamesPlayed) });
       const stake = kellyStake(over55, market.over25Odds);
