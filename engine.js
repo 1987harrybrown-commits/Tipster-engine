@@ -3164,8 +3164,40 @@ async function getSaturdayAcca() {
   return { selections: sels, combinedOdds: sels.reduce((a,s) => a * parseFloat(s.odds), 1), reasoning: `${sels.length} high-confidence selections from today's card.` };
 }
 
+// Has a dispatch of this type already gone out today?
+//
+// The scheduler's per-day guards live in `lastRun`, which is in memory, so
+// they are lost on restart. Render restarts on every deploy, on
+// a crash, and when a sleeping instance wakes. A restart landing inside the
+// five-minute window a job fires in therefore re-runs it — and for the 07:00
+// Pro dispatch that means every paying subscriber receives the card twice.
+//
+// email_log already records a row per send with its type, so it can answer
+// this without new schema. Returns null when the question cannot be answered,
+// and the caller falls back to the in-memory guard: a database blip should not
+// turn "probably already sent" into a missed day for a paid product.
+async function alreadyDispatchedToday(type) {
+  try {
+    const { data, error } = await supabase.from('email_log')
+      .select('id')
+      .eq('type', type)
+      .eq('status', 'sent')
+      .gte('sent_at', ukDayStart().toISOString())
+      .limit(1);
+    if (error) { console.error(`alreadyDispatchedToday(${type}):`, error.message); return null; }
+    return !!(data && data.length);
+  } catch (e) {
+    console.error(`alreadyDispatchedToday(${type}):`, e.message);
+    return null;
+  }
+}
+
 async function sendProEmails() {
   console.log('📧 Pro dispatch 07:00...');
+  if (await alreadyDispatchedToday('pro_daily')) {
+    console.log('📧 Pro dispatch already sent today — skipping (restart inside the send window)');
+    return;
+  }
   const tips = await getTodaysTips(15);
   if (!tips.length) return;
   const subs = await getSubscribers('daily', 'pro');
@@ -3179,6 +3211,10 @@ async function sendProEmails() {
 
 async function sendDailyEmails() {
   console.log('📧 Free dispatch 08:30...');
+  if (await alreadyDispatchedToday('daily')) {
+    console.log('📧 Free dispatch already sent today — skipping (restart inside the send window)');
+    return;
+  }
   const tip = await getBetOfTheDay();
   if (!tip) return;
   const all  = await getTodaysTips(15);
@@ -3193,6 +3229,10 @@ async function sendDailyEmails() {
 
 async function sendSaturdayEmails() {
   console.log('📧 Saturday acca dispatch...');
+  if (await alreadyDispatchedToday('saturday')) {
+    console.log('📧 Saturday dispatch already sent today — skipping (restart inside the send window)');
+    return;
+  }
   const acca = await getSaturdayAcca();
   if (!acca) return;
   const subs = await getSubscribers('saturday');
@@ -3546,10 +3586,35 @@ async function handleStripeWebhook(event) {
 // SCHEDULER
 // ═══════════════════════════════════════════════════════════════
 
-let lastProDate = '', lastFreeDate = '', lastSatDate = '', lastMorningDate = '', lastMiddayDate = '', lastEveningDate = '';
+// One entry per scheduled job, keyed by the UK date it last ran on.
+//
+// These were six separate variables, each assigned immediately before its
+// await. Taking the guard first is right — a five-minute window is five ticks,
+// and without it the job would start five times. But nothing released the
+// guard when the work threw, so a single transient failure cost the whole day
+// silently, and the rejection escaped the interval callback entirely because
+// nothing awaited it.
+const lastRun = {};
+
+// Runs fn at most once per UK day. Takes the guard before the work so
+// overlapping ticks cannot start it again, and releases it if the work throws,
+// so the rest of the window is available to retry rather than the day being
+// written off.
+async function runDaily(name, today, fn) {
+  if (lastRun[name] === today) return;
+  lastRun[name] = today;
+  try {
+    await fn();
+  } catch (e) {
+    lastRun[name] = '';
+    console.error(`❌ Scheduled job "${name}" failed:`, e.message,
+                  '— guard released, will retry while the window is open');
+  }
+}
 
 function startScheduler() {
   setInterval(async () => {
+    try {
     const uk    = ukTime();
     const h     = uk.getHours();
     const m     = uk.getMinutes();
@@ -3557,49 +3622,48 @@ function startScheduler() {
     const isSat = uk.getDay() === 6;
 
     // Morning fetch: 06:00 UK — full data pull
-    if (h === 6 && m < 5 && lastMorningDate !== today) {
-      lastMorningDate = today;
+    if (h === 6 && m < 5) await runDaily('morning', today, async () => {
       await morningFetch();
       await tagDailyBestBet();
-    }
+    });
 
     // Pro emails + acca: 07:00
-    if (h === 7 && m < 5 && lastProDate !== today) {
-      lastProDate = today;
+    if (h === 7 && m < 5) await runDaily('pro', today, async () => {
       await tagDailyBestBet();
       await sendProEmails();
       await generateDailyAcca();
-    }
+    });
 
     // Free emails: 08:30
-    if (h === 8 && m >= 30 && m < 35 && lastFreeDate !== today) {
-      lastFreeDate = today;
+    if (h === 8 && m >= 30 && m < 35) await runDaily('free', today, async () => {
       await sendDailyEmails();
-    }
+    });
 
     // Saturday acca: 08:00 Sat
-    if (isSat && h === 8 && m < 5 && lastSatDate !== today) {
-      lastSatDate = today;
+    if (isSat && h === 8 && m < 5) await runDaily('saturday', today, async () => {
       await sendSaturdayEmails();
-    }
+    });
 
     // Midday odds refresh: 13:00
-    if (h === 13 && m < 5 && lastMiddayDate !== today) {
-      lastMiddayDate = today;
+    if (h === 13 && m < 5) await runDaily('midday', today, async () => {
       await middayOddsRefresh();
-    }
+    });
 
     // Evening goalie + lineup refresh: 21:00 UK
     // NHL starters confirmed ~4pm ET = 9pm UK, football lineups confirmed ~1-2hr pre-kickoff
-    if (h === 21 && m < 5 && lastEveningDate !== today) {
-      lastEveningDate = today;
+    if (h === 21 && m < 5) await runDaily('evening', today, async () => {
       console.log('🥅 Evening goalie + lineup refresh...');
       Object.keys(nhlGoalieCache).forEach(k => delete nhlGoalieCache[k]);
       nhlGoalieCacheDate = '';
       await fetchNHLGoalieData();
       await fetchLineupsForToday();
-    }
+    });
 
+    } catch (e) {
+      // Nothing awaits this callback, so anything escaping it becomes an
+      // unhandled rejection rather than a logged fault.
+      console.error('Scheduler tick failed:', e.message);
+    }
   }, 60 * 1000);
 
   setInterval(() => settleResults().catch(e => console.error('Scheduled settle error:', e.message)), 60 * 60 * 1000);
