@@ -3380,8 +3380,25 @@ function readBody(req, maxBytes = 1048576) {
   });
 }
 
-http.createServer(async (req, res) => {
-  const url    = new URL(req.url, 'http://localhost');
+// The request handler is deliberately a SYNCHRONOUS function wrapping an async
+// IIFE with a .catch. It used to be `async (req, res) => {...}` directly, which
+// meant any throw inside it became an unhandled promise rejection — and Node
+// terminates the process on those by default.
+//
+// That was not theoretical. `new URL('//', ...)` throws TypeError: Invalid URL,
+// and it was the first statement in the handler, so `GET //` killed the engine
+// outright. An unauthenticated one-line request took the whole service down,
+// and every restart re-ran morningFetch and spent RapidAPI quota.
+http.createServer((req, res) => { (async () => {
+  // A malformed path is a client error, not a server fault.
+  let url;
+  try {
+    url = new URL(req.url, 'http://localhost');
+  } catch (e) {
+    res.writeHead(400, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'Malformed request URL' }));
+    return;
+  }
   const origin = req.headers['origin'] || '';
   const allowedOrigins = ['https://www.thetipsteredge.com', 'https://thetipsteredge.com', 'https://the-tipster.vercel.app'];
   const allowOrigin = allowedOrigins.includes(origin) ? origin : allowedOrigins[0];
@@ -3684,7 +3701,20 @@ http.createServer(async (req, res) => {
 
   res.writeHead(404); res.end('Not found');
 
-}).listen(process.env.PORT || 3000, () => {
+})().catch(e => {
+  // Anything that escapes a route's own error handling lands here instead of
+  // taking the process down. Reply if we still can, so the client gets an
+  // answer rather than a reset connection.
+  console.error('Unhandled request error:', e && e.message);
+  try {
+    if (!res.headersSent) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Server error' }));
+    } else {
+      res.end();
+    }
+  } catch (_) { /* response already torn down */ }
+}); }).listen(process.env.PORT || 3000, () => {
   console.log(`🟢 HTTP server on port ${process.env.PORT || 3000}`);
 });
 
@@ -3692,21 +3722,36 @@ http.createServer(async (req, res) => {
 // STARTUP
 // ═══════════════════════════════════════════════════════════════
 
+// Last-resort backstop. Every known async path is guarded individually above,
+// but this is a single-process service where an unhandled rejection means a
+// total outage until the platform restarts it — and each restart re-runs the
+// morning fetch against a metered API. Log loudly and stay up rather than
+// dying silently on something nobody anticipated.
+process.on('unhandledRejection', (reason) => {
+  console.error('⚠️ UNHANDLED REJECTION (service kept alive):', reason && (reason.stack || reason.message || reason));
+});
+
 (async () => {
   console.log(`\n🟢 The Tipster Engine v9.9 starting...`);
   console.log(`   Season: ${currentSeason()}/${currentSeason()+1}`);
   console.log(`   Data source: Sofascore (RapidAPI Pro)`);
   console.log(`   Schedule: Morning fetch 06:00 | Midday refresh 13:00 | Tips every 15min`);
 
+  // Every async call below is guarded. A rejection from any of them would
+  // otherwise be unhandled, and Node terminates the process on those — one
+  // transient Sofascore or Supabase failure would take the service down, and
+  // each restart re-runs morningFetch and spends RapidAPI quota.
+  const guard = (label) => (e) => console.error(`${label} error:`, e && e.message);
+
   // On startup, run morning fetch immediately to populate cache
-  await morningFetch();
-  await settleResults().catch(e => console.error('Startup settle error:', e.message));
+  await morningFetch().catch(guard('Startup morning fetch'));
+  await settleResults().catch(guard('Startup settle'));
 
   // Start 15-min tip generation cycle
-  setInterval(runEngine, 15 * 60 * 1000);
-  await runEngine();
+  setInterval(() => runEngine().catch(guard('Scheduled runEngine')), 15 * 60 * 1000);
+  await runEngine().catch(guard('Startup runEngine'));
 
   startScheduler();
-  setInterval(processAdminJobs, 30 * 1000);
-  processAdminJobs();
+  setInterval(() => processAdminJobs().catch(guard('Scheduled admin jobs')), 30 * 1000);
+  processAdminJobs().catch(guard('Startup admin jobs'));
 })();
