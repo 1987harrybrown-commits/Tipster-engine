@@ -2926,18 +2926,31 @@ function buildSaturdayEmail({ selections, combinedOdds, reasoning, userId }) {
 
 async function getSubscribers(type = 'daily', tier = 'all') {
   const col = type === 'saturday' ? 'email_saturday' : 'email_daily';
-  let q = supabase.from('users').select('id, email, first_name, subscription_status').eq('email_opt_in', true).eq(col, true);
-  if (tier === 'pro')  q = q.eq('subscription_status', 'pro');
-  if (tier === 'free') q = q.neq('subscription_status', 'pro');
 
+  // Paginated. This was a single select, and PostgREST caps every response at
+  // 1000 rows — so the moment the opted-in list passes a thousand, everyone
+  // after the first thousand silently stops receiving email. Nothing surfaces:
+  // the dispatch reports "sent 1000/1000", which reads as a complete run. For
+  // Pro subscribers that is paid-for mail quietly not arriving.
+  //
   // Returns null when the list could not be READ, versus [] when there
   // genuinely are no subscribers. The error used to be discarded, so a
   // database blip at dispatch time sent to nobody and logged "0/0" — which
   // reads as "no subscribers today" rather than "we never found out who they
-  // are". Callers abort on null instead of quietly sending nothing.
-  const { data, error } = await q;
-  if (error) { console.error(`getSubscribers(${type}/${tier}) failed:`, error.message); return null; }
-  return data || [];
+  // are". Callers abort on null instead of quietly sending nothing. selectAll
+  // throws on failure, so that contract is preserved here rather than letting
+  // a partial list through as if it were the whole audience.
+  try {
+    return await selectAll('users', 'id, email, first_name, subscription_status', q => {
+      q = q.eq('email_opt_in', true).eq(col, true);
+      if (tier === 'pro')  q = q.eq('subscription_status', 'pro');
+      if (tier === 'free') q = q.neq('subscription_status', 'pro');
+      return q;
+    });
+  } catch (err) {
+    console.error(`getSubscribers(${type}/${tier}) failed:`, err.message);
+    return null;
+  }
 }
 
 // Sends one email per subscriber, isolating each so a single bad record cannot
