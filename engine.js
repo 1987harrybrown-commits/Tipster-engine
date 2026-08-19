@@ -606,6 +606,22 @@ async function morningFetch() {
 }
 
 // ─── MATCH CONTEXT CACHE ─────────────────────────────────────
+// These are keyed by event id and the process is long-lived, so without a cap
+// they only grow: one entry per fixture, for every fixture ever seen. Team
+// stats are keyed by team and are naturally bounded, so they are left alone.
+//
+// Oldest-first eviction on insertion order, which for these is arrival order —
+// good enough, since the entries that matter are always the recent ones.
+const CACHE_MAX = 5000;
+function cacheSet(cache, key, value) {
+  if (!(key in cache) && Object.keys(cache).length >= CACHE_MAX) {
+    const oldest = Object.keys(cache).slice(0, Math.ceil(CACHE_MAX / 10));
+    for (const k of oldest) delete cache[k];
+  }
+  cache[key] = value;
+  return value;
+}
+
 const teamStatsCache = {};
 const matchContextCache = {};
 
@@ -694,7 +710,7 @@ async function fetchMatchContext(eventId, homeTeamId, awayTeamId, sport) {
     console.log(`  ⚠️ Match context error [${eventId}]: ${e.message}`);
   }
 
-  matchContextCache[eventId] = ctx;
+  cacheSet(matchContextCache, eventId, ctx);
   return ctx;
 }
 
@@ -720,7 +736,7 @@ async function fetchLineupsForToday() {
             homeMissing:   (lineupData.home?.missingPlayers || []).map(p => ({ name: p.player?.name, reason: p.type })),
             awayMissing:   (lineupData.away?.missingPlayers || []).map(p => ({ name: p.player?.name, reason: p.type })),
           };
-          matchContextCache[event.id] = ctx;
+          cacheSet(matchContextCache, event.id, ctx);
           fetched++;
           console.log(`  📋 Lineups: ${event.home_team} vs ${event.away_team} — confirmed: ${lineupData.confirmed}`);
         }
@@ -2254,6 +2270,9 @@ async function saveTips(tips) {
 // RESULT SETTLER — uses Sofascore match results
 // ═══════════════════════════════════════════════════════════════
 
+// Final scores, keyed by event id. Only ever holds results confirmed finished,
+// so an entry is safe to keep — but it is still capped, because the settler
+// touches every past event and the process is long-lived. See cacheSet.
 const scoreCache = {};
 
 async function fetchSofascoreResult(eventId) {
@@ -2261,43 +2280,54 @@ async function fetchSofascoreResult(eventId) {
 
   // Primary: matches/detail
   const data = await sofascoreFetch(`/matches/detail`, { id: eventId });
-  if (data?.event) {
-    const e = data.event;
-    const isFinished = e.status?.type === 'finished' || e.status?.description === 'Ended' || e.status?.code === 100;
-    if (!isFinished) {
-      console.log(`  ⏳ Not finished yet [${eventId}]: ${e.status?.description} (${e.status?.type})`);
-      return null;
-    }
-    const result = {
-      homeScore: e.homeScore?.current ?? e.homeScore?.normaltime ?? null,
-      awayScore: e.awayScore?.current ?? e.awayScore?.normaltime ?? null,
-      finished:  true,
-    };
-    if (result.homeScore !== null) {
-      scoreCache[eventId] = result;
-      return result;
-    }
+  if (!data?.event) {
+    // No status means no way to know whether the match has finished. The graph
+    // fallback below used to run in this case and cached its last data point as
+    // the final score with no finished check at all — so a transient failure on
+    // this call, for a match still in play, pinned a half-time score as final.
+    // The settler runs hourly against every tip whose kick-off has passed, so
+    // it queries in-progress matches as a matter of course, and scoreCache is
+    // never invalidated: the wrong score would have been settled against and
+    // then kept for the life of the process.
+    console.log(`  ⚠️ No detail for event ${eventId} — will retry next cycle`);
+    return null;
   }
 
-  // Fallback: matches/get-h2h-events or tournaments/get-last-matches
-  // Try getting score via the match graph endpoint which often has final scores
+  const e = data.event;
+  const isFinished = e.status?.type === 'finished' || e.status?.description === 'Ended' || e.status?.code === 100;
+  if (!isFinished) {
+    console.log(`  ⏳ Not finished yet [${eventId}]: ${e.status?.description} (${e.status?.type})`);
+    return null;
+  }
+
+  const result = {
+    homeScore: e.homeScore?.current ?? e.homeScore?.normaltime ?? null,
+    awayScore: e.awayScore?.current ?? e.awayScore?.normaltime ?? null,
+    finished:  true,
+  };
+  if (result.homeScore !== null && result.awayScore !== null) {
+    cacheSet(scoreCache, eventId, result);
+    return result;
+  }
+
+  // Finished, but the detail payload carried no score. Only now is the graph
+  // worth reading — we have confirmed the match is over, so its last data point
+  // is a full-time score rather than a snapshot of one in progress.
   await new Promise(r => setTimeout(r, 300));
   const graphData = await sofascoreFetch(`/matches/get-graph`, { matchId: eventId });
   if (graphData) {
-    // Graph data has homeScore/awayScore on parent
-    // Try extracting from the last data point
     const points = graphData.graphPoints || [];
     if (points.length > 0) {
       const last = points[points.length - 1];
       if (last.homeScore !== undefined && last.awayScore !== undefined) {
-        const result = {
+        const fromGraph = {
           homeScore: last.homeScore,
           awayScore: last.awayScore,
           finished:  true,
         };
-        console.log(`  ✅ Score from graph [${eventId}]: ${result.homeScore}-${result.awayScore}`);
-        scoreCache[eventId] = result;
-        return result;
+        console.log(`  ✅ Score from graph [${eventId}]: ${fromGraph.homeScore}-${fromGraph.awayScore}`);
+        cacheSet(scoreCache, eventId, fromGraph);
+        return fromGraph;
       }
     }
   }
