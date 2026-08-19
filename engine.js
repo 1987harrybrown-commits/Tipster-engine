@@ -2570,7 +2570,7 @@ async function settleResultsInner() {
 
       currentRunningPL = parseFloat((currentRunningPL + pl).toFixed(2));
 
-      await supabase.from('results_history').insert({
+      const { error: ledgerErr } = await supabase.from('results_history').insert({
         tip_ref:    tip.tip_ref,
         sport:      tip.sport,
         event:      `${tip.home_team} vs ${tip.away_team}`,
@@ -2584,6 +2584,18 @@ async function settleResultsInner() {
         settled_at:  new Date().toISOString(),
         confidence: tip.confidence || 0,
       });
+
+      // currentRunningPL was advanced above on the assumption this insert would
+      // land. Discarding the error meant a failed insert left the tally ahead
+      // of the ledger, so every remaining tip in the batch was written with a
+      // running_pl that counted a row which does not exist. Roll it back, the
+      // same way Pass 1 already does on a unique violation.
+      if (ledgerErr) {
+        currentRunningPL = parseFloat((currentRunningPL - pl).toFixed(2));
+        console.error(`❌ Ledger insert failed [${tip.tip_ref}]:`, ledgerErr.message,
+                      '— tip is graded but missing from results_history; Pass 1 will backfill it next run');
+        continue;
+      }
 
       console.log(`${won ? '✅ WON' : '❌ LOST'}: [${tip.tip_ref}] ${tip.home_team} vs ${tip.away_team} — ${tip.selection} @ ${settlementOdds} (${pl >= 0 ? '+' : ''}${pl}u)`);
       count++; dirty = true;
@@ -2653,13 +2665,21 @@ async function updateStatsCache() {
     const total = won + lost;
     const pl    = data.reduce((s,r) => s + parseFloat(r.profit_loss || 0), 0);
     const stk   = data.reduce((s,r) => s + parseFloat(r.stake ?? 1), 0);
-    await supabase.from('stats_cache').update({
+    const { data: cached, error: statsErr } = await supabase.from('stats_cache').update({
       total_tips:   total, total_won: won, total_lost: lost,
       win_rate:     total > 0 ? parseFloat((won/total*100).toFixed(1)) : 0,
       total_pl:     parseFloat(pl.toFixed(2)),
       total_staked: parseFloat(stk.toFixed(2)),
       roi:          stk > 0 ? parseFloat((pl/stk*100).toFixed(1)) : 0,
-    }).eq('id', 1);
+    }).eq('id', 1).select('id');
+
+    // The homepage headline figures read this row. A failed write left them
+    // frozen at whatever they last were, silently — the numbers would simply
+    // stop moving while settlement carried on, which looks like nothing
+    // happening rather than like a fault.
+    if (statsErr) { console.error('❌ Stats cache update failed:', statsErr.message); return; }
+    if (!cached || !cached.length) { console.error('❌ Stats cache row id=1 does not exist — published figures will not update'); return; }
+
     console.log(`📈 Stats: ${won}W/${lost}L | ${total > 0 ? (won/total*100).toFixed(1) : 0}% | ${pl >= 0 ? '+' : ''}${pl.toFixed(2)}u`);
   } catch(e) { console.error('Stats cache error:', e.message); }
 }
@@ -3551,7 +3571,20 @@ http.createServer((req, res) => { (async () => {
     if (!token || !uid) { res.writeHead(400); res.end('Invalid'); return; }
     try {
       if (!verifyUnsubToken(token, uid)) { res.writeHead(403); res.end('Invalid token'); return; }
-      await supabase.from('users').update({ email_opt_in: false }).eq('id', uid);
+
+      // The result used to be discarded, so a failed write still rendered
+      // "You have been removed from all emails." Telling someone they are
+      // unsubscribed while they remain opted in is the one failure here that
+      // actually matters — they will keep receiving mail they have explicitly
+      // refused, and will have no reason to try again.
+      const { data: optedOut, error: unsubErr } = await supabase.from('users')
+        .update({ email_opt_in: false }).eq('id', uid).select('id');
+      if (unsubErr || !optedOut || !optedOut.length) {
+        console.error('Unsubscribe failed for', uid, unsubErr ? unsubErr.message : 'no matching user');
+        res.writeHead(500, { 'Content-Type': 'text/html' });
+        res.end('<html><body style="font-family:sans-serif;text-align:center;padding:60px;background:#07090d;color:#dde6f0;"><h2>Something went wrong</h2><p>We could not update your preferences just now. Please email <a href="mailto:support@thetipsteredge.com" style="color:#18e07a;">support@thetipsteredge.com</a> and we will remove you manually.</p></body></html>');
+        return;
+      }
       res.writeHead(200, { 'Content-Type': 'text/html' });
       res.end('<html><body style="font-family:sans-serif;text-align:center;padding:60px;background:#07090d;color:#dde6f0;"><h2>Unsubscribed</h2><p>You have been removed from all emails.</p><a href="https://www.thetipsteredge.com/account.html" style="color:#18e07a;">Manage preferences</a></body></html>');
     } catch(e) { res.writeHead(400); res.end('Invalid token'); }
