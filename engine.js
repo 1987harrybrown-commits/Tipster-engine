@@ -2874,14 +2874,27 @@ const FROM_EMAIL      = 'info@thetipsteredge.com';
 const FROM_NAME       = 'The Tipster';
 const SITE_URL        = 'https://www.thetipsteredge.com';
 
-async function sendEmail({ to, subject, html, type = 'general' }) {
+// userId, when given, adds the RFC 8058 one-click unsubscribe headers.
+//
+// There were none. Gmail and Yahoo have required them of bulk senders since
+// 2024, so their absence costs inbox placement — and it means the only way out
+// of the list was the link in the footer, which recipients who cannot find it
+// replace with the spam button.
+async function sendEmail({ to, subject, html, type = 'general', userId = null }) {
   if (!RESEND_API_KEY) { console.log(`📧 No RESEND key — skipping email to ${to}`); return false; }
   let ok = false;
   try {
+    const extraHeaders = {};
+    if (userId) {
+      const unsub = `${SITE_URL.replace('www.','')}/unsubscribe?token=${generateUnsubToken(userId)}&uid=${userId}`;
+      extraHeaders['List-Unsubscribe'] = `<${unsub}>`;
+      extraHeaders['List-Unsubscribe-Post'] = 'List-Unsubscribe=One-Click';
+    }
     const res = await fetch('https://api.resend.com/emails', {
       method: 'POST',
       headers: { 'Authorization': `Bearer ${RESEND_API_KEY}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ from: `${FROM_NAME} <${FROM_EMAIL}>`, to, subject, html }),
+      body: JSON.stringify({ from: `${FROM_NAME} <${FROM_EMAIL}>`, to, subject, html,
+        ...(Object.keys(extraHeaders).length ? { headers: extraHeaders } : {}) }),
     });
     const data = await res.json();
     if (!res.ok) console.error(`Email error (${type}):`, data.message || data);
@@ -3211,6 +3224,7 @@ async function sendProEmails({ force = false } = {}) {
     subject: `${u.first_name ? u.first_name + ', ' : ''}Pro Early Access | ${tips.length} tips ready`,
     html: buildProEmail({ tip: tips[0], allTips: tips, userId: u.id, firstName: u.first_name }),
     type: 'pro_daily',
+    userId: u.id,
   }));
 }
 
@@ -3229,6 +3243,7 @@ async function sendDailyEmails({ force = false } = {}) {
     subject: `${u.first_name ? u.first_name + ', ' : ''}Today's Bet of the Day`,
     html: buildFreeEmail({ tip, proTipCount: Math.max(all.length - 1, 0), userId: u.id, firstName: u.first_name }),
     type: 'daily',
+    userId: u.id,
   }));
 }
 
@@ -3246,6 +3261,7 @@ async function sendSaturdayEmails({ force = false } = {}) {
     subject: `${u.first_name ? u.first_name + ', ' : ''}Saturday's ${acca.selections.length}-Fold | ${parseFloat(acca.combinedOdds).toFixed(2)} combined odds`,
     html: buildSaturdayEmail({ ...acca, userId: u.id }),
     type: 'saturday',
+    userId: u.id,
   }));
 }
 
@@ -3910,6 +3926,31 @@ http.createServer((req, res) => { (async () => {
     try {
       if (!verifyUnsubToken(token, uid)) { res.writeHead(403); res.end('Invalid token'); return; }
 
+      // A GET must not change anything. Mail security scanners and link
+      // prefetchers — Outlook Safe Links, corporate filters, some mobile
+      // clients — fetch every URL in a message, so a GET that opted someone
+      // out unsubscribed people who never clicked, and did it silently.
+      //
+      // GET therefore confirms, POST acts. The POST form posts back to the
+      // same address, so it stays on the branded domain, and the same shape
+      // serves RFC 8058 one-click: the signed token in the query string is the
+      // authentication, so no session or form field is needed.
+      if (req.method !== 'POST') {
+        const action = `/unsubscribe?token=${encodeURIComponent(token)}&uid=${encodeURIComponent(uid)}`;
+        res.writeHead(200, { 'Content-Type': 'text/html' });
+        res.end('<html><head><meta name="robots" content="noindex"><meta name="viewport" content="width=device-width, initial-scale=1.0">'
+          + '<title>Unsubscribe | The Tipster Edge</title></head>'
+          + '<body style="font-family:system-ui,-apple-system,sans-serif;text-align:center;padding:60px 20px;background:#07090d;color:#dde6f0;">'
+          + '<h2 style="font-weight:800;">Unsubscribe</h2>'
+          + '<p style="color:#6c83a3;font-size:14px;max-width:420px;margin:0 auto 22px;">Stop receiving tips emails from The Tipster Edge? You can re-enable them any time from your account.</p>'
+          + `<form method="POST" action="${esc(action)}" style="margin:0;">`
+          + '<button type="submit" style="background:#18e07a;color:#07090d;border:0;font-size:14px;font-weight:700;padding:12px 28px;border-radius:5px;cursor:pointer;">Yes, unsubscribe me</button>'
+          + '</form>'
+          + '<p style="margin-top:22px;"><a href="https://www.thetipsteredge.com/account.html" style="color:#6c83a3;font-size:13px;">Manage preferences instead</a></p>'
+          + '</body></html>');
+        return;
+      }
+
       // The result used to be discarded, so a failed write still rendered
       // "You have been removed from all emails." Telling someone they are
       // unsubscribed while they remain opted in is the one failure here that
@@ -3937,7 +3978,21 @@ http.createServer((req, res) => { (async () => {
       if (token) {
         const { data: { user }, error: authErr } = await supabase.auth.getUser(token);
         if (!authErr && user) {
-          const { data: profile } = await supabase.from('users').select('subscription_status, stripe_subscription_id').eq('id', user.id).single();
+          // The error was discarded, so a failed profile read left isPro false
+          // and served a paying subscriber the free card — the same wrong
+          // denial the fallback below exists to prevent, arriving through a
+          // different door. There is no way to tell whether they are Pro
+          // without this row, so say so rather than presenting the free card
+          // as their entitlement. PGRST116 is "no row", which is a real state
+          // and means genuinely not Pro.
+          const { data: profile, error: profileErr } =
+            await supabase.from('users').select('subscription_status, stripe_subscription_id').eq('id', user.id).single();
+          if (profileErr && profileErr.code !== 'PGRST116') {
+            console.error('/tips profile read failed:', profileErr.message);
+            res.writeHead(503, { ...cors, 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'Could not confirm your subscription', tips: [], isPro: false }));
+            return;
+          }
 
           // subscription_status is what the Stripe webhook maintains — both
           // 'active' and 'trialing' map to 'pro' — so it is the fast path: one
@@ -3981,8 +4036,20 @@ http.createServer((req, res) => { (async () => {
         res.end(JSON.stringify({ error: 'Tips temporarily unavailable', tips: [], isPro })); return;
       }
 
-      const tips = (allTips || []).map((tip, i) => {
-        const isLocked = !isPro && i >= 3;
+      // Which tips are free is the engine's decision, recorded on the row by
+      // tagFreeTips — not "the first three by confidence". Those agree only by
+      // coincidence: this route takes a three-day window while tagFreeTips
+      // works a single UK day, so a high-confidence fixture tomorrow could
+      // take a free slot from one of today's. index.html and the six Vercel
+      // pages already gate on the flag; this was the last place deriving it
+      // independently.
+      //
+      // Falls back to position while the column is unmigrated, which is still
+      // the case in production.
+      const rows = allTips || [];
+      const tagged = rows.some(t => t.is_free != null);
+      const tips = rows.map((tip, i) => {
+        const isLocked = !isPro && (tagged ? tip.is_free !== true : i >= 3);
         if (isLocked) return { tip_ref: tip.tip_ref, sport: tip.sport, league: tip.league, home_team: tip.home_team, away_team: tip.away_team, event_time: tip.event_time, tier: tip.tier, locked: true };
         return { ...tip, locked: false };
       });
