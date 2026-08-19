@@ -546,10 +546,24 @@ function buildTeamStatsFromStandings(standings, tournamentId) {
     const teamId  = row.team?.id;
     if (!name) continue;
 
-    const played = row.matches || row.played || 0;
-    const gf     = row.scoresFor || row.goalsScored || 0;
-    const ga     = row.scoresAgainst || row.goalsConceded || 0;
+    // Coerced and checked. These arrive from a third-party feed, and a field
+    // that came through as text made every figure below NaN — which then
+    // survived the lambda clamps, the score matrix and every threshold meant to
+    // catch nonsense, because no comparison against NaN is ever true. Dropping
+    // the row here means one bad row costs one team rather than quietly
+    // poisoning every fixture that team appears in.
+    const played = Number(row.matches ?? row.played ?? 0);
+    const gf     = Number(row.scoresFor ?? row.goalsScored ?? 0);
+    const ga     = Number(row.scoresAgainst ?? row.goalsConceded ?? 0);
+    if (!Number.isFinite(played) || !Number.isFinite(gf) || !Number.isFinite(ga)) {
+      console.warn(`⚠️ standings row for ${name}: non-numeric ` +
+        `(played=${row.matches ?? row.played}, for=${row.scoresFor ?? row.goalsScored}, ` +
+        `against=${row.scoresAgainst ?? row.goalsConceded}) — skipping this team`);
+      continue;
+    }
 
+    // Too small a sample to average over. A promoted side mid-season, or the
+    // opening week of a new one, would otherwise carry a two-match average.
     if (played < 4) continue;
 
     const hg = Math.max(1, Math.round(played * homeRatio));
@@ -924,7 +938,8 @@ function getContextModifiers(teamSide, ctx, isHome) {
     // blend them in slightly
     if (form.gamesPlayed >= 3) {
       const recentAttAdj = (form.goalsFor - 1.3) * 0.10; // small nudge
-      attackMult = Math.max(0.7, Math.min(1.4, attackMult + recentAttAdj));
+      // A modifier has a safe default that a lambda does not: no adjustment.
+      attackMult = clampFinite(attackMult + recentAttAdj, 0.7, 1.4) ?? 1;
     }
   } else {
     dataQuality = 0.90;
@@ -1413,7 +1428,26 @@ function generateTipRef(sport) {
 
 // ─── MATHS ────────────────────────────────────────────────────
 
+// Math.min and Math.max propagate NaN. Every clamp in the analysers reads as
+// though it bounds its value to a sensible range, and does nothing whatever
+// when the input is NaN: Math.min(4.0, NaN) is NaN and Math.max(0.3, NaN) is
+// NaN. Infinity clamps correctly; only NaN walks through.
+//
+// That matters because NaN then survives everything downstream. A NaN lambda
+// gives a NaN score matrix, NaN probabilities and a NaN fair price, and every
+// comparison against NaN is false — so none of the thresholds meant to catch
+// nonsense reject it. It is reachable from one non-numeric field in a
+// standings response.
+//
+// Returns null rather than a number when the input is not finite, because
+// there is no safe default for expected goals; the caller has to decide.
+function clampFinite(x, lo, hi) {
+  return Number.isFinite(x) ? Math.max(lo, Math.min(hi, x)) : null;
+}
+
 function poisson(lambda, k) {
+  // A non-finite lambda would otherwise return NaN and poison the whole matrix.
+  if (!Number.isFinite(lambda)) return 0;
   if (lambda <= 0) return k === 0 ? 1 : 0;
   let logP = -lambda + k * Math.log(lambda);
   for (let i = 1; i <= k; i++) logP -= Math.log(i);
@@ -1437,7 +1471,12 @@ function buildScoreMatrix(lH, lA) {
     for (let a = 0; a <= N; a++) {
       const raw = poisson(lH, h) * poisson(lA, a);
       const tau = dixonColesTau(h, a, lH, lA, DC_RHO);
-      matrix[h][a] = Math.max(0, raw * tau);
+      // Math.max(0, NaN) is NaN — the same trap as the clamps in the analysers,
+      // one layer further down. poisson already refuses a non-finite lambda,
+      // but dixonColesTau multiplies the lambdas directly and will hand back
+      // NaN for one, so the guard has to be here rather than only upstream.
+      const cell = raw * tau;
+      matrix[h][a] = Number.isFinite(cell) ? Math.max(0, cell) : 0;
       total += matrix[h][a];
     }
   }
@@ -1465,7 +1504,9 @@ function calcOutcomes(matrix) {
 }
 
 function fairOdds(prob) {
-  if (prob <= 0.001) return 999.0;
+  // NaN <= 0.001 is false, so without this a NaN probability produced a NaN
+  // price and published it.
+  if (!Number.isFinite(prob) || prob <= 0.001) return 999.0;
   return parseFloat((1 / prob).toFixed(2));
 }
 
@@ -1792,30 +1833,43 @@ async function analyseFootballFixture(event, sport) {
       const hDef = hStats.homeGames > 0 ? (hStats.homeConceded / hStats.homeGames) / leagueAvg.awayGoals : 1;
       const aAtt = aStats.awayGames > 0 ? (aStats.awayScored / aStats.awayGames) / leagueAvg.awayGoals : 1;
       const aDef = aStats.awayGames > 0 ? (aStats.awayConceded / aStats.awayGames) / leagueAvg.homeGoals : 1;
-      lH = Math.max(0.3, Math.min(4.0, hAtt * aDef * leagueAvg.homeGoals));
-      lA = Math.max(0.3, Math.min(4.0, aAtt * hDef * leagueAvg.awayGoals));
+      lH = clampFinite(hAtt * aDef * leagueAvg.homeGoals, 0.3, 4.0);
+      lA = clampFinite(aAtt * hDef * leagueAvg.awayGoals, 0.3, 4.0);
+      if (lH === null || lA === null) {
+        console.warn(`⚠️ ${event.home_team} vs ${event.away_team}: team stats gave a `
+          + `non-finite expected goals — skipping rather than modelling from NaN`);
+        return null;
+      }
     } else {
       // No stats — skip, don't fall back to market consensus for football
       return null;
     }
 
-    const matrix = buildScoreMatrix(lH, lA);
     // Apply match context modifiers (form, rest, injuries, lineups)
+    // (the pre-modifier matrix used to be built here and never read — an
+    //  81-cell Poisson grid per fixture per cycle, discarded immediately)
     const ctx      = matchContextCache[event.id] || null;
     const homeMod  = getContextModifiers('home', ctx, true);
     const awayMod  = getContextModifiers('away', ctx, false);
 
     // Apply multipliers to expected goals
-    let lHmod = Math.max(0.3, Math.min(4.0, lH * homeMod.attackMult * awayMod.defenceMult));
-    let lAmod = Math.max(0.3, Math.min(4.0, lA * awayMod.attackMult * homeMod.defenceMult));
+    let lHmod = clampFinite(lH * homeMod.attackMult * awayMod.defenceMult, 0.3, 4.0);
+    let lAmod = clampFinite(lA * awayMod.attackMult * homeMod.defenceMult, 0.3, 4.0);
 
     // H2H adjustment — if one team dominates historically, nudge lambda slightly
     if (ctx?.h2h && ctx.h2h.total >= 5) {
       const h2hHomeRate = ctx.h2h.homeWins / ctx.h2h.total;
       const h2hAwayRate = ctx.h2h.awayWins / ctx.h2h.total;
       const h2hAdj = (h2hHomeRate - h2hAwayRate) * 0.08; // max ±8% nudge
-      lHmod = Math.max(0.3, Math.min(4.0, lHmod * (1 + h2hAdj)));
-      lAmod = Math.max(0.3, Math.min(4.0, lAmod * (1 - h2hAdj)));
+      lHmod = clampFinite(lHmod * (1 + h2hAdj), 0.3, 4.0);
+      lAmod = clampFinite(lAmod * (1 - h2hAdj), 0.3, 4.0);
+    }
+    // One check covering the modifiers and the H2H nudge: any of them can be
+    // NaN if the context data is malformed, and the clamps no longer hide it.
+    if (lHmod === null || lAmod === null) {
+      console.warn(`⚠️ ${event.home_team} vs ${event.away_team}: match context gave a `
+        + `non-finite expected goals — skipping`);
+      return null;
     }
 
     const dataQuality = Math.min(homeMod.dataQuality, awayMod.dataQuality);
@@ -1952,12 +2006,17 @@ async function analyseNHLFixture(event, sport) {
 
     // homeGoalie faces away shots → multiplier applies to lA (goals scored by away)
     // awayGoalie faces home shots → multiplier applies to lH (goals scored by home)
-    let lH = Math.max(0.5, Math.min(6.0,
-      homeAttack * awayDef * NHL_LEAGUE_AVG_GF * awayGoalie.multiplier + NHL_HOME_ADVANTAGE
-    ));
-    let lA = Math.max(0.5, Math.min(6.0,
-      awayAttack * homeDef * NHL_LEAGUE_AVG_GF * homeGoalie.multiplier
-    ));
+    let lH = clampFinite(
+      homeAttack * awayDef * NHL_LEAGUE_AVG_GF * awayGoalie.multiplier + NHL_HOME_ADVANTAGE,
+      0.5, 6.0);
+    let lA = clampFinite(
+      awayAttack * homeDef * NHL_LEAGUE_AVG_GF * homeGoalie.multiplier,
+      0.5, 6.0);
+    if (lH === null || lA === null) {
+      console.warn(`⚠️ ${event.home_team} vs ${event.away_team}: team or goalie data gave a `
+        + `non-finite expected goals — skipping`);
+      return null;
+    }
 
     // Data quality tier — lower if goalie data absent (less confident model)
     const hasGoalieData = homeGoalie.label && awayGoalie.label;
@@ -1972,14 +2031,19 @@ async function analyseNHLFixture(event, sport) {
     const homeMod = getContextModifiers('home', ctx, true);
     const awayMod = getContextModifiers('away', ctx, false);
 
-    lH = Math.max(0.5, Math.min(6.0, lH * homeMod.attackMult * awayMod.defenceMult));
-    lA = Math.max(0.5, Math.min(6.0, lA * awayMod.attackMult * homeMod.defenceMult));
+    lH = clampFinite(lH * homeMod.attackMult * awayMod.defenceMult, 0.5, 6.0);
+    lA = clampFinite(lA * awayMod.attackMult * homeMod.defenceMult, 0.5, 6.0);
 
     // H2H adjustment for NHL
     if (ctx?.h2h && ctx.h2h.total >= 5) {
       const h2hAdj = ((ctx.h2h.homeWins - ctx.h2h.awayWins) / ctx.h2h.total) * 0.06;
-      lH = Math.max(0.5, Math.min(6.0, lH * (1 + h2hAdj)));
-      lA = Math.max(0.5, Math.min(6.0, lA * (1 - h2hAdj)));
+      lH = clampFinite(lH * (1 + h2hAdj), 0.5, 6.0);
+      lA = clampFinite(lA * (1 - h2hAdj), 0.5, 6.0);
+    }
+    if (lH === null || lA === null) {
+      console.warn(`⚠️ ${event.home_team} vs ${event.away_team}: match context gave a `
+        + `non-finite expected goals — skipping`);
+      return null;
     }
 
     // Merge context data quality with goalie data quality
