@@ -3702,6 +3702,28 @@ const rateLimitMap = new Map();
 const RATE_LIMIT   = 60;
 const RATE_WINDOW  = 60 * 1000;
 
+// Resolve the client address for rate limiting.
+//
+// x-forwarded-for is a list that each proxy appends its observed peer to, so
+// the LEFTMOST entry is whatever the client itself sent. Keying the limiter on
+// it — which is what `split(',')[0]` did — meant anyone could bypass the limit
+// entirely by varying a header on every request, so the protection was
+// decorative.
+//
+// Count back from the right instead. With one trusted proxy in front, the last
+// entry is the address that proxy actually observed, and everything to its left
+// is unverifiable. TRUSTED_PROXY_HOPS covers the case of another layer (a CDN,
+// say) being added in front later; get it wrong in the low direction and you
+// over-limit rather than under-limit, which is the safer way to be wrong.
+const TRUSTED_PROXY_HOPS = Math.max(1, parseInt(process.env.TRUSTED_PROXY_HOPS || '1', 10) || 1);
+
+function clientIpFrom(req) {
+  const xff = String(req.headers['x-forwarded-for'] || '')
+    .split(',').map(v => v.trim()).filter(Boolean);
+  if (xff.length) return xff[Math.max(0, xff.length - TRUSTED_PROXY_HOPS)];
+  return req.socket?.remoteAddress || '';
+}
+
 function isRateLimited(ip) {
   const now   = Date.now();
   const entry = rateLimitMap.get(ip) || { count: 0, start: now };
@@ -3785,7 +3807,7 @@ http.createServer((req, res) => { (async () => {
 
   if (req.method === 'OPTIONS') { res.writeHead(204, cors); res.end(); return; }
 
-  const clientIp = req.headers['x-forwarded-for']?.split(',')[0].trim() || req.socket.remoteAddress || '';
+  const clientIp = clientIpFrom(req);
   if (isRateLimited(clientIp)) { res.writeHead(429, { ...cors, 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'Too many requests' })); return; }
 
   if (url.pathname === '/') {
