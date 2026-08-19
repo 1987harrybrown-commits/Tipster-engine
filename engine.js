@@ -222,6 +222,15 @@ const sofascoreCache = {
   events:      {},
   fetchedDate: '',
   oddsFetchedAt: null,
+  // Per sport, because the fetch is per sport. The single oddsFetchedAt above
+  // is stamped at the end of morningFetch whatever happened inside it, while
+  // sofascoreCache.events[sport.key] is only written when that sport's fetch
+  // succeeded. So one league failing left yesterday's fixtures in the cache
+  // with a timestamp saying they had just been fetched — and the staleness
+  // check in runEngine, looking at that one timestamp, could not see it.
+  //
+  // oddsFetchedAt is kept because /status reports it.
+  fetchedAt: {},
 };
 
 // Sofascore API wrapper — rate limited to 5 req/sec
@@ -677,6 +686,7 @@ async function morningFetch() {
       }
 
       sofascoreCache.events[sport.key] = enriched;
+      sofascoreCache.fetchedAt[sport.key] = new Date();
 
     } catch(e) {
       console.error(`Morning fetch error (${sport.league}):`, e.message);
@@ -1006,6 +1016,9 @@ async function middayOddsRefresh() {
       await new Promise(r => setTimeout(r, 300));
     }
     console.log(`  🔄 ${sport.league}: ${updated}/${events.length} events repriced`);
+    // Only if something was actually repriced. A pass that updated nothing has
+    // not refreshed these prices, and saying it did is the whole bug above.
+    if (updated > 0) sofascoreCache.fetchedAt[sport.key] = new Date();
   }
 
   sofascoreCache.oddsFetchedAt = new Date();
@@ -3034,32 +3047,46 @@ async function runEngine() {
   //
   // Odds are refreshed twice a day, at 06:00 and 13:00, so the longest they are
   // legitimately allowed to get is the overnight gap — about 17 hours, 18
-  // across a clock change. Nothing checked. If a morning fetch failed, the
-  // cache kept yesterday's events, generateTips happily found the ones still
-  // inside its 48-hour window, and the engine went on publishing tips every
-  // fifteen minutes at prices from the previous day.
+  // across a clock change. Nothing checked. If a fetch failed, the cache kept
+  // yesterday's events, generateTips happily found the ones still inside its
+  // 48-hour window, and the engine went on publishing tips every fifteen
+  // minutes at prices from the previous day.
   //
   // A fully stale cache was already harmless — every event falls outside the
   // window and no tips come out. This is the partial case, which is the one
   // that produces confident output from data nobody would stand behind.
-  const oddsAgeMs = sofascoreCache.oddsFetchedAt
-    ? Date.now() - new Date(sofascoreCache.oddsFetchedAt).getTime()
-    : Infinity;
-  if (oddsAgeMs > ODDS_MAX_AGE_MS) {
-    const hrs = Number.isFinite(oddsAgeMs) ? (oddsAgeMs / 3600000).toFixed(1) + 'h' : 'never fetched';
-    console.error(`🚨 Odds are ${hrs} old (limit ${ODDS_MAX_AGE_MS / 3600000}h) — `
-      + `not publishing tips until a fetch succeeds`);
-    return;
-  }
+  //
+  // Checked per sport, because the fetch is per sport: one league failing while
+  // the others succeed is the likeliest form of this, and a single cache-wide
+  // timestamp cannot see it. One stale league is skipped; the rest still
+  // publish, because withholding good tips is its own kind of wrong.
+  const stale = (sport) => {
+    const at = sofascoreCache.fetchedAt && sofascoreCache.fetchedAt[sport.key];
+    const age = at ? Date.now() - new Date(at).getTime() : Infinity;
+    return age > ODDS_MAX_AGE_MS
+      ? (Number.isFinite(age) ? (age / 3600000).toFixed(1) + 'h old' : 'never fetched')
+      : null;
+  };
 
-  let all = [];
+  let all = [], skipped = 0;
   for (const sport of SPORTS) {
     const events = sofascoreCache.events[sport.key] || [];
     if (!events.length) continue;
+    const why = stale(sport);
+    if (why) {
+      skipped++;
+      console.error(`🚨 ${sport.league}: odds are ${why} (limit ${ODDS_MAX_AGE_MS / 3600000}h) `
+        + `— skipping until a fetch succeeds`);
+      continue;
+    }
     console.log(`Analysing ${sport.league} (${events.length} events from cache)...`);
     const tips = await generateTips(events, sport);
     console.log(`  → ${tips.length} tips`);
     all = all.concat(tips);
+  }
+  if (skipped && !all.length) {
+    console.error(`🚨 Every sport with cached events has stale odds — publishing nothing this cycle`);
+    return;
   }
   console.log(`\n💾 Saving ${all.length} tips...`);
   await saveTips(all);
