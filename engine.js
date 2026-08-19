@@ -151,9 +151,17 @@ const MIN_CONFIDENCE     = 52;  // Minimum win probability to publish
 const NBA_MIN_CONFIDENCE = 52;
 const NHL_MIN_CONFIDENCE = 52;
 const MIN_EDGE_PCT      = 0;
-const NHL_MIN_EDGE      = 0;
-const NBA_MIN_EDGE      = 0;
-const OVERS_MIN_EDGE    = 0;
+// Vestigial. None of these is referenced anywhere, and setting them has no
+// effect — same as MIN_EDGE_PCT above. What actually excludes a no-edge bet is
+// Kelly: the fraction is <= 0 whenever modelProb <= 1/odds, so the tip sizes at
+// 0 and publishes as insight rather than as a bet.
+//
+// Left in place rather than deleted because wiring them up is a real decision:
+// an enforced `edge >= 0` filter would stop those tips being published at all,
+// where today they still appear as informational. That changes the card.
+const NHL_MIN_EDGE      = 0;   // unused
+const NBA_MIN_EDGE      = 0;   // unused
+const OVERS_MIN_EDGE    = 0;   // unused
 const ELITE_H2H_EDGE    = 10;
 const ELITE_OVERS_EDGE  = 14;
 
@@ -175,12 +183,12 @@ const PUBLISH_FOOTBALL_OVERS = false;
 //   ODDS_ELITE_MAX    — maximum odds published
 const INSIGHT_ODDS_MIN  = 1.05; // Show from here — heavy favs shown as insight
 const BET_ODDS_MIN      = 1.35; // Minimum odds for a real bet
-const ODDS_CORE_MAX     = 5.00;
+const ODDS_CORE_MAX     = 5.00;  // unused — there is no core/elite split in the code
 const ODDS_ELITE_MAX    = 10.0;
 
 const LINE_MOVE_REJECT  = 0.10;
 const MATRIX_MAX_GOALS  = 8;
-const FOOTBALL_EDGE_PREMIUM = 0;
+const FOOTBALL_EDGE_PREMIUM = 0;  // unused
 const MIN_QUALITY_SCORE = 0.10;
 const NHL_HOME_ADVANTAGE  = 0.20;
 const NHL_LEAGUE_AVG_GF   = 3.10;
@@ -1570,8 +1578,15 @@ function falseEdgeCheck(candidate, market) {
 
 // ─── CANDIDATE SCORING ────────────────────────────────────────
 
-const NBA_CONFIDENCE_CEILING = 80; // cap until injury/rest data available
-const NHL_CONFIDENCE_CEILING = 80; // cap until goalie/rest data available
+// Confidence ceilings. These were declared and never read — the caps below were
+// hardcoded as literals, so raising a ceiling here changed nothing. The NHL
+// value was also wrong as documentation: the real cap is 88 once confirmed
+// goalie data is present, which a single constant could not express.
+const NBA_CONFIDENCE_CEILING      = 80; // cap until injury/rest data available
+const NHL_CONFIDENCE_CEILING      = 80; // without confirmed goalie data
+const NHL_CONFIDENCE_CEILING_GOALIE = 88; // with it
+const CONFIDENCE_FLOOR            = 50; // never publish below this
+const CONFIDENCE_CEILING          = 95; // absolute cap, all sports
 
 // ─── CONFIDENCE = MODEL WIN PROBABILITY ──────────────────────
 // Confidence is literally how likely we think this outcome is to happen.
@@ -1601,13 +1616,13 @@ function confidenceFromSignals({ modelProb, dataQualityTier, sport, gamesPlayed 
   // Sport caps — NHL cap lifted to 88 when confirmed goalie data is present
   // Without goalie data (dataQualityTier < 1.0), cap stays at 80
   if (sport === 'Ice Hockey') {
-    const cap = (dataQualityTier >= 1.0) ? 88 : 80;
+    const cap = (dataQualityTier >= 1.0) ? NHL_CONFIDENCE_CEILING_GOALIE : NHL_CONFIDENCE_CEILING;
     conf = Math.min(conf, cap);
   }
-  if (sport === 'Basketball') conf = Math.min(conf, 80);
+  if (sport === 'Basketball') conf = Math.min(conf, NBA_CONFIDENCE_CEILING);
 
-  // Hard floor — don't publish tips below 50% win probability
-  conf = Math.max(50, Math.min(95, conf));
+  // Hard floor — don't publish tips below this win probability
+  conf = Math.max(CONFIDENCE_FLOOR, Math.min(CONFIDENCE_CEILING, conf));
 
   return conf;
 }
