@@ -429,11 +429,19 @@ function parseOdds(value) {
     const num = parseFloat(parts[0]);
     const den = parseFloat(parts[1]);
     if (!isFinite(num) || !isFinite(den) || den === 0) return 0;
-    return parseFloat((1 + num / den).toFixed(4));
+    const frac = parseFloat((1 + num / den).toFixed(4));
+    return frac > 1 ? frac : 0;
   }
-  // Decimal format
+  // Decimal format.
+  //
+  // Anything at or below 1.00 is not a price: it says a winning bet returns
+  // less than the stake. This accepted d > 0, so a feed sending 0.5 produced an
+  // implied probability of 2.0, which de-vigged against the rest of the book
+  // into a perfectly plausible-looking 79% — a number with nothing behind it.
+  // Returning 0 makes getChoicePrice fall through to the next field, which is
+  // what it does for every other unusable value.
   const d = parseFloat(s);
-  return isFinite(d) && d > 0 ? d : 0;
+  return isFinite(d) && d > 1 ? d : 0;
 }
 
 // Get best available price from a Sofascore choice object
@@ -510,10 +518,19 @@ function parseSofascoreOdds(markets, homeTeam, awayTeam, targetTotalsLine = null
         const price = getChoicePrice(choice);
         if (!price) return;
         const label = String(choice.name || '').trim();
-        if      (label === '1' || nameMatch(label, homeTeam)) h2hOutcomes.push({ name: homeTeam, price });
-        else if (label === '2' || nameMatch(label, awayTeam)) h2hOutcomes.push({ name: awayTeam, price });
-        else if (idx === 0)                                   h2hOutcomes.push({ name: homeTeam, price });
-        else if (idx === 1)                                   h2hOutcomes.push({ name: awayTeam, price });
+        // A label that matches both teams identifies neither. This tried home
+        // first and took it, so a feed abbreviating 'Manchester United' and
+        // 'Manchester City' to 'Manchester' would have put the away price on
+        // the home side — the same silent inversion the position fallback
+        // below was added to fix. Fall through to position instead, which at
+        // least follows the feed's own ordering.
+        const isHome = nameMatch(label, homeTeam);
+        const isAway = nameMatch(label, awayTeam);
+        const named  = isHome !== isAway;
+        if      (label === '1' || (named && isHome)) h2hOutcomes.push({ name: homeTeam, price });
+        else if (label === '2' || (named && isAway)) h2hOutcomes.push({ name: awayTeam, price });
+        else if (idx === 0)                          h2hOutcomes.push({ name: homeTeam, price });
+        else if (idx === 1)                          h2hOutcomes.push({ name: awayTeam, price });
       });
     }
   }
