@@ -187,12 +187,28 @@ const ODDS_CORE_MAX     = 5.00;  // unused — there is no core/elite split in t
 const ODDS_ELITE_MAX    = 10.0;
 
 const LINE_MOVE_REJECT  = 0.10;
-const MATRIX_MAX_GOALS  = 8;
+// The score matrix is truncated at this many goals per side and then
+// renormalised, so whatever Poisson mass sits above it is redistributed across
+// the rest — which biases every probability drawn from it.
+//
+// At ordinary football lambdas the loss is immaterial (0.002 points at 1.5 vs
+// 1.2). It is the clamp maximum that matters: at 4.0 against 4.0, a cap of 8
+// discarded 2.1% per side and moved the draw by 0.61 points. 12 brings that to
+// 0.03%, for 169 cells instead of 81.
+const MATRIX_MAX_GOALS  = 12;
 const FOOTBALL_EDGE_PREMIUM = 0;  // unused
 const MIN_QUALITY_SCORE = 0.10;
 const NHL_HOME_ADVANTAGE  = 0.20;
 const NHL_LEAGUE_AVG_GF   = 3.10;
-const NHL_MATRIX_MAX      = 7;
+// Same reasoning, and it mattered far more here: NHL lambdas run about twice
+// football ones, and the published Over 5.5 line sits where the truncated tail
+// actually is. Measured against an untruncated matrix, a cap of 7 understated
+// P(Over 5.5) by 1.08 points at lambda 3.0 per side, 2.12 at 4.0 — a
+// systematic bias against every over the engine could publish. The clamp
+// permits 6.0, where a cap of 7 threw away a quarter of the distribution.
+//
+// 16 leaves under 0.001 points of error at the clamp maximum.
+const NHL_MATRIX_MAX      = 16;
 const NBA_HOME_ADVANTAGE  = 3.5;
 const NBA_LEAGUE_AVG_PTS  = 113;
 const NBA_SCORE_STD_DEV   = 12.0;
@@ -2520,6 +2536,10 @@ async function saveTips(tips) {
 // touches every past event and the process is long-lived. See cacheSet.
 const scoreCache = {};
 
+// Descriptions the feed uses for a match that ended without being played out.
+// Kept next to the check that uses it so the two cannot drift apart.
+const NOT_PLAYED_OUT = /abandon|cancel|postpon|walkover|award|retire|interrupt|suspend|coverage lost/i;
+
 async function fetchSofascoreResult(eventId) {
   if (scoreCache[eventId]) return scoreCache[eventId];
 
@@ -2539,9 +2559,35 @@ async function fetchSofascoreResult(eventId) {
   }
 
   const e = data.event;
-  const isFinished = e.status?.type === 'finished' || e.status?.description === 'Ended' || e.status?.code === 100;
+  const status = e.status || {};
+  const desc   = String(status.description || '');
+  const isFinished = status.type === 'finished' || desc === 'Ended' || status.code === 100;
   if (!isFinished) {
-    console.log(`  ⏳ Not finished yet [${eventId}]: ${e.status?.description} (${e.status?.type})`);
+    console.log(`  ⏳ Not finished yet [${eventId}]: ${desc} (${status.type})`);
+    return null;
+  }
+
+  // "Finished" is not the same as "played out".
+  //
+  // The feed marks several outcomes as finished that are not a match played to
+  // its end: abandoned, walkover, awarded, retired, coverage lost. Each of
+  // those carries whatever score existed when play stopped, and a partial score
+  // is the worst possible input to a settler because it looks exactly like a
+  // real one. A hockey game abandoned at 1-0 in the first period would have
+  // settled every moneyline on it and graded an Over 5.5 as a loss.
+  //
+  // Matched on the description rather than the numeric code, because the codes
+  // are undocumented and guessing them wrong is worse than not checking. This
+  // is deliberately a reject-list on top of an already-required 'finished': an
+  // unfamiliar description still has to pass the check above.
+  //
+  // Returns null, which leaves the tip pending and re-checked each run. That is
+  // the same choice the ungradeable-selection path makes: a bet nobody can
+  // grade needs a person, and inventing a rule for it is how a ledger stops
+  // meaning anything.
+  if (NOT_PLAYED_OUT.test(desc)) {
+    console.error(`🚨 [${eventId}] status "${desc}" — the match did not play out. `
+      + `Not settling on a partial score; needs manual review.`);
     return null;
   }
 
