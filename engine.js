@@ -1340,19 +1340,24 @@ function calcEdge(modelProb, trueImpliedProb) {
 // 2.5u tiers were unreachable and 66% of publishable bets collapsed onto the
 // 0.5u floor — the model's discrimination was being thrown away.
 //
-// Rescaled against the actual distribution of quarter-Kelly values across the
-// band this engine publishes (odds 1.10-6.00, edge 8-20 points), so the tiers
-// separate meaningfully and 2u+ stays reserved for the strongest bets, in line
-// with "A+ (2-2.5u) | A (1.5u)" in the header:
+// The thresholds were calibrated over odds 1.10-6.00 with edge 8-20 points,
+// where they give 0.5u 20% / 1u 36% / 1.5u 30% / 2u 8% / 2.5u 5% / 3u 2% and
+// average 1.24u. That calibration band is not the band the engine actually
+// stakes in, which is BET_ODDS_MIN (1.35) to ODDS_ELITE_MAX (10.0). Measured
+// over the real band:
 //
-//     0.5u 20%   1u 35%   1.5u 30%   2u 8%   2.5u 5%   3u 2%
+//     edge 8-20 pts:   0.5u 30%   1u 43%   1.5u 21%   2u 4%   2.5u 2%   3u 0%   avg 1.03u
+//     edge 0-20 pts:   0.5u 56%   1u 27%   1.5u 13%   2u 3%   2.5u 1%   3u 0%   avg 0.83u
 //
-// Average stake moves from 0.71u to 1.25u. That is a deliberate increase in
-// exposure, taken on the basis that the model's inputs are now correct — the
-// earlier record was produced against a stale odds cache, moneyline markets
-// that could be inverted, and form that could be computed from the oldest
-// matches rather than the newest. Lower every threshold to stake less; this
-// table is the single place to tune it.
+// So 3u is effectively unreachable in practice and the distribution sits lower
+// than the calibration suggests. Recorded rather than retuned: moving these
+// thresholds changes what every subscriber is advised to stake, and the right
+// band to calibrate over depends on whether ODDS_ELITE_MAX really should be
+// 10.0 — the file header says the ceiling is 2.50, which the code has never
+// enforced.
+//
+// This table is the single place to tune staking. Lower every threshold to
+// stake more, raise them to stake less.
 const KELLY_TIERS = [
   [0.1725, 3.0],
   [0.1079, 2.5],
@@ -2085,11 +2090,37 @@ function applyStrictRules(tip, existingBestOdds = null) {
   }
 
   // ── Normal bet tip ────────────────────────────────────────
-  const conf = parseFloat(tip.confidence || 0);
-  let stake;
-  if      (conf >= 78) stake = 2.0;
-  else if (conf >= 72) stake = 1.5;
-  else                 stake = 1.0;
+  // The stake is the quarter-Kelly value already computed during analysis and
+  // carried on the tip. This used to overwrite it with a three-way bucket on
+  // confidence alone:
+  //
+  //     conf >= 78 -> 2.0 | conf >= 72 -> 1.5 | else 1.0
+  //
+  // which discarded Kelly entirely. Confidence is the model win probability, so
+  // that sized every bet on probability alone and ignored the price — the two
+  // inputs Kelly exists to combine. A 1.30 shot with a thin edge and a 4.00
+  // shot with a large one drew the same stake whenever their probabilities
+  // matched. It also made 0.5u, 2.5u and 3u unreachable, so the KELLY_TIERS
+  // table and the rescaling work documented against it had no effect on
+  // anything that shipped.
+  //
+  // The file header has said "Grades do NOT set the stake: that is
+  // quarter-Kelly (see KELLY_TIERS)" and "Stakes: 0.5u-3.0u, quarter-Kelly"
+  // throughout. This makes the code do what it already claimed.
+  //
+  // To go back to flat or confidence-based staking, replace this one line.
+  const stake = parseFloat(tip.stake);
+  if (!Number.isFinite(stake) || stake <= 0) {
+    // kellyStake returns 0 for degenerate input, and a tip that cannot be
+    // sized is not a bet. Publish it as insight rather than inventing a stake.
+    return {
+      ...tip,
+      stake:      0,
+      tier:       'insight',
+      is_short_price: false,
+      notes: (tip.notes || '') + ` | Unstakeable (no Kelly size) | Grade: ${grade} | Edge: ${edge >= 0 ? '+' : ''}${edge.toFixed(1)}%`,
+    };
+  }
 
   const edgeStr = edge >= 0 ? `+${edge.toFixed(1)}%` : `${edge.toFixed(1)}%`;
   return {
