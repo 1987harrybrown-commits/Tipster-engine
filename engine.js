@@ -229,7 +229,7 @@ let rapidApiCallCount = 0;
 let rapidApiCallDate  = '';
 
 function trackApiCall() {
-  const today = new Date().toISOString().split('T')[0];
+  const today = ukDateString();
   if (rapidApiCallDate !== today) { rapidApiCallDate = today; rapidApiCallCount = 0; }
   rapidApiCallCount++;
   if (rapidApiCallCount % 10 === 0) console.log(`📡 RapidAPI calls today: ${rapidApiCallCount}`);
@@ -540,7 +540,7 @@ function buildFormFromMatches(matches, teamId) {
 
 async function morningFetch() {
   console.log('\n🌅 Morning fetch starting...');
-  const today = new Date().toISOString().split('T')[0];
+  const today = ukDateString();
 
   for (const sport of SPORTS) {
     console.log(`  📡 Fetching ${sport.league}...`);
@@ -1069,7 +1069,7 @@ function currentSeason() {
 }
 
 async function fetchNHLAllTeams() {
-  const today = new Date().toISOString().split('T')[0];
+  const today = ukDateString();
   if (nhlAllTeamsCache && nhlAllTeamsCacheDate === today) return nhlAllTeamsCache;
   const year = currentSeason();
   const seasonId = `${year}${year + 1}`;
@@ -1131,7 +1131,7 @@ const NBA_TEAM_ABBREVS = {
 };
 
 async function fetchNBAAllTeamStats() {
-  const today = new Date().toISOString().split('T')[0];
+  const today = ukDateString();
   if (nbaAllTeamsCache && nbaAllTeamsCacheDate === today) return nbaAllTeamsCache;
 
   const season = currentSeason();
@@ -1276,6 +1276,15 @@ function nameMatch(a, b) {
 // window therefore still covered the previous day, so these pages queried
 // yesterday's tips and advertised yesterday's date in the title, the H1 and
 // the structured data.
+// The UK calendar day, which is the only day this product has: tips are carded
+// by it, emails are scheduled by it, and the admin panel keys its overrides by
+// it. toISOString() gives the UTC day, which during BST is the previous day
+// between 00:00 and 01:00 UK — so a lookup written against the UK date and read
+// against the UTC one silently miss each other inside that hour.
+function ukDateString(now = new Date()) {
+  return now.toLocaleDateString('en-CA', { timeZone: 'Europe/London' });
+}
+
 function ukDayStart(now = new Date()) {
   // The calendar date as London sees it, e.g. "2026-08-18".
   const ymd = new Intl.DateTimeFormat('en-CA', {
@@ -3271,7 +3280,7 @@ async function getTodaysTips(limit = 15) {
 }
 
 async function getBetOfTheDay() {
-  const today = new Date().toISOString().split('T')[0];
+  const today = ukDateString();
   // An override that cannot be read is not the same as no override, but the
   // fallback to automatic selection is the right behaviour either way — say so
   // rather than failing the dispatch.
@@ -3282,8 +3291,24 @@ async function getBetOfTheDay() {
   return tips[0] || null;
 }
 
+// The Saturday accumulator is emailed but NOT recorded, so its result never
+// enters the published record.
+//
+// generateDailyAcca writes its acca to daily_accas and the settler picks it up
+// from there. This one is built on the fly at send time and written nowhere, so
+// a bet that goes out to every Saturday subscriber has no outcome anywhere in
+// the product — on a site whose copy says every result is logged.
+//
+// Recording it needs a schema decision rather than a code change: daily_accas
+// is keyed one row per date (generateDailyAcca skips if that date already has
+// one), so a Saturday acca cannot coexist with that day's daily acca without a
+// type column, exactly like the (date, type) pair email_overrides needed. And
+// an admin-entered override carries free text with no tip_ref at all, so those
+// can never settle automatically whatever the schema does.
+//
+// Left as a decision. See DEPLOY.md.
 async function getSaturdayAcca() {
-  const today = new Date().toISOString().split('T')[0];
+  const today = ukDateString();
   const { data: ov } = await supabase.from('email_overrides').select('*').eq('date', today).eq('type','saturday').maybeSingle();
   if (ov?.acca_selections) return { selections: ov.acca_selections, combinedOdds: ov.acca_combined_odds||0, reasoning: ov.acca_reasoning||'' };
   const dayStart = ukDayStart();
@@ -3293,7 +3318,13 @@ async function getSaturdayAcca() {
     .gte('event_time', s.toISOString()).lte('event_time', e.toISOString())
     .gte('confidence', 72).order('confidence', { ascending: false }).limit(4);
   if (!tips || tips.length < 3) return null;
-  const sels = tips.map(t => ({ match: `${t.home_team} vs ${t.away_team}`, selection: t.selection, odds: advisedPrice(t) }));
+  // tip_ref and confidence carried through, matching the shape
+  // generateDailyAcca writes. The settler resolves an acca's legs by tip_ref
+  // and skips any acca without them, so without this the Saturday acca could
+  // not be settled even if it were recorded. It still is not recorded — see
+  // the note below — but the data no longer blocks it.
+  const sels = tips.map(t => ({ match: `${t.home_team} vs ${t.away_team}`, selection: t.selection,
+                                odds: advisedPrice(t), tip_ref: t.tip_ref, confidence: t.confidence }));
   return { selections: sels, combinedOdds: sels.reduce((a,s) => a * parseFloat(s.odds), 1), reasoning: `${sels.length} high-confidence selections from today's card.` };
 }
 
