@@ -3192,16 +3192,21 @@ async function alreadyDispatchedToday(type) {
   }
 }
 
-async function sendProEmails() {
+// force skips the already-sent check. The scheduler never forces — a restart
+// inside its window must not re-send. An admin pressing the button in the
+// dashboard always does: that is a person deciding to send, usually because
+// the first attempt went wrong, and silently doing nothing while reporting
+// success is worse than a duplicate they asked for.
+async function sendProEmails({ force = false } = {}) {
   console.log('📧 Pro dispatch 07:00...');
-  if (await alreadyDispatchedToday('pro_daily')) {
+  if (!force && await alreadyDispatchedToday('pro_daily')) {
     console.log('📧 Pro dispatch already sent today — skipping (restart inside the send window)');
-    return;
+    return { skipped: 'already sent today' };
   }
   const tips = await getTodaysTips(15);
-  if (!tips.length) return;
+  if (!tips.length) return { skipped: 'no tips to send' };
   const subs = await getSubscribers('daily', 'pro');
-  await dispatchToSubscribers('Pro', subs, (u) => ({
+  return await dispatchToSubscribers('Pro', subs, (u) => ({
     to: u.email,
     subject: `${u.first_name ? u.first_name + ', ' : ''}Pro Early Access | ${tips.length} tips ready`,
     html: buildProEmail({ tip: tips[0], allTips: tips, userId: u.id, firstName: u.first_name }),
@@ -3209,17 +3214,17 @@ async function sendProEmails() {
   }));
 }
 
-async function sendDailyEmails() {
+async function sendDailyEmails({ force = false } = {}) {
   console.log('📧 Free dispatch 08:30...');
-  if (await alreadyDispatchedToday('daily')) {
+  if (!force && await alreadyDispatchedToday('daily')) {
     console.log('📧 Free dispatch already sent today — skipping (restart inside the send window)');
-    return;
+    return { skipped: 'already sent today' };
   }
   const tip = await getBetOfTheDay();
-  if (!tip) return;
+  if (!tip) return { skipped: 'no bet of the day' };
   const all  = await getTodaysTips(15);
   const subs = await getSubscribers('daily', 'free');
-  await dispatchToSubscribers('Free', subs, (u) => ({
+  return await dispatchToSubscribers('Free', subs, (u) => ({
     to: u.email,
     subject: `${u.first_name ? u.first_name + ', ' : ''}Today's Bet of the Day`,
     html: buildFreeEmail({ tip, proTipCount: Math.max(all.length - 1, 0), userId: u.id, firstName: u.first_name }),
@@ -3227,16 +3232,16 @@ async function sendDailyEmails() {
   }));
 }
 
-async function sendSaturdayEmails() {
+async function sendSaturdayEmails({ force = false } = {}) {
   console.log('📧 Saturday acca dispatch...');
-  if (await alreadyDispatchedToday('saturday')) {
+  if (!force && await alreadyDispatchedToday('saturday')) {
     console.log('📧 Saturday dispatch already sent today — skipping (restart inside the send window)');
-    return;
+    return { skipped: 'already sent today' };
   }
   const acca = await getSaturdayAcca();
-  if (!acca) return;
+  if (!acca) return { skipped: 'no acca available' };
   const subs = await getSubscribers('saturday');
-  await dispatchToSubscribers('Saturday', subs, (u) => ({
+  return await dispatchToSubscribers('Saturday', subs, (u) => ({
     to: u.email,
     subject: `${u.first_name ? u.first_name + ', ' : ''}Saturday's ${acca.selections.length}-Fold | ${parseFloat(acca.combinedOdds).toFixed(2)} combined odds`,
     html: buildSaturdayEmail({ ...acca, userId: u.id }),
@@ -3390,15 +3395,23 @@ async function generateDailyAcca() {
 
 async function processAdminJobs() {
   try {
-    const { data: jobs } = await supabase.from('admin_jobs').select('*').eq('status','pending').order('created_at',{ascending:true}).limit(10);
+    // The error was discarded, so a failed read looked identical to an empty
+    // queue and admin actions would silently never run.
+    const { data: jobs, error: jobsErr } = await supabase.from('admin_jobs')
+      .select('*').eq('status','pending').order('created_at',{ascending:true}).limit(10);
+    if (jobsErr) { console.error('Job queue read failed:', jobsErr.message); return; }
     if (!jobs?.length) return;
     for (const job of jobs) {
       await supabase.from('admin_jobs').update({ status: 'processing' }).eq('id', job.id);
       try {
         const p = JSON.parse(job.payload || '{}');
         if (job.job_type === 'test_email')        { const r = await sendTestEmail(p.to, p.type||'daily'); await supabase.from('admin_jobs').update({ status: r.success?'done':'failed', result: JSON.stringify(r) }).eq('id', job.id); }
-        else if (job.job_type === 'send_daily')    { await sendDailyEmails();    await supabase.from('admin_jobs').update({ status: 'done' }).eq('id', job.id); }
-        else if (job.job_type === 'send_saturday') { await sendSaturdayEmails(); await supabase.from('admin_jobs').update({ status: 'done' }).eq('id', job.id); }
+        // force: a person pressed the button. Recording the result matters —
+        // marking the job 'done' when the dispatch skipped or reached nobody
+        // tells the admin it worked.
+        else if (job.job_type === 'send_daily')    { const r = await sendDailyEmails({ force: true });    await supabase.from('admin_jobs').update({ status: 'done', result: JSON.stringify(r || {}) }).eq('id', job.id); }
+        else if (job.job_type === 'send_saturday') { const r = await sendSaturdayEmails({ force: true }); await supabase.from('admin_jobs').update({ status: 'done', result: JSON.stringify(r || {}) }).eq('id', job.id); }
+        else if (job.job_type === 'send_pro')      { const r = await sendProEmails({ force: true });      await supabase.from('admin_jobs').update({ status: 'done', result: JSON.stringify(r || {}) }).eq('id', job.id); }
         else { await supabase.from('admin_jobs').update({ status: 'unknown_type' }).eq('id', job.id); }
       } catch(e) { await supabase.from('admin_jobs').update({ status: 'failed', result: e.message }).eq('id', job.id); }
     }
@@ -3811,18 +3824,31 @@ http.createServer((req, res) => { (async () => {
     res.end(JSON.stringify(r)); return;
   }
 
+  // The Pro card is the paid product and had no manual trigger at all — no
+  // route, no job type, no button. A failed 07:00 dispatch meant paying
+  // subscribers got nothing until the following day, with no way to recover.
+  if (url.pathname === '/admin/send-pro') {
+    if (!safeEqual(adminKey, ADMIN_KEY)) { res.writeHead(403); res.end('Forbidden'); return; }
+    const r = await sendProEmails({ force: true }).catch(e => ({ error: e.message }));
+    res.writeHead(200, { ...cors, 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ started: true, ...(r || {}) })); return;
+  }
+
   if (url.pathname === '/admin/send-daily') {
     if (!safeEqual(adminKey, ADMIN_KEY)) { res.writeHead(403); res.end('Forbidden'); return; }
-    sendDailyEmails();
+    // Awaited and reported: this used to be fire-and-forget, so a rejection
+    // became an unhandled rejection and the caller was told it started
+    // regardless of what happened.
+    const r = await sendDailyEmails({ force: true }).catch(e => ({ error: e.message }));
     res.writeHead(200, { ...cors, 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ started: true })); return;
+    res.end(JSON.stringify({ started: true, ...(r || {}) })); return;
   }
 
   if (url.pathname === '/admin/send-saturday') {
     if (!safeEqual(adminKey, ADMIN_KEY)) { res.writeHead(403); res.end('Forbidden'); return; }
-    sendSaturdayEmails();
+    const r = await sendSaturdayEmails({ force: true }).catch(e => ({ error: e.message }));
     res.writeHead(200, { ...cors, 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ started: true })); return;
+    res.end(JSON.stringify({ started: true, ...(r || {}) })); return;
   }
 
   if (url.pathname === '/admin/resettle') {
