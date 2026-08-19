@@ -1360,11 +1360,52 @@ async function fetchNBATeamStats(teamName) {
 // HELPERS
 // ═══════════════════════════════════════════════════════════════
 
+// Does one team name refer to the same team as another?
+//
+// This decides which price belongs to which side, which cached fixture a tip
+// settles against, and which team's stats feed the model. Everything below it
+// treats the answer as ground truth, so a wrong answer here is invisible
+// downstream — there is no later check that would notice.
+//
+// It used to strip to [a-z0-9] and accept containment in either direction.
+// Two problems with that.
+//
+// A name made entirely of characters outside [a-z0-9] cleaned to the empty
+// string, and every string contains the empty string — so any Cyrillic, Greek
+// or punctuation-only name matched EVERY team. `nameMatch('Зенит', 'Arsenal')`
+// returned true. The `!a || !b` guard above caught a name that arrived empty,
+// not one that became empty. Worst case: the settler's fixture lookup matched
+// the first cached event and graded a tip against a different match's score.
+//
+// And plain containment matches names that merely share a prefix. 'Inter'
+// matched 'Internacional'; 'Athletic' matched 'Athletico'. Comparing token sets
+// instead keeps every legitimate case — 'Roma' inside 'AS Roma', 'Forest'
+// inside 'Nottingham Forest', 'Tottenham' inside 'Tottenham Hotspur' — while
+// refusing both of those, because a token has to match a whole token.
+//
+// Unicode-aware, so a non-Latin name is compared rather than erased. It still
+// will not match a name against its own transliteration; that is a false
+// negative, and a tip nobody can match is dropped rather than mis-assigned.
 function nameMatch(a, b) {
   if (!a || !b) return false;
-  const clean = s => s.toLowerCase().replace(/[^a-z0-9]/g, '');
-  const ac = clean(a), bc = clean(b);
-  return ac === bc || ac.includes(bc) || bc.includes(ac);
+  // NFD then drop the combining marks, so Munchen and München are the same
+  // word. Feeds disagree about diacritics constantly, and without this the
+  // disagreement reads as two different clubs. Cyrillic and Greek letters are
+  // unaffected — they survive as letters rather than decomposing away.
+  const tokens = (s) => String(s).normalize('NFD').replace(/\p{M}/gu, '').toLowerCase()
+    .split(/[^\p{L}\p{N}]+/u)
+    .filter(Boolean);
+  const at = tokens(a), bt = tokens(b);
+  // A name with nothing in it matches nothing, rather than everything.
+  if (!at.length || !bt.length) return false;
+
+  const aj = at.join(''), bj = bt.join('');
+  if (aj === bj) return true;
+
+  // Otherwise every token of the shorter name has to appear in the longer one.
+  const [short, long] = at.length <= bt.length ? [at, bt] : [bt, at];
+  const set = new Set(long);
+  return short.every(t => set.has(t));
 }
 
 // Wall-clock time in London, as a Date whose local Y/M/D/H/M/S fields hold the
