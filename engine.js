@@ -3150,12 +3150,32 @@ async function stripeRequest(path, method = 'GET', body = null) {
   if (!STRIPE_SECRET_KEY) return null;
   const opts = { method, headers: { 'Authorization': `Bearer ${STRIPE_SECRET_KEY}`, 'Content-Type': 'application/x-www-form-urlencoded' } };
   if (body) opts.body = new URLSearchParams(body).toString();
+
+  // Node's fetch has no default timeout, so a hanging Stripe endpoint would
+  // stall the caller indefinitely — and the callers here are request handlers
+  // (/stripe/portal, /stripe/checkout, the webhook, and the /tips fallback),
+  // so hung calls hold client connections open with them. sofascoreFetch has
+  // had a 10s abort all along; this had none.
+  //
+  // Deliberately no retry, unlike sofascoreFetch. These calls are not all
+  // idempotent — retrying a checkout session creation risks charging twice —
+  // and every caller already treats null as "could not determine", so a single
+  // clean failure is the safe outcome.
+  let timeout;
   try {
+    const controller = new AbortController();
+    timeout = setTimeout(() => controller.abort(), 10000);
+    opts.signal = controller.signal;
     const res = await fetch(`https://api.stripe.com/v1${path}`, opts);
     const data = await res.json();
     if (!res.ok) { console.error('Stripe error:', data.error?.message); return null; }
     return data;
-  } catch(e) { console.error('Stripe error:', e.message); return null; }
+  } catch(e) {
+    console.error('Stripe error:', e.name === 'AbortError' ? `timeout after 10s (${path})` : e.message);
+    return null;
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 async function createCheckoutSession(userId, email, priceId, plan) {
