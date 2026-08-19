@@ -3372,7 +3372,18 @@ function readBody(req, maxBytes = 1048576) {
     let size = 0;
     req.on('data', c => {
       size += c.length;
-      if (size > maxBytes) { reject(new Error('Body too large')); req.destroy(); return; }
+      if (size > maxBytes) {
+        // Pause rather than destroy. req.destroy() tore the socket down before
+        // the caller could write its 413, so an oversized body got a reset
+        // connection and no status line at all — verified by probing the route
+        // with a 20KB payload against the 16KB cap. Pausing stops us buffering
+        // any more while leaving the response writable.
+        req.pause();
+        const err = new Error('Body too large');
+        err.code = 'BODY_TOO_LARGE';
+        reject(err);
+        return;
+      }
       chunks.push(c);
     });
     req.on('end', () => resolve(Buffer.concat(chunks)));
@@ -3643,7 +3654,22 @@ http.createServer((req, res) => { (async () => {
         let raw;
         try { raw = await readBody(req, 16384); }
         catch(e) { res.writeHead(413, cors); res.end('Payload too large'); return; }
-        const { userId, email, plan } = JSON.parse(raw.toString('utf8'));
+        // A body that is not parseable JSON — or is valid JSON but not an
+        // object, like `null` or `[1,2,3]` — is a client mistake. This used to
+        // fall through to the outer catch and answer 500, reporting the
+        // caller's error as a server fault and polluting error monitoring.
+        let payload;
+        try {
+          payload = JSON.parse(raw.toString('utf8'));
+        } catch (_) {
+          res.writeHead(400, { ...cors, 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'Invalid JSON body' })); return;
+        }
+        if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+          res.writeHead(400, { ...cors, 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'Body must be a JSON object' })); return;
+        }
+        const { userId, email, plan } = payload;
         if (!userId || !email || !plan) { res.writeHead(400, cors); res.end('Missing params'); return; }
 
         // Refuse a second checkout for someone who is already subscribed.
