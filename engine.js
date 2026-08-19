@@ -3254,7 +3254,22 @@ async function getTodaysTips(limit = 15) {
   const e = new Date(s.getTime() + 24 * 3600000 - 1);
 
   // Over-fetch, because the informational picks filtered out below would
-  // otherwise eat into the limit.
+  // otherwise eat into the limit — with a floor, because a multiple of the
+  // limit is not enough at small limits.
+  //
+  // getBetOfTheDay calls this with limit 1, which fetched three rows. The
+  // filter below removes stake-0 picks, and those are short-priced and
+  // therefore high-confidence, so they cluster at the top of exactly this
+  // ordering. Three informational picks at the head of the card — not a
+  // remote case, the reasoning below says it is likelier than average —
+  // emptied the result, getBetOfTheDay returned null, and the free dispatch
+  // skipped for the day with "no bet of the day" while a full card of real
+  // bets sat just underneath them.
+  //
+  // A day's card is bounded, so a flat floor covers it. The exact fix is to
+  // push the predicate into the query (stake.gt.0 or stake.is.null) so the
+  // limit applies to bets; that is a query change worth making the next time
+  // someone can run it against the real database rather than a mock.
   // Throws rather than returning nothing. Every caller is a dispatch, and an
   // empty list is indistinguishable from a quiet day — so a blip at 07:00 sent
   // paying subscribers nothing and logged "no tips to send". runDaily releases
@@ -3262,7 +3277,7 @@ async function getTodaysTips(limit = 15) {
   // window to retry instead of writing the day off.
   const { data, error } = await supabase.from('tips').select('*').eq('status','pending')
     .gte('event_time', s.toISOString()).lte('event_time', e.toISOString())
-    .order('confidence', { ascending: false }).limit(limit * 3);
+    .order('confidence', { ascending: false }).limit(Math.max(limit * 3, 50));
   if (error) throw new Error(`getTodaysTips read failed: ${error.message}`);
 
   // Every caller of this function builds an email that recommends bets.
@@ -3466,15 +3481,34 @@ async function tagFreeTips() {
     const e = new Date(dayStart.getTime() + 24 * 3600000 - 1).toISOString();
 
     const { data: tips, error: readErr } = await supabase.from('tips')
-      .select('id, confidence')
+      .select('id, confidence, stake')
       .eq('status', 'pending')
       .gte('event_time', s).lte('event_time', e)
       .order('confidence', { ascending: false });
     if (readErr) { console.error('tagFreeTips read:', readErr.message); return; }
     if (!tips || !tips.length) return;
 
-    const freeIds = tips.slice(0, FREE_TIPS_PER_DAY).map(t => t.id);
-    const proIds  = tips.slice(FREE_TIPS_PER_DAY).map(t => t.id);
+    // The free slots are bets, and this list is ordered by confidence.
+    //
+    // getTodaysTips already carries this filter and explains the trap: the
+    // informational picks applyStrictRules publishes with stake 0 are
+    // short-priced, therefore high-confidence, and therefore MORE likely than
+    // average to occupy the top of a confidence-ordered list. Unfiltered, a
+    // free tier of three could be three things that are explicitly not bets,
+    // while every actual bet stayed locked.
+    //
+    // It also split the free tier in two. The free email sends
+    // getBetOfTheDay(), which is the top STAKED tip, while the website locks
+    // anything not tagged here — so the one tip a free subscriber was emailed
+    // could render locked on the site they clicked through to.
+    //
+    // stake is now selected for this; the column was not even being read.
+    const bets = tips.filter(t => parseFloat(t.stake ?? 1) > 0);
+    const freeIds = bets.slice(0, FREE_TIPS_PER_DAY).map(t => t.id);
+    const free = new Set(freeIds);
+    // Everything else, informational picks included — they are a Pro extra,
+    // not one of the three free bets.
+    const proIds = tips.filter(t => !free.has(t.id)).map(t => t.id);
 
     if (freeIds.length) {
       const { error } = await supabase.from('tips').update({ is_free: true }).in('id', freeIds);
