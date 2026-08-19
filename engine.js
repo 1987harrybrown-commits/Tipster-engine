@@ -3746,16 +3746,39 @@ function mapSubStatus(stripeStatus) {
 // not been written yet — Stripe does not guarantee checkout.session.completed
 // arrives before customer.subscription.updated. Surface it instead of losing
 // the event without trace.
-async function updateUserByCustomer(customerId, patch, label) {
-  if (!customerId) { console.error(`Stripe ${label}: event carried no customer id`); return false; }
-  const { data, error } = await supabase.from('users').update(patch).eq('stripe_customer_id', customerId).select('id');
-  if (error) { console.error(`Stripe ${label} update failed:`, error.message); return false; }
-  if (!data || !data.length) {
-    // No row to apply it to. Retrying will not conjure one, so report success
-    // and let the warning stand rather than making Stripe redeliver for days.
-    console.warn(`⚠️ Stripe ${label}: no user with stripe_customer_id=${customerId} — not applied`);
-    return true;
+// Apply a patch to the user an event is about, trying each identifier in turn.
+//
+// This used to key on stripe_customer_id alone. That column is written by
+// checkout.session.completed, and Stripe does not guarantee that event arrives
+// first — the old comment said so and accepted the loss. What was being lost:
+// subscription.deleted, which leaves someone holding Pro access they cancelled,
+// and payment_failed, which leaves someone Pro on a card that declined.
+//
+// The other identifiers were already in the events and nothing read them.
+// createCheckoutSession writes user_id into subscription_data[metadata], so
+// every subscription event carries it; invoices name the subscription, and that
+// id is stored at checkout.
+//
+// A match on a fallback key also writes the customer id, so the row heals and
+// the next event for that customer matches on the first key.
+async function updateStripeUser(keys, patch, label) {
+  const tried = [];
+  for (const [col, val] of keys) {
+    if (!val) continue;
+    tried.push(`${col}=${val}`);
+    const { data, error } = await supabase.from('users').update(patch).eq(col, val).select('id');
+    if (error) { console.error(`Stripe ${label} update failed (${col}):`, error.message); return false; }
+    if (data && data.length) {
+      if (col !== 'stripe_customer_id') {
+        console.log(`Stripe ${label}: matched on ${col} — checkout.session.completed had not landed yet`);
+      }
+      return true;
+    }
   }
+  if (!tried.length) { console.error(`Stripe ${label}: event carried nothing to identify a user by`); return false; }
+  // Retrying will not conjure a row, so report success and let the warning
+  // stand rather than making Stripe redeliver for days.
+  console.warn(`⚠️ Stripe ${label}: no user matched ${tried.join(' or ')} — not applied`);
   return true;
 }
 
@@ -3768,7 +3791,42 @@ async function handleStripeWebhook(event) {
     case 'checkout.session.completed': {
       const s = event.data.object;
       const uid = s.metadata?.user_id;
-      if (!uid) break;
+      if (!uid) {
+        // Every session this app creates carries metadata.user_id. One that
+        // does not was created elsewhere — a payment link, or the dashboard —
+        // and there is nothing here to upgrade. Retrying cannot help, so this
+        // still answers 2xx, but it must not pass in silence: money has moved
+        // and nobody has been given anything for it.
+        console.error(`🚨 Stripe checkout.completed: session ${s.id} has no metadata.user_id `
+          + `(customer=${s.customer}) — payment taken, NO account upgraded, needs manual review`);
+        break;
+      }
+
+      // A completed session is not necessarily a paid one. For card payments
+      // this is always 'paid', or 'no_payment_required' for a trial. Enabling a
+      // delayed method such as Bacs or SEPA is a Stripe dashboard setting rather
+      // than a code change, and under one the session completes as 'unpaid' —
+      // which would have granted Pro before any money moved. The
+      // invoice.payment_succeeded branch now covers subscription_create, so the
+      // upgrade still lands when the payment actually clears.
+      if (s.payment_status && s.payment_status !== 'paid'
+          && s.payment_status !== 'no_payment_required') {
+        // Record who they are, even though they are not being upgraded. The
+        // invoice event that later confirms the payment is matched on exactly
+        // these two columns, so leaving them null here means it finds nobody —
+        // and the customer pays and is never upgraded, which is the outcome
+        // this guard exists to prevent.
+        const { error: idErr } = await supabase.from('users')
+          .update({ stripe_customer_id: s.customer, stripe_subscription_id: s.subscription })
+          .eq('id', uid).select('id');
+        if (idErr) {
+          console.error('Stripe checkout.completed: could not record ids for a pending payment:', idErr.message);
+          return false;
+        }
+        console.log(`Stripe checkout.completed: session ${s.id} is ${s.payment_status} — `
+          + `ids recorded, waiting for the invoice to be paid before upgrading`);
+        break;
+      }
 
       // Stripe delivers at least once, and answering 500 on a failed write
       // makes redelivery more likely, not less — so this has to be safe to run
@@ -3813,20 +3871,50 @@ async function handleStripeWebhook(event) {
       // A subscription cancelled at period end stays 'active' until it lapses,
       // so access correctly continues until subscription.deleted arrives.
       const patch = { subscription_status: mapped };
+      if (sub.customer) patch.stripe_customer_id = sub.customer;
       if (mapped === 'free') patch.stripe_subscription_id = null;
-      if (!await updateUserByCustomer(sub.customer, patch, `subscription.updated(${sub.status})`)) return false;
+      if (!await updateStripeUser(
+            [['stripe_customer_id', sub.customer], ['id', sub.metadata?.user_id]],
+            patch, `subscription.updated(${sub.status})`)) return false;
       break;
     }
-    case 'customer.subscription.deleted':
-      if (!await updateUserByCustomer(event.data.object.customer, { subscription_status:'free', stripe_subscription_id: null }, 'subscription.deleted')) return false;
+    case 'customer.subscription.deleted': {
+      const sub = event.data.object;
+      if (!await updateStripeUser(
+            [['stripe_customer_id', sub.customer], ['id', sub.metadata?.user_id],
+             ['stripe_subscription_id', sub.id]],
+            { subscription_status:'free', stripe_subscription_id: null },
+            'subscription.deleted')) return false;
       break;
-    case 'invoice.payment_failed':
-      if (!await updateUserByCustomer(event.data.object.customer, { subscription_status:'past_due' }, 'payment_failed')) return false;
+    }
+    case 'invoice.payment_failed': {
+      const inv = event.data.object;
+      const patch = { subscription_status:'past_due' };
+      if (inv.customer) patch.stripe_customer_id = inv.customer;
+      // An invoice carries no subscription metadata of its own, but it does
+      // name the subscription, and that id is stored at checkout.
+      if (!await updateStripeUser(
+            [['stripe_customer_id', inv.customer], ['stripe_subscription_id', inv.subscription]],
+            patch, 'payment_failed')) return false;
       break;
-    case 'invoice.payment_succeeded':
-      if (event.data.object.billing_reason === 'subscription_cycle')
-        if (!await updateUserByCustomer(event.data.object.customer, { subscription_status:'pro' }, 'payment_succeeded')) return false;
+    }
+    case 'invoice.payment_succeeded': {
+      const inv = event.data.object;
+      // subscription_create as well as subscription_cycle. The first invoice is
+      // normally settled before checkout.session.completed fires, so this is
+      // redundant for card payments — but under a delayed payment method the
+      // session completes unpaid, and this is the event that confirms the money
+      // moved. Upgrading on a paid subscription invoice is right in both cases,
+      // and idempotent when it is the second thing to say so.
+      if (inv.billing_reason !== 'subscription_cycle'
+          && inv.billing_reason !== 'subscription_create') break;
+      const patch = { subscription_status:'pro' };
+      if (inv.customer) patch.stripe_customer_id = inv.customer;
+      if (!await updateStripeUser(
+            [['stripe_customer_id', inv.customer], ['stripe_subscription_id', inv.subscription]],
+            patch, `payment_succeeded(${inv.billing_reason})`)) return false;
       break;
+    }
   }
   return true;
 }
