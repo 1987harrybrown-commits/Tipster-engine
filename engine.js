@@ -3229,12 +3229,21 @@ function mapSubStatus(stripeStatus) {
 // arrives before customer.subscription.updated. Surface it instead of losing
 // the event without trace.
 async function updateUserByCustomer(customerId, patch, label) {
-  if (!customerId) { console.error(`Stripe ${label}: event carried no customer id`); return; }
+  if (!customerId) { console.error(`Stripe ${label}: event carried no customer id`); return false; }
   const { data, error } = await supabase.from('users').update(patch).eq('stripe_customer_id', customerId).select('id');
-  if (error) { console.error(`Stripe ${label} update failed:`, error.message); return; }
-  if (!data || !data.length) console.warn(`⚠️ Stripe ${label}: no user with stripe_customer_id=${customerId} — not applied`);
+  if (error) { console.error(`Stripe ${label} update failed:`, error.message); return false; }
+  if (!data || !data.length) {
+    // No row to apply it to. Retrying will not conjure one, so report success
+    // and let the warning stand rather than making Stripe redeliver for days.
+    console.warn(`⚠️ Stripe ${label}: no user with stripe_customer_id=${customerId} — not applied`);
+    return true;
+  }
+  return true;
 }
 
+// Returns false when the event could not be PERSISTED. The caller turns that
+// into a non-2xx so Stripe redelivers — its retry schedule runs for days and is
+// the only safety net for a database that was briefly unavailable.
 async function handleStripeWebhook(event) {
   console.log('Stripe:', event.type);
   switch(event.type) {
@@ -3242,9 +3251,24 @@ async function handleStripeWebhook(event) {
       const s = event.data.object;
       const uid = s.metadata?.user_id;
       if (!uid) break;
-      await supabase.from('users').update({ subscription_status:'pro', stripe_customer_id: s.customer, stripe_subscription_id: s.subscription }).eq('id', uid);
-      const { data: u } = await supabase.from('users').select('email,first_name').eq('id', uid).single();
-      if (u) await sendEmail({ to: u.email, subject: `Welcome to The Tipster Pro, ${u.first_name||'there'}`, html: buildWelcomeEmail({ userId: uid, firstName: u.first_name }), type: 'welcome_pro' });
+
+      // The most consequential write in the system: someone has just paid.
+      // Its result used to be discarded, and because the route answered 200
+      // before running any of this, a failure here meant Stripe never retried
+      // and the customer was silently never upgraded.
+      const { data: upgraded, error } = await supabase.from('users')
+        .update({ subscription_status:'pro', stripe_customer_id: s.customer, stripe_subscription_id: s.subscription })
+        .eq('id', uid).select('id');
+      if (error) { console.error('Stripe checkout.completed upgrade failed:', error.message); return false; }
+      if (!upgraded || !upgraded.length) { console.error(`Stripe checkout.completed: no user row for ${uid} — payment taken, account NOT upgraded`); return false; }
+
+      // The welcome email is best-effort and deliberately not awaited into the
+      // return value: a mail failure must not make Stripe redeliver the event
+      // and upgrade-plus-email the customer twice.
+      (async () => {
+        const { data: u } = await supabase.from('users').select('email,first_name').eq('id', uid).single();
+        if (u) await sendEmail({ to: u.email, subject: `Welcome to The Tipster Pro, ${u.first_name||'there'}`, html: buildWelcomeEmail({ userId: uid, firstName: u.first_name }), type: 'welcome_pro' });
+      })().catch(e => console.error('Welcome email failed:', e.message));
       break;
     }
     case 'customer.subscription.updated': {
@@ -3255,20 +3279,21 @@ async function handleStripeWebhook(event) {
       // so access correctly continues until subscription.deleted arrives.
       const patch = { subscription_status: mapped };
       if (mapped === 'free') patch.stripe_subscription_id = null;
-      await updateUserByCustomer(sub.customer, patch, `subscription.updated(${sub.status})`);
+      if (!await updateUserByCustomer(sub.customer, patch, `subscription.updated(${sub.status})`)) return false;
       break;
     }
     case 'customer.subscription.deleted':
-      await updateUserByCustomer(event.data.object.customer, { subscription_status:'free', stripe_subscription_id: null }, 'subscription.deleted');
+      if (!await updateUserByCustomer(event.data.object.customer, { subscription_status:'free', stripe_subscription_id: null }, 'subscription.deleted')) return false;
       break;
     case 'invoice.payment_failed':
-      await updateUserByCustomer(event.data.object.customer, { subscription_status:'past_due' }, 'payment_failed');
+      if (!await updateUserByCustomer(event.data.object.customer, { subscription_status:'past_due' }, 'payment_failed')) return false;
       break;
     case 'invoice.payment_succeeded':
       if (event.data.object.billing_reason === 'subscription_cycle')
-        await updateUserByCustomer(event.data.object.customer, { subscription_status:'pro' }, 'payment_succeeded');
+        if (!await updateUserByCustomer(event.data.object.customer, { subscription_status:'pro' }, 'payment_succeeded')) return false;
       break;
   }
+  return true;
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -3677,9 +3702,24 @@ http.createServer((req, res) => { (async () => {
       if (!sig) { res.writeHead(400); res.end('Missing signature'); return; }
       const event = verifyStripeWebhook(body, sig);
       if (!event) { res.writeHead(400); res.end('Invalid signature'); return; }
+      // Process BEFORE answering. This used to reply 200 and then fire the
+      // handler off unawaited, so a failed database write happened after Stripe
+      // had already been told the event was received — and Stripe never
+      // retried. Someone could pay and simply never be upgraded, with nothing
+      // but a line in the logs.
+      //
+      // Answering non-2xx on a persistence failure puts Stripe's redelivery
+      // schedule behind it instead. The writes are idempotent, so a retry that
+      // succeeds lands in exactly the right state.
+      const ok = await handleStripeWebhook(event)
+        .catch(e => { console.error('Webhook error:', e && e.message); return false; });
+      if (!ok) {
+        res.writeHead(500, { ...cors, 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Could not persist event — please retry' }));
+        return;
+      }
       res.writeHead(200, { ...cors, 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ received: true }));
-      handleStripeWebhook(event).catch(e => console.error('Webhook error:', e.message));
     })();
     return;
   }
