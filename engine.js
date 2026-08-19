@@ -2497,8 +2497,23 @@ async function settleResultsInner() {
       try {
         const oddsUsed = advisedPrice(tip);
         const stake    = parseFloat(tip.stake ?? 0);
-        if (!oddsUsed || !stake) {
-          console.log(`  ⚠️ Skipping backfill [${tip.tip_ref}] — missing odds/stake`);
+
+        // These were one condition, `!oddsUsed || !stake`, which skipped a
+        // stake of 0 because !0 is true. Pass 2 records those — an insight
+        // pick settles with a ledger row carrying stake 0 and P/L 0 — so the
+        // two passes disagreed about whether insight picks belong in the
+        // ledger, and one whose row was lost could never be restored.
+        //
+        // Pass 2 is the behaviour to match: their P/L is 0 so they move no
+        // total, every published figure already filters them out by tier and
+        // stake, and keeping them preserves the record of how the short-price
+        // picks actually did.
+        if (!Number.isFinite(oddsUsed) || oddsUsed <= 1) {
+          console.log(`  ⚠️ Skipping backfill [${tip.tip_ref}] — unusable price (${tip.advised_odds ?? tip.odds})`);
+          continue;
+        }
+        if (!Number.isFinite(stake) || stake < 0) {
+          console.log(`  ⚠️ Skipping backfill [${tip.tip_ref}] — unusable stake (${tip.stake})`);
           continue;
         }
 
