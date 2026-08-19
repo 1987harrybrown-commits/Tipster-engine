@@ -2784,6 +2784,20 @@ function verifyUnsubToken(token, uid) {
   return safeEqual(token, generateUnsubToken(uid));
 }
 
+// Escape values interpolated into email HTML.
+//
+// Three sources reach these templates and none were escaped: team names and
+// selections from the Sofascore feed, first names typed at signup with no
+// validation, and the match/selection text an admin types into an email
+// override. Brighton & Hove Albion alone means a bare ampersand is already
+// going out in real emails — invalid HTML that most clients tolerate and some
+// do not.
+function esc(v) {
+  return String(v == null ? '' : v)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
 function emailBase(content, userId) {
   const unsubUrl = `${SITE_URL.replace('www.','')}/unsubscribe?token=${generateUnsubToken(userId)}&uid=${userId}`;
   return `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>The Tipster Edge</title></head>
@@ -2804,7 +2818,7 @@ function emailBase(content, userId) {
 }
 
 function buildWelcomeEmail({ userId, firstName }) {
-  const g = firstName || 'there';
+  const g = esc(firstName || 'there');
   const content = `
 <p style="font-family:monospace;font-size:10px;text-transform:uppercase;letter-spacing:3px;color:#18e07a;margin:0 0 10px;">Welcome to Pro</p>
 <h1 style="font-size:22px;font-weight:800;color:#dde6f0;margin:0 0 8px;">You're in, ${g}.</h1>
@@ -2832,7 +2846,7 @@ function livePriceNote(tip, { block = false } = {}) {
 const PRICE_FOOTNOTE = '<p style="font-size:10px;color:#4a5a70;margin:18px 0 0;text-align:center;line-height:1.5;">Odds shown are the prices advised at publication — the same prices our published results are settled at.</p>';
 
 function buildProEmail({ tip, allTips, userId, firstName }) {
-  const g    = firstName || 'there';
+  const g    = esc(firstName || 'there');
   const edge = parseFloat(tip.model_edge != null ? tip.model_edge : 0).toFixed(1);
   const ec   = parseFloat(edge) >= 0 ? '#18e07a' : '#ff3d5a';
   const es   = parseFloat(edge) >= 0 ? `+${edge}%` : `${edge}%`;
@@ -2840,9 +2854,9 @@ function buildProEmail({ tip, allTips, userId, firstName }) {
     const te  = parseFloat(t.model_edge != null ? t.model_edge : 0).toFixed(1);
     const tec = parseFloat(te) >= 0 ? '#18e07a' : '#ff3d5a';
     return `<tr style="border-top:1px solid #1c2535;"><td style="padding:10px 14px;">
-<p style="font-size:10px;color:#4a5a70;margin:0 0 2px;font-family:monospace;text-transform:uppercase;">${t.sport} · ${t.league} · [${t.tip_ref}]</p>
-<p style="font-size:13px;font-weight:700;color:#dde6f0;margin:0 0 2px;">${t.home_team} vs ${t.away_team}</p>
-<p style="font-size:12px;color:#18e07a;margin:0;">${t.selection} <span style="color:#4a5a70;">@</span> <span style="color:#f0b429;font-family:monospace;">${advisedPrice(t).toFixed(2)}</span>${livePriceNote(t)}</p>
+<p style="font-size:10px;color:#4a5a70;margin:0 0 2px;font-family:monospace;text-transform:uppercase;">${esc(t.sport)} · ${esc(t.league)} · [${esc(t.tip_ref)}]</p>
+<p style="font-size:13px;font-weight:700;color:#dde6f0;margin:0 0 2px;">${esc(t.home_team)} vs ${esc(t.away_team)}</p>
+<p style="font-size:12px;color:#18e07a;margin:0;">${esc(t.selection)} <span style="color:#4a5a70;">@</span> <span style="color:#f0b429;font-family:monospace;">${advisedPrice(t).toFixed(2)}</span>${livePriceNote(t)}</p>
 </td><td style="padding:10px 14px;text-align:right;white-space:nowrap;">
 <p style="font-family:monospace;font-size:11px;color:${tec};margin:0;">${parseFloat(te)>=0?'+':''}${te}% edge</p>
 <p style="font-family:monospace;font-size:11px;color:#4a5a70;margin:2px 0;">${t.confidence}% conf · ${t.stake}u</p>
@@ -2852,12 +2866,12 @@ function buildProEmail({ tip, allTips, userId, firstName }) {
 <p style="font-family:monospace;font-size:10px;text-transform:uppercase;letter-spacing:3px;color:#f0b429;margin:0 0 10px;">Pro Early Access · 07:00</p>
 <h1 style="font-size:20px;font-weight:800;color:#dde6f0;margin:0 0 4px;">Morning, ${g}. Here's your full card.</h1>
 <p style="font-size:12px;color:#4a5a70;margin:0 0 22px;">${allTips.length} tips ready.</p>
-<p style="font-family:monospace;font-size:9px;text-transform:uppercase;letter-spacing:2px;color:#18e07a;margin:0 0 8px;">Best Pick · [${tip.tip_ref}]</p>
+<p style="font-family:monospace;font-size:9px;text-transform:uppercase;letter-spacing:2px;color:#18e07a;margin:0 0 8px;">Best Pick · [${esc(tip.tip_ref)}]</p>
 <table width="100%" cellpadding="0" cellspacing="0" style="background:#111620;border-radius:7px;margin-bottom:16px;">
 <tr><td style="padding:14px 16px;">
-<p style="font-size:11px;color:#4a5a70;margin:0 0 3px;font-family:monospace;text-transform:uppercase;">${tip.sport} · ${tip.league}</p>
-<p style="font-size:17px;font-weight:800;color:#dde6f0;margin:0 0 2px;">${tip.home_team} vs ${tip.away_team}</p>
-<p style="font-size:14px;color:#18e07a;margin:0;">${tip.selection}</p>
+<p style="font-size:11px;color:#4a5a70;margin:0 0 3px;font-family:monospace;text-transform:uppercase;">${esc(tip.sport)} · ${esc(tip.league)}</p>
+<p style="font-size:17px;font-weight:800;color:#dde6f0;margin:0 0 2px;">${esc(tip.home_team)} vs ${esc(tip.away_team)}</p>
+<p style="font-size:14px;color:#18e07a;margin:0;">${esc(tip.selection)}</p>
 </td><td style="padding:14px 16px;text-align:right;">
 <p style="font-family:monospace;font-size:26px;font-weight:700;color:#f0b429;margin:0;line-height:1;">${advisedPrice(tip).toFixed(2)}</p>
 ${livePriceNote(tip, { block: true })}
@@ -2869,19 +2883,19 @@ ${extras ? `<table width="100%" cellpadding="0" cellspacing="0" style="backgroun
 }
 
 function buildFreeEmail({ tip, proTipCount, userId, firstName }) {
-  const g    = firstName || 'there';
+  const g    = esc(firstName || 'there');
   const edge = parseFloat(tip.model_edge != null ? tip.model_edge : 0).toFixed(1);
   const ec   = parseFloat(edge) >= 0 ? '#18e07a' : '#ff3d5a';
   const es   = parseFloat(edge) >= 0 ? `+${edge}%` : `${edge}%`;
   const content = `
 <p style="font-family:monospace;font-size:10px;text-transform:uppercase;letter-spacing:3px;color:#18e07a;margin:0 0 10px;">Bet of the Day</p>
 <h1 style="font-size:20px;font-weight:800;color:#dde6f0;margin:0 0 4px;">Morning, ${g}.</h1>
-<p style="font-size:12px;color:#4a5a70;margin:0 0 22px;">Your daily pick · Ref: <span style="font-family:monospace;">[${tip.tip_ref || '-'}]</span></p>
+<p style="font-size:12px;color:#4a5a70;margin:0 0 22px;">Your daily pick · Ref: <span style="font-family:monospace;">[${esc(tip.tip_ref || '-')}]</span></p>
 <table width="100%" cellpadding="0" cellspacing="0" style="background:#111620;border-radius:7px;margin-bottom:16px;">
 <tr><td style="padding:14px 16px;">
-<p style="font-size:11px;color:#4a5a70;margin:0 0 3px;font-family:monospace;text-transform:uppercase;">${tip.sport} · ${tip.league}</p>
-<p style="font-size:17px;font-weight:800;color:#dde6f0;margin:0 0 2px;">${tip.home_team} vs ${tip.away_team}</p>
-<p style="font-size:14px;color:#18e07a;margin:0;">${tip.selection}</p>
+<p style="font-size:11px;color:#4a5a70;margin:0 0 3px;font-family:monospace;text-transform:uppercase;">${esc(tip.sport)} · ${esc(tip.league)}</p>
+<p style="font-size:17px;font-weight:800;color:#dde6f0;margin:0 0 2px;">${esc(tip.home_team)} vs ${esc(tip.away_team)}</p>
+<p style="font-size:14px;color:#18e07a;margin:0;">${esc(tip.selection)}</p>
 </td><td style="padding:14px 16px;text-align:right;">
 <p style="font-family:monospace;font-size:26px;font-weight:700;color:#f0b429;margin:0;line-height:1;">${advisedPrice(tip).toFixed(2)}</p>
 ${livePriceNote(tip, { block: true })}
@@ -2898,8 +2912,8 @@ ${livePriceNote(tip, { block: true })}
 
 function buildSaturdayEmail({ selections, combinedOdds, reasoning, userId }) {
   const rows = selections.map((s, i) => `<tr style="${i>0?'border-top:1px solid #1c2535;':''}"><td style="padding:11px 14px;">
-<p style="font-size:12px;font-weight:700;color:#dde6f0;margin:0 0 2px;">${s.match}</p>
-<p style="font-family:monospace;font-size:11px;color:#18e07a;margin:0;">${s.selection} <span style="color:#4a5a70;">@ ${parseFloat(s.odds).toFixed(2)}</span></p>
+<p style="font-size:12px;font-weight:700;color:#dde6f0;margin:0 0 2px;">${esc(s.match)}</p>
+<p style="font-family:monospace;font-size:11px;color:#18e07a;margin:0;">${esc(s.selection)} <span style="color:#4a5a70;">@ ${parseFloat(s.odds).toFixed(2)}</span></p>
 </td></tr>`).join('');
   const content = `
 <p style="font-family:monospace;font-size:10px;text-transform:uppercase;letter-spacing:3px;color:#18e07a;margin:0 0 10px;">Weekend Accumulator</p>
