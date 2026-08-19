@@ -2898,8 +2898,42 @@ async function getSubscribers(type = 'daily', tier = 'all') {
   let q = supabase.from('users').select('id, email, first_name, subscription_status').eq('email_opt_in', true).eq(col, true);
   if (tier === 'pro')  q = q.eq('subscription_status', 'pro');
   if (tier === 'free') q = q.neq('subscription_status', 'pro');
-  const { data } = await q;
+
+  // Returns null when the list could not be READ, versus [] when there
+  // genuinely are no subscribers. The error used to be discarded, so a
+  // database blip at dispatch time sent to nobody and logged "0/0" — which
+  // reads as "no subscribers today" rather than "we never found out who they
+  // are". Callers abort on null instead of quietly sending nothing.
+  const { data, error } = await q;
+  if (error) { console.error(`getSubscribers(${type}/${tier}) failed:`, error.message); return null; }
   return data || [];
+}
+
+// Sends one email per subscriber, isolating each so a single bad record cannot
+// take the rest of the list with it.
+//
+// That was a real exposure: the loops built the HTML inline and awaited the
+// send with no try/catch, so one throw — a malformed tip, an unexpected field —
+// aborted the loop, and every remaining subscriber got nothing. The scheduler
+// sets its per-day guard BEFORE dispatching, so there was no retry either: one
+// bad row silently cost the rest of that day's list.
+async function dispatchToSubscribers(label, subs, buildOne) {
+  if (subs === null) { console.error(`📧 ${label} aborted — could not read the subscriber list`); return { sent: 0, failed: 0, aborted: true }; }
+  if (!subs.length)  { console.log(`📧 ${label}: no subscribers`); return { sent: 0, failed: 0, aborted: false }; }
+
+  let sent = 0, failed = 0;
+  for (const u of subs) {
+    try {
+      const msg = buildOne(u);
+      if (await sendEmail(msg)) sent++; else failed++;
+    } catch (e) {
+      failed++;
+      console.error(`📧 ${label} failed for ${u && u.email}:`, e && e.message);
+    }
+    await new Promise(r => setTimeout(r, 100));
+  }
+  console.log(`📧 ${label}: ${sent} sent, ${failed} failed, of ${subs.length}`);
+  return { sent, failed, aborted: false };
 }
 
 async function getTodaysTips(limit = 15) {
@@ -2957,13 +2991,12 @@ async function sendProEmails() {
   const tips = await getTodaysTips(15);
   if (!tips.length) return;
   const subs = await getSubscribers('daily', 'pro');
-  let sent = 0;
-  for (const u of subs) {
-    const html = buildProEmail({ tip: tips[0], allTips: tips, userId: u.id, firstName: u.first_name });
-    if (await sendEmail({ to: u.email, subject: `${u.first_name?u.first_name+', ':''}Pro Early Access | ${tips.length} tips ready`, html, type: 'pro_daily' })) sent++;
-    await new Promise(r => setTimeout(r, 100));
-  }
-  console.log(`📧 Pro: ${sent}/${subs.length}`);
+  await dispatchToSubscribers('Pro', subs, (u) => ({
+    to: u.email,
+    subject: `${u.first_name ? u.first_name + ', ' : ''}Pro Early Access | ${tips.length} tips ready`,
+    html: buildProEmail({ tip: tips[0], allTips: tips, userId: u.id, firstName: u.first_name }),
+    type: 'pro_daily',
+  }));
 }
 
 async function sendDailyEmails() {
@@ -2972,13 +3005,12 @@ async function sendDailyEmails() {
   if (!tip) return;
   const all  = await getTodaysTips(15);
   const subs = await getSubscribers('daily', 'free');
-  let sent = 0;
-  for (const u of subs) {
-    const html = buildFreeEmail({ tip, proTipCount: Math.max(all.length - 1, 0), userId: u.id, firstName: u.first_name });
-    if (await sendEmail({ to: u.email, subject: `${u.first_name?u.first_name+', ':''}Today's Bet of the Day`, html, type: 'daily' })) sent++;
-    await new Promise(r => setTimeout(r, 100));
-  }
-  console.log(`📧 Free: ${sent}/${subs.length}`);
+  await dispatchToSubscribers('Free', subs, (u) => ({
+    to: u.email,
+    subject: `${u.first_name ? u.first_name + ', ' : ''}Today's Bet of the Day`,
+    html: buildFreeEmail({ tip, proTipCount: Math.max(all.length - 1, 0), userId: u.id, firstName: u.first_name }),
+    type: 'daily',
+  }));
 }
 
 async function sendSaturdayEmails() {
@@ -2986,13 +3018,12 @@ async function sendSaturdayEmails() {
   const acca = await getSaturdayAcca();
   if (!acca) return;
   const subs = await getSubscribers('saturday');
-  let sent = 0;
-  for (const u of subs) {
-    const html = buildSaturdayEmail({ ...acca, userId: u.id });
-    if (await sendEmail({ to: u.email, subject: `${u.first_name?u.first_name+', ':''}Saturday's ${acca.selections.length}-Fold | ${parseFloat(acca.combinedOdds).toFixed(2)} combined odds`, html, type: 'saturday' })) sent++;
-    await new Promise(r => setTimeout(r, 100));
-  }
-  console.log(`📧 Saturday: ${sent}/${subs.length}`);
+  await dispatchToSubscribers('Saturday', subs, (u) => ({
+    to: u.email,
+    subject: `${u.first_name ? u.first_name + ', ' : ''}Saturday's ${acca.selections.length}-Fold | ${parseFloat(acca.combinedOdds).toFixed(2)} combined odds`,
+    html: buildSaturdayEmail({ ...acca, userId: u.id }),
+    type: 'saturday',
+  }));
 }
 
 async function sendTestEmail(to, type) {
