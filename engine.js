@@ -3227,12 +3227,41 @@ async function getSubscribers(type = 'daily', tier = 'all') {
 // aborted the loop, and every remaining subscriber got nothing. The scheduler
 // sets its per-day guard BEFORE dispatching, so there was no retry either: one
 // bad row silently cost the rest of that day's list.
-async function dispatchToSubscribers(label, subs, buildOne) {
+async function dispatchToSubscribers(label, subs, buildOne, { type = null, force = false } = {}) {
   if (subs === null) { console.error(`📧 ${label} aborted — could not read the subscriber list`); return { sent: 0, failed: 0, aborted: true }; }
   if (!subs.length)  { console.log(`📧 ${label}: no subscribers`); return { sent: 0, failed: 0, aborted: false }; }
 
-  let sent = 0, failed = 0;
+  // Resume, do not restart.
+  //
+  // This used to be an all-or-nothing guard in each dispatcher: if email_log
+  // held ANY 'sent' row for this type today, the entire dispatch was skipped.
+  // That is right for a restart after the send finished and wrong for a
+  // restart during it — and the loop below is sequential with a delay between
+  // sends, so a few thousand subscribers take minutes and a restart inside
+  // that is exactly the case the guard was written for. Everyone after the
+  // interruption silently missed that day's email, and the log said
+  // "already sent today".
+  //
+  // Skipping per recipient covers both cases with one mechanism: a completed
+  // dispatch skips everyone, an interrupted one sends only the remainder, and
+  // nobody is sent twice either way.
+  let already = new Set();
+  if (type && !force) {
+    try {
+      const rows = await selectAll('email_log', 'recipient',
+        q => q.eq('type', type).eq('status', 'sent').gte('sent_at', ukDayStart().toISOString()));
+      already = new Set((rows || []).map(r => r.recipient));
+    } catch (e) {
+      // Delivery beats duplicate-avoidance here, which is also what the old
+      // guard chose: its read error returned null and the send proceeded.
+      console.error(`📧 ${label}: could not read today's send log (${e.message}) — sending to everyone`);
+      already = new Set();
+    }
+  }
+
+  let sent = 0, failed = 0, skipped = 0;
   for (const u of subs) {
+    if (already.has(u.email)) { skipped++; continue; }
     try {
       const msg = buildOne(u);
       if (await sendEmail(msg)) sent++; else failed++;
@@ -3242,8 +3271,13 @@ async function dispatchToSubscribers(label, subs, buildOne) {
     }
     await new Promise(r => setTimeout(r, 100));
   }
-  console.log(`📧 ${label}: ${sent} sent, ${failed} failed, of ${subs.length}`);
-  return { sent, failed, aborted: false };
+  console.log(`📧 ${label}: ${sent} sent, ${failed} failed, ${skipped} already had it, of ${subs.length}`);
+  // Preserves the shape the dispatchers used to return when the old guard
+  // fired, so callers and the admin dashboard read the same thing.
+  if (!sent && !failed && skipped) {
+    return { sent: 0, failed: 0, skipped: 'already sent today', aborted: false };
+  }
+  return { sent, failed, resumedPast: skipped, aborted: false };
 }
 
 async function getTodaysTips(limit = 15) {
@@ -3346,45 +3380,16 @@ async function getSaturdayAcca() {
   return { selections: sels, combinedOdds: sels.reduce((a,s) => a * parseFloat(s.odds), 1), reasoning: `${sels.length} high-confidence selections from today's card.` };
 }
 
-// Has a dispatch of this type already gone out today?
-//
-// The scheduler's per-day guards live in `lastRun`, which is in memory, so
-// they are lost on restart. Render restarts on every deploy, on
-// a crash, and when a sleeping instance wakes. A restart landing inside the
-// five-minute window a job fires in therefore re-runs it — and for the 07:00
-// Pro dispatch that means every paying subscriber receives the card twice.
-//
-// email_log already records a row per send with its type, so it can answer
-// this without new schema. Returns null when the question cannot be answered,
-// and the caller falls back to the in-memory guard: a database blip should not
-// turn "probably already sent" into a missed day for a paid product.
-async function alreadyDispatchedToday(type) {
-  try {
-    const { data, error } = await supabase.from('email_log')
-      .select('id')
-      .eq('type', type)
-      .eq('status', 'sent')
-      .gte('sent_at', ukDayStart().toISOString())
-      .limit(1);
-    if (error) { console.error(`alreadyDispatchedToday(${type}):`, error.message); return null; }
-    return !!(data && data.length);
-  } catch (e) {
-    console.error(`alreadyDispatchedToday(${type}):`, e.message);
-    return null;
-  }
-}
 
-// force skips the already-sent check. The scheduler never forces — a restart
-// inside its window must not re-send. An admin pressing the button in the
-// dashboard always does: that is a person deciding to send, usually because
-// the first attempt went wrong, and silently doing nothing while reporting
-// success is worse than a duplicate they asked for.
+// force is passed through to dispatchToSubscribers, where it skips the
+// already-sent check. The scheduler never forces — a restart inside its window
+// must not re-send to anyone who already has the email, though it must still
+// reach anyone who does not. An admin pressing the button in the dashboard
+// always forces: that is a person deciding to send, usually because the first
+// attempt went wrong, and silently doing nothing while reporting success is
+// worse than a duplicate they asked for.
 async function sendProEmails({ force = false } = {}) {
   console.log('📧 Pro dispatch 07:00...');
-  if (!force && await alreadyDispatchedToday('pro_daily')) {
-    console.log('📧 Pro dispatch already sent today — skipping (restart inside the send window)');
-    return { skipped: 'already sent today' };
-  }
   const tips = await getTodaysTips(15);
   if (!tips.length) return { skipped: 'no tips to send' };
   const subs = await getSubscribers('daily', 'pro');
@@ -3394,15 +3399,11 @@ async function sendProEmails({ force = false } = {}) {
     html: buildProEmail({ tip: tips[0], allTips: tips, userId: u.id, firstName: u.first_name }),
     type: 'pro_daily',
     userId: u.id,
-  }));
+  }), { type: 'pro_daily', force });
 }
 
 async function sendDailyEmails({ force = false } = {}) {
   console.log('📧 Free dispatch 08:30...');
-  if (!force && await alreadyDispatchedToday('daily')) {
-    console.log('📧 Free dispatch already sent today — skipping (restart inside the send window)');
-    return { skipped: 'already sent today' };
-  }
   const tip = await getBetOfTheDay();
   if (!tip) return { skipped: 'no bet of the day' };
   const all  = await getTodaysTips(15);
@@ -3413,15 +3414,11 @@ async function sendDailyEmails({ force = false } = {}) {
     html: buildFreeEmail({ tip, proTipCount: Math.max(all.length - 1, 0), userId: u.id, firstName: u.first_name }),
     type: 'daily',
     userId: u.id,
-  }));
+  }), { type: 'daily', force });
 }
 
 async function sendSaturdayEmails({ force = false } = {}) {
   console.log('📧 Saturday acca dispatch...');
-  if (!force && await alreadyDispatchedToday('saturday')) {
-    console.log('📧 Saturday dispatch already sent today — skipping (restart inside the send window)');
-    return { skipped: 'already sent today' };
-  }
   const acca = await getSaturdayAcca();
   if (!acca) return { skipped: 'no acca available' };
   const subs = await getSubscribers('saturday');
@@ -3431,7 +3428,7 @@ async function sendSaturdayEmails({ force = false } = {}) {
     html: buildSaturdayEmail({ ...acca, userId: u.id }),
     type: 'saturday',
     userId: u.id,
-  }));
+  }), { type: 'saturday', force });
 }
 
 async function sendTestEmail(to, type) {
