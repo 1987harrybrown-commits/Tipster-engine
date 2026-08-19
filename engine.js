@@ -2519,7 +2519,18 @@ async function settleResultsInner() {
       // Grade the selection. Resolve the side against BOTH teams — the old
       // ternary treated "not a home-name match" as "must be away", so a single
       // fuzzy-match miss silently graded the opposite team.
-      let won = false, graded = true;
+      // `push` is a whole-line totals tie — the total lands exactly on the line,
+      // the stake comes back and the bet is neither won nor lost. Both branches
+      // below used to fall to the losing side of the comparison, so a push was
+      // recorded as a full stake lost.
+      //
+      // Unreachable from what the engine currently publishes: the only totals
+      // selection it generates is 'Over 5.5', and a half line cannot tie. Admin
+      // overrides do take free text, but they build an email-only object and
+      // are never written to tips, so they are never settled. This is the
+      // settlement maths being right rather than a live defect — whole lines
+      // are ordinary if a totals market is ever added.
+      let won = false, graded = true, push = false;
       const sel = (tip.selection || '').toLowerCase().trim();
 
       if (/ win$/i.test(tip.selection || '')) {
@@ -2536,10 +2547,14 @@ async function settleResultsInner() {
         won = homeScore === awayScore;
       } else if (sel.startsWith('over')) {
         const line = parseFloat(sel.replace('over ', ''));
-        if (Number.isFinite(line)) won = (homeScore + awayScore) > line; else graded = false;
+        if (!Number.isFinite(line)) graded = false;
+        else if (homeScore + awayScore === line) push = true;
+        else won = (homeScore + awayScore) > line;
       } else if (sel.startsWith('under')) {
         const line = parseFloat(sel.replace('under ', ''));
-        if (Number.isFinite(line)) won = (homeScore + awayScore) < line; else graded = false;
+        if (!Number.isFinite(line)) graded = false;
+        else if (homeScore + awayScore === line) push = true;
+        else won = (homeScore + awayScore) < line;
       } else {
         console.error(`🚨 UNGRADEABLE [${tip.tip_ref}] unrecognised selection "${tip.selection}"`);
         graded = false;
@@ -2555,14 +2570,23 @@ async function settleResultsInner() {
         console.error(`🚨 [${tip.tip_ref}] invalid settlement odds (${settlementOdds}) — skipping`);
         continue;
       }
-      const pl = won
-        ? parseFloat(((settlementOdds - 1) * tip.stake).toFixed(2))
-        : parseFloat((-tip.stake).toFixed(2));
+      // Guarded the same way the odds are, immediately above. A null or
+      // non-numeric stake would otherwise produce NaN, and NaN written into
+      // profit_loss propagates through every aggregate that sums the ledger.
+      const settlementStake = parseFloat(tip.stake);
+      if (!Number.isFinite(settlementStake) || settlementStake < 0) {
+        console.error(`🚨 [${tip.tip_ref}] invalid stake (${tip.stake}) — skipping`);
+        continue;
+      }
+
+      const pl = push ? 0
+        : won ? parseFloat(((settlementOdds - 1) * settlementStake).toFixed(2))
+              : parseFloat((-settlementStake).toFixed(2));
 
       const { data: already } = await supabase.from('results_history').select('id').eq('tip_ref', tip.tip_ref).maybeSingle();
 
       await supabase.from('tips').update({
-        status: won ? 'won' : 'lost', profit_loss: pl,
+        status: push ? 'void' : won ? 'won' : 'lost', profit_loss: pl,
         result_updated_at: new Date().toISOString()
       }).eq('tip_ref', tip.tip_ref);
 
@@ -2576,9 +2600,12 @@ async function settleResultsInner() {
         event:      `${tip.home_team} vs ${tip.away_team}`,
         selection:  tip.selection,
         odds:       settlementOdds,
-        stake:      tip.stake,
+        stake:      settlementStake,
         tier:       tip.tier || 'pro',
-        result:     won ? 'WON' : 'LOST',
+        // VOID is already the value the acca settler uses for a void, and every
+        // aggregate counts wins and losses explicitly, so a VOID row is
+        // excluded from win rate while its 0 still sums correctly into P/L.
+        result:     push ? 'VOID' : won ? 'WON' : 'LOST',
         profit_loss: pl,
         running_pl:  currentRunningPL,
         settled_at:  new Date().toISOString(),
@@ -2597,7 +2624,7 @@ async function settleResultsInner() {
         continue;
       }
 
-      console.log(`${won ? '✅ WON' : '❌ LOST'}: [${tip.tip_ref}] ${tip.home_team} vs ${tip.away_team} — ${tip.selection} @ ${settlementOdds} (${pl >= 0 ? '+' : ''}${pl}u)`);
+      console.log(`${push ? '➖ PUSH' : won ? '✅ WON' : '❌ LOST'}: [${tip.tip_ref}] ${tip.home_team} vs ${tip.away_team} — ${tip.selection} @ ${settlementOdds} (${pl >= 0 ? '+' : ''}${pl}u)`);
       count++; dirty = true;
 
     } catch(e) { console.error(`Settle error [${tip.tip_ref}]:`, e.message); }
