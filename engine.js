@@ -2240,10 +2240,19 @@ async function fetchSofascoreResult(eventId) {
 // Returns the true cumulative total so the caller can re-seed from it.
 async function recomputeRunningPL() {
   const rows = await selectAll('results_history', 'id, profit_loss, running_pl, settled_at');
+  // A comparator must never return NaN. new Date(null).getTime() and any
+  // unparseable settled_at both give NaN, and NaN !== NaN is true, so the old
+  // comparator took the `ta - tb` branch and returned NaN — which leaves the
+  // sort order undefined. Every running_pl is derived from this ordering, so
+  // one bad timestamp could scramble the whole ledger rather than just its own
+  // row. Undated rows sort first, deterministically, then by primary key.
+  const at = (r) => {
+    const t = new Date(r.settled_at).getTime();
+    return Number.isFinite(t) ? t : -Infinity;
+  };
   rows.sort((a, b) => {
-    const ta = new Date(a.settled_at).getTime();
-    const tb = new Date(b.settled_at).getTime();
-    if (ta !== tb) return ta - tb;
+    const ta = at(a), tb = at(b);
+    if (ta !== tb) return ta < tb ? -1 : 1;
     return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;   // stable tiebreak on PK
   });
 
