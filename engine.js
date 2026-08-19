@@ -1693,7 +1693,7 @@ async function analyseFootballFixture(event, sport) {
     // market changes what subscribers are advised to bet, so it is left as a
     // decision rather than switched on. The unused locals that used to sit here
     // read as though the market were live.
-    
+
     const contextNote = `Form H:${homeMod.notes} | A:${awayMod.notes}`;
 
     const candidates = [];
