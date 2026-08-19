@@ -12,8 +12,22 @@
 // STRICT RULES ENGINE — target ROI: 30%+
 //   Sports:  Ice Hockey (primary), Basketball (primary), Football (secondary)
 //   Markets: H2H win markets + Overs (secondary, stricter rules)
-//   Odds:    1.40–2.20 core | 2.21–2.50 elite only | reject outside
-//   Edge:    H2H ≥ 8% | Overs ≥ 12% | Elite grade requires ≥ 10% (H2H) / 14% (Overs)
+//   Odds:    insight from INSIGHT_ODDS_MIN 1.05 | staked from BET_ODDS_MIN 1.35
+//            | rejected above ODDS_ELITE_MAX 10.0.
+//            (This line read "1.40–2.20 core | 2.21–2.50 elite only" for a long
+//            time. The code has never enforced a 2.50 ceiling; whether it
+//            should is a decision about which bets get published, so the line
+//            has been corrected to describe the constants rather than the
+//            constants changed to match the line.)
+//   Edge:    no minimum is enforced. MIN_EDGE_PCT exists but is referenced
+//            nowhere, and ELITE_H2H_EDGE / ELITE_OVERS_EDGE only pick the
+//            displayed grade. What actually excludes a no-edge bet is Kelly:
+//            the fraction is <= 0 whenever modelProb <= 1/odds, so it sizes at
+//            0 and the tip publishes as insight. Measured over everything that
+//            clears the confidence and odds filters, 1.6% of combinations have
+//            non-positive edge against the price — the confidence buckets this
+//            replaced staked about a unit on every one of them.
+//            (This line read "H2H ≥ 8% | Overs ≥ 12%", which was never enforced.)
 //   Grades:  A+ / A / B — edge bands only, for display. Grades do NOT set the
 //            stake: that is quarter-Kelly (see KELLY_TIERS), which depends on
 //            odds as well as edge, so the two correlate but do not map onto
