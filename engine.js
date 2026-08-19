@@ -4026,7 +4026,7 @@ function readBody(req, maxBytes = 1048576) {
 // and it was the first statement in the handler, so `GET //` killed the engine
 // outright. An unauthenticated one-line request took the whole service down,
 // and every restart re-ran morningFetch and spent RapidAPI quota.
-http.createServer((req, res) => { (async () => {
+const server = http.createServer((req, res) => { (async () => {
   // A malformed path is a client error, not a server fault.
   let url;
   try {
@@ -4532,6 +4532,31 @@ http.createServer((req, res) => { (async () => {
   console.log(`🟢 HTTP server on port ${process.env.PORT || 3000}`);
 });
 
+// Render sends SIGTERM before replacing the process, on every deploy. With no
+// handler the listening socket is cut mid-request, so whoever happened to be
+// checking out at that moment gets a connection reset instead of an answer.
+// Stop accepting new connections, let the in-flight ones finish, then exit.
+//
+// An in-flight email dispatch is deliberately NOT waited for. It can run for
+// minutes — longer than the platform's grace period — and dispatchToSubscribers
+// now resumes per recipient on the next start, so being cut short costs nothing
+// except the waiting. Blocking here would just get the process force-killed at
+// the same point, having also delayed the deploy.
+let shuttingDown = false;
+function shutdown(signal) {
+  if (shuttingDown) return;            // SIGTERM then SIGKILL is normal
+  shuttingDown = true;
+  console.log(`
+${signal} received — finishing in-flight requests`);
+  server.close(() => { console.log('🔴 HTTP server closed'); process.exit(0); });
+  // A keep-alive connection that never sends another request would otherwise
+  // hold close() open until the platform kills us anyway. unref so this timer
+  // cannot by itself keep the process alive.
+  setTimeout(() => { console.log('🔴 Grace period elapsed'); process.exit(0); }, 10000).unref();
+}
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT',  () => shutdown('SIGINT'));
+
 // ═══════════════════════════════════════════════════════════════
 // STARTUP
 // ═══════════════════════════════════════════════════════════════
@@ -4543,6 +4568,19 @@ http.createServer((req, res) => { (async () => {
 // dying silently on something nobody anticipated.
 process.on('unhandledRejection', (reason) => {
   console.error('⚠️ UNHANDLED REJECTION (service kept alive):', reason && (reason.stack || reason.message || reason));
+});
+
+// The synchronous half of the same problem. A throw from a timer callback or an
+// event emitter has no try/catch to land in, and Node's default is to terminate.
+//
+// The standard advice is to log and exit, on the grounds that a process which
+// has thrown from an unknown place is in an unknown state. That argument is
+// weaker here than usual: this service keeps its state in Supabase rather than
+// in memory, so there is little in-process state to be corrupted — and the
+// alternative is a total outage plus another metered morningFetch on restart.
+// Same trade as the handler above, made deliberately.
+process.on('uncaughtException', (err) => {
+  console.error('⚠️ UNCAUGHT EXCEPTION (service kept alive):', err && (err.stack || err.message || err));
 });
 
 (async () => {
