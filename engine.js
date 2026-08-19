@@ -4355,9 +4355,34 @@ http.createServer((req, res) => { (async () => {
           .select('stripe_subscription_id').eq('id', userId).maybeSingle();
         if (existing?.stripe_subscription_id) {
           const current = await stripeRequest(`/subscriptions/${existing.stripe_subscription_id}`);
-          if (current && (current.status === 'active' || current.status === 'trialing')) {
+
+          // Any subscription that still exists at Stripe blocks a second one,
+          // not just an active or trialing one.
+          //
+          // past_due was the gap. A failed payment maps the account to
+          // 'past_due', which every reader treats as not-Pro — so the account
+          // page shows an Upgrade button, and this guard used to wave the
+          // resulting checkout straight through. The webhook then overwrote
+          // stripe_subscription_id with the new subscription and the original
+          // kept billing with nothing in the app pointing at it: exactly the
+          // double-charge this guard exists to prevent.
+          //
+          // 'incomplete' is deliberately absent. That is a checkout whose first
+          // payment never landed; Stripe expires it within a day, and blocking
+          // it would strand someone who simply abandoned a payment and came
+          // back to try again.
+          const LIVE = ['active', 'trialing', 'past_due', 'unpaid', 'paused'];
+          if (current && LIVE.includes(current.status)) {
+            const needsPayment = current.status === 'past_due' || current.status === 'unpaid';
             res.writeHead(409, { ...cors, 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ error: 'You already have an active subscription.', alreadySubscribed: true }));
+            res.end(JSON.stringify({
+              error: needsPayment
+                ? 'Your subscription needs a payment method updating — manage it from your account rather than starting a new one.'
+                : 'You already have an active subscription.',
+              alreadySubscribed: true,
+              subscriptionStatus: current.status,
+              needsPayment,
+            }));
             return;
           }
         }
