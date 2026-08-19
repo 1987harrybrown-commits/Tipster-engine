@@ -3548,7 +3548,23 @@ http.createServer((req, res) => { (async () => {
       }
       const today = ukDayStart();
       const tom = new Date(today.getTime() + 3 * 24 * 3600000);
-      const { data: allTips } = await supabase.from('tips').select('*').gte('event_time', today.toISOString()).lte('event_time', tom.toISOString()).eq('status', 'pending').order('confidence', { ascending: false }).limit(50);
+      const { data: allTips, error: tipsErr } = await supabase.from('tips').select('*').gte('event_time', today.toISOString()).lte('event_time', tom.toISOString()).eq('status', 'pending').order('confidence', { ascending: false }).limit(50);
+
+      // A failed query is not the same as a quiet day. The error used to be
+      // discarded, so `allTips || []` turned a database outage into a cheerful
+      // 200 with an empty list — and the site renders that as "No tips yet",
+      // identical to a day with no fixtures.
+      //
+      // That matters most for a misconfigured Row Level Security policy, which
+      // presents exactly this way: tips silently vanish and the engine looks
+      // broken. Say so instead, so the frontend can distinguish "nothing on"
+      // from "we cannot reach the data".
+      if (tipsErr) {
+        console.error('/tips query failed:', tipsErr.message);
+        res.writeHead(503, { ...cors, 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Tips temporarily unavailable', tips: [], isPro })); return;
+      }
+
       const tips = (allTips || []).map((tip, i) => {
         const isLocked = !isPro && i >= 3;
         if (isLocked) return { tip_ref: tip.tip_ref, sport: tip.sport, league: tip.league, home_team: tip.home_team, away_team: tip.away_team, event_time: tip.event_time, tier: tip.tier, locked: true };
