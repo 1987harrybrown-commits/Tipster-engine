@@ -1587,6 +1587,37 @@ function winProbFromMargin(expectedMargin, stdDev = NBA_SCORE_STD_DEV) {
 // ─── MARKET DATA EXTRACTION ───────────────────────────────────
 // Splits football (3-way) from NBA/NHL (2-way) cleanly.
 // Returns null if no valid market found.
+// Pick the book to de-vig against.
+//
+// This used to be books[0] — whichever the feed happened to list first. Two
+// problems with that, and the second is the worse one.
+//
+// A book's margin is how far its prices sit from the true probability, so the
+// tightest book is the best estimate available. Taking an arbitrary one means a
+// soft book with a 12% margin can set the model's view of a match while a 3%
+// book sits unused two entries later.
+//
+// And feed order is not guaranteed stable. If the bookmakers come back in a
+// different order at 13:00 than at 06:00, the de-vigged probability moves with
+// no price having changed anywhere — so the published edge shifts for no
+// reason, and the line-move rejection in saveTips is comparing against noise.
+// Sorting by margin makes the choice deterministic; the title tie-break makes
+// it deterministic even between two books quoting identical prices.
+//
+// Averaging across books is not the alternative: de-vigging needs a coherent
+// set of prices from one book, and an average of several is not one.
+function sharpestBook(books, sumImplied) {
+  let best = null, bestMargin = Infinity;
+  for (const b of books) {
+    const m = sumImplied(b);
+    if (!Number.isFinite(m) || m <= 0) continue;
+    if (m < bestMargin || (m === bestMargin && best && String(b.title) < String(best.title))) {
+      best = b; bestMargin = m;
+    }
+  }
+  return best;
+}
+
 function extractMarketData(event) {
   const books1x2  = [];
   const books2way = [];
@@ -1644,7 +1675,8 @@ function extractMarketData(event) {
 
   // 3-way (football)
   if (books1x2.length > 0) {
-    const b       = books1x2[0];
+    const b = sharpestBook(books1x2, (x) => (1/x.home) + (1/x.draw) + (1/x.away));
+    if (!b) return null;
     const totalIP = (1/b.home) + (1/b.draw) + (1/b.away);
     return {
       trueHome:   (1/b.home) / totalIP,
@@ -1662,7 +1694,8 @@ function extractMarketData(event) {
 
   // 2-way (NBA/NHL)
   if (books2way.length > 0) {
-    const b       = books2way[0];
+    const b = sharpestBook(books2way, (x) => (1/x.home) + (1/x.away));
+    if (!b) return null;
     const totalIP = (1/b.home) + (1/b.away);
     return {
       trueHome:   (1/b.home) / totalIP,
