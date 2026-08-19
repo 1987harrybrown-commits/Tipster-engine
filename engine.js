@@ -2658,8 +2658,25 @@ async function updateStatsCache() {
   try {
     // PAGINATED — an unbounded select caps at 1000 rows, so published
     // win rate and ROI would silently be computed from a partial ledger.
-    const data = await selectAll('results_history', 'result, profit_loss, stake');
+    const rows = await selectAll('results_history', 'result, profit_loss, stake, tier');
+    if (!rows.length) return;
+
+    // Win rate and ROI have to describe the SAME set of tips, and until now
+    // they did not. applyStrictRules publishes short-price selections with
+    // stake 0 and tier 'insight' — informational, never advised as bets. Those
+    // counted towards win rate but, having no stake, contributed nothing to
+    // ROI. So the two headline figures were computed over different
+    // populations, and because insight picks are short-priced they win more
+    // often than average, which pulled the published win rate up.
+    //
+    // There is no way to include them in ROI — you cannot compute a return on a
+    // stake of zero — so the only coherent resolution is to report the record
+    // of actual bets. Both figures now cover the same staked rows.
+    const data = rows.filter(r => r.tier !== 'insight' && parseFloat(r.stake ?? 1) > 0);
+    const skipped = rows.length - data.length;
+    if (skipped) console.log(`📈 Excluding ${skipped} informational pick(s) from the published record`);
     if (!data.length) return;
+
     const won   = data.filter(r => r.result === 'WON').length;
     const lost  = data.filter(r => r.result === 'LOST').length;
     const total = won + lost;
