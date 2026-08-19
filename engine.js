@@ -3057,6 +3057,12 @@ function esc(v) {
 }
 
 function emailBase(content, userId) {
+  // Every email this product sends recommends bets, and none of them carried
+  // any of the messaging the website carries on every page: no 18+ notice, no
+  // "past performance" line, no route to help. The emails are the channel the
+  // advice actually arrives through, so they were the one surface where it
+  // mattered most and the only one where it was absent. It goes in the shared
+  // shell rather than the templates so a fifth email cannot be added without it.
   const unsubUrl = `${SITE_URL.replace('www.','')}/unsubscribe?token=${generateUnsubToken(userId)}&uid=${userId}`;
   return `<!DOCTYPE html><html lang="en-GB"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>The Tipster Edge</title></head>
 <body style="margin:0;padding:0;background:#07090d;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;">
@@ -3068,7 +3074,9 @@ function emailBase(content, userId) {
 </td></tr>
 <tr><td style="background:#0c0f15;border-radius:10px;padding:28px 24px;">${content}</td></tr>
 <tr><td style="padding-top:20px;text-align:center;">
-<p style="font-size:11px;color:#6c83a3;margin:0;">© The Tipster Edge · <a href="${unsubUrl}" style="color:#6c83a3;">Unsubscribe</a></p>
+<p style="font-size:11px;color:#6c83a3;margin:0 0 10px;">© The Tipster Edge · <a href="${unsubUrl}" style="color:#6c83a3;">Unsubscribe</a></p>
+<p style="font-size:10px;line-height:1.7;color:#6c83a3;margin:0;">&#9888; <strong style="color:#6c83a3;">18+ only.</strong> Tips are for informational purposes only. Past performance does not guarantee future results. Please gamble responsibly.</p>
+<p style="font-size:10px;line-height:1.7;color:#6c83a3;margin:6px 0 0;"><a href="${SITE_URL.replace('www.','')}/responsible-gambling.html" style="color:#6c83a3;text-decoration:underline;">Responsible Gambling</a> · <a href="https://www.begambleaware.org" style="color:#6c83a3;text-decoration:underline;">BeGambleAware.org</a> · National Gambling Helpline 0808 8020 133</p>
 </td></tr>
 </table>
 </td></tr>
