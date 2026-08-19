@@ -2810,7 +2810,7 @@ function emailBase(content, userId) {
 </td></tr>
 <tr><td style="background:#0c0f15;border-radius:10px;padding:28px 24px;">${content}</td></tr>
 <tr><td style="padding-top:20px;text-align:center;">
-<p style="font-size:11px;color:#6a81a0;margin:0;">© The Tipster Edge · <a href="${unsubUrl}" style="color:#6a81a0;">Unsubscribe</a></p>
+<p style="font-size:11px;color:#6c83a3;margin:0;">© The Tipster Edge · <a href="${unsubUrl}" style="color:#6c83a3;">Unsubscribe</a></p>
 </td></tr>
 </table>
 </td></tr>
@@ -2839,11 +2839,11 @@ function livePriceNote(tip, { block = false } = {}) {
   if (Math.abs(live - advised) <= 0.01) return '';
   return block
     ? `<p style="font-family:monospace;font-size:10px;color:#7a8fa6;margin:3px 0 0;">now ${live.toFixed(2)}</p>`
-    : ` <span style="color:#6a81a0;">· now ${live.toFixed(2)}</span>`;
+    : ` <span style="color:#6c83a3;">· now ${live.toFixed(2)}</span>`;
 }
 
 // Stated once per email so the headline number needs no per-tip label.
-const PRICE_FOOTNOTE = '<p style="font-size:10px;color:#6a81a0;margin:18px 0 0;text-align:center;line-height:1.5;">Odds shown are the prices advised at publication — the same prices our published results are settled at.</p>';
+const PRICE_FOOTNOTE = '<p style="font-size:10px;color:#6c83a3;margin:18px 0 0;text-align:center;line-height:1.5;">Odds shown are the prices advised at publication — the same prices our published results are settled at.</p>';
 
 function buildProEmail({ tip, allTips, userId, firstName }) {
   const g    = esc(firstName || 'there');
@@ -2854,22 +2854,22 @@ function buildProEmail({ tip, allTips, userId, firstName }) {
     const te  = parseFloat(t.model_edge != null ? t.model_edge : 0).toFixed(1);
     const tec = parseFloat(te) >= 0 ? '#18e07a' : '#ff3d5a';
     return `<tr style="border-top:1px solid #1c2535;"><td style="padding:10px 14px;">
-<p style="font-size:10px;color:#6a81a0;margin:0 0 2px;font-family:monospace;text-transform:uppercase;">${esc(t.sport)} · ${esc(t.league)} · [${esc(t.tip_ref)}]</p>
+<p style="font-size:10px;color:#6c83a3;margin:0 0 2px;font-family:monospace;text-transform:uppercase;">${esc(t.sport)} · ${esc(t.league)} · [${esc(t.tip_ref)}]</p>
 <p style="font-size:13px;font-weight:700;color:#dde6f0;margin:0 0 2px;">${esc(t.home_team)} vs ${esc(t.away_team)}</p>
-<p style="font-size:12px;color:#18e07a;margin:0;">${esc(t.selection)} <span style="color:#6a81a0;">@</span> <span style="color:#f0b429;font-family:monospace;">${advisedPrice(t).toFixed(2)}</span>${livePriceNote(t)}</p>
+<p style="font-size:12px;color:#18e07a;margin:0;">${esc(t.selection)} <span style="color:#6c83a3;">@</span> <span style="color:#f0b429;font-family:monospace;">${advisedPrice(t).toFixed(2)}</span>${livePriceNote(t)}</p>
 </td><td style="padding:10px 14px;text-align:right;white-space:nowrap;">
 <p style="font-family:monospace;font-size:11px;color:${tec};margin:0;">${parseFloat(te)>=0?'+':''}${te}% edge</p>
-<p style="font-family:monospace;font-size:11px;color:#6a81a0;margin:2px 0;">${t.confidence}% conf · ${t.stake}u</p>
+<p style="font-family:monospace;font-size:11px;color:#6c83a3;margin:2px 0;">${t.confidence}% conf · ${t.stake}u</p>
 </td></tr>`;
   }).join('');
   const content = `
 <p style="font-family:monospace;font-size:10px;text-transform:uppercase;letter-spacing:3px;color:#f0b429;margin:0 0 10px;">Pro Early Access · 07:00</p>
 <h1 style="font-size:20px;font-weight:800;color:#dde6f0;margin:0 0 4px;">Morning, ${g}. Here's your full card.</h1>
-<p style="font-size:12px;color:#6a81a0;margin:0 0 22px;">${allTips.length} tips ready.</p>
+<p style="font-size:12px;color:#6c83a3;margin:0 0 22px;">${allTips.length} tips ready.</p>
 <p style="font-family:monospace;font-size:9px;text-transform:uppercase;letter-spacing:2px;color:#18e07a;margin:0 0 8px;">Best Pick · [${esc(tip.tip_ref)}]</p>
 <table width="100%" cellpadding="0" cellspacing="0" style="background:#111620;border-radius:7px;margin-bottom:16px;">
 <tr><td style="padding:14px 16px;">
-<p style="font-size:11px;color:#6a81a0;margin:0 0 3px;font-family:monospace;text-transform:uppercase;">${esc(tip.sport)} · ${esc(tip.league)}</p>
+<p style="font-size:11px;color:#6c83a3;margin:0 0 3px;font-family:monospace;text-transform:uppercase;">${esc(tip.sport)} · ${esc(tip.league)}</p>
 <p style="font-size:17px;font-weight:800;color:#dde6f0;margin:0 0 2px;">${esc(tip.home_team)} vs ${esc(tip.away_team)}</p>
 <p style="font-size:14px;color:#18e07a;margin:0;">${esc(tip.selection)}</p>
 </td><td style="padding:14px 16px;text-align:right;">
@@ -2890,10 +2890,10 @@ function buildFreeEmail({ tip, proTipCount, userId, firstName }) {
   const content = `
 <p style="font-family:monospace;font-size:10px;text-transform:uppercase;letter-spacing:3px;color:#18e07a;margin:0 0 10px;">Bet of the Day</p>
 <h1 style="font-size:20px;font-weight:800;color:#dde6f0;margin:0 0 4px;">Morning, ${g}.</h1>
-<p style="font-size:12px;color:#6a81a0;margin:0 0 22px;">Your daily pick · Ref: <span style="font-family:monospace;">[${esc(tip.tip_ref || '-')}]</span></p>
+<p style="font-size:12px;color:#6c83a3;margin:0 0 22px;">Your daily pick · Ref: <span style="font-family:monospace;">[${esc(tip.tip_ref || '-')}]</span></p>
 <table width="100%" cellpadding="0" cellspacing="0" style="background:#111620;border-radius:7px;margin-bottom:16px;">
 <tr><td style="padding:14px 16px;">
-<p style="font-size:11px;color:#6a81a0;margin:0 0 3px;font-family:monospace;text-transform:uppercase;">${esc(tip.sport)} · ${esc(tip.league)}</p>
+<p style="font-size:11px;color:#6c83a3;margin:0 0 3px;font-family:monospace;text-transform:uppercase;">${esc(tip.sport)} · ${esc(tip.league)}</p>
 <p style="font-size:17px;font-weight:800;color:#dde6f0;margin:0 0 2px;">${esc(tip.home_team)} vs ${esc(tip.away_team)}</p>
 <p style="font-size:14px;color:#18e07a;margin:0;">${esc(tip.selection)}</p>
 </td><td style="padding:14px 16px;text-align:right;">
@@ -2913,12 +2913,12 @@ ${livePriceNote(tip, { block: true })}
 function buildSaturdayEmail({ selections, combinedOdds, reasoning, userId }) {
   const rows = selections.map((s, i) => `<tr style="${i>0?'border-top:1px solid #1c2535;':''}"><td style="padding:11px 14px;">
 <p style="font-size:12px;font-weight:700;color:#dde6f0;margin:0 0 2px;">${esc(s.match)}</p>
-<p style="font-family:monospace;font-size:11px;color:#18e07a;margin:0;">${esc(s.selection)} <span style="color:#6a81a0;">@ ${parseFloat(s.odds).toFixed(2)}</span></p>
+<p style="font-family:monospace;font-size:11px;color:#18e07a;margin:0;">${esc(s.selection)} <span style="color:#6c83a3;">@ ${parseFloat(s.odds).toFixed(2)}</span></p>
 </td></tr>`).join('');
   const content = `
 <p style="font-family:monospace;font-size:10px;text-transform:uppercase;letter-spacing:3px;color:#18e07a;margin:0 0 10px;">Weekend Accumulator</p>
 <h1 style="font-size:22px;font-weight:800;color:#dde6f0;margin:0 0 6px;">Saturday's Best ${selections.length}-Fold</h1>
-<p style="font-size:12px;color:#6a81a0;margin:0 0 24px;">Combined odds: <span style="font-family:monospace;font-weight:700;color:#f0b429;font-size:15px;">${parseFloat(combinedOdds).toFixed(2)}</span></p>
+<p style="font-size:12px;color:#6c83a3;margin:0 0 24px;">Combined odds: <span style="font-family:monospace;font-weight:700;color:#f0b429;font-size:15px;">${parseFloat(combinedOdds).toFixed(2)}</span></p>
 <table width="100%" cellpadding="0" cellspacing="0" style="background:#111620;border-radius:7px;margin-bottom:20px;">${rows}</table>
 <div style="text-align:center;"><a href="${SITE_URL}/#tips" style="display:inline-block;background:#18e07a;color:#07090d;font-size:13px;font-weight:700;padding:13px 28px;border-radius:5px;text-decoration:none;">View Full Weekend Card</a></div>`;
   return emailBase(content, userId);
