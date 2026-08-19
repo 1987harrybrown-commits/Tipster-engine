@@ -2635,11 +2635,23 @@ async function settleResultsInner() {
 
   // Settle daily accas
   try {
-    const { data: pendingAccas } = await supabase.from('daily_accas').select('*').eq('result', 'pending');
+    // The error was discarded, so a failed read looked exactly like "no accas
+    // are pending": the loop simply did not run and nothing was logged. Accas
+    // would quietly stop settling with no signal anywhere.
+    const { data: pendingAccas, error: accaErr } = await supabase.from('daily_accas').select('*').eq('result', 'pending');
+    if (accaErr) throw new Error(`could not read pending accas: ${accaErr.message}`);
     for (const acca of (pendingAccas || [])) {
       const tipRefs = (acca.selections || []).map(s => s.tip_ref).filter(Boolean);
       if (!tipRefs.length) continue;
-      const { data: legTips } = await supabase.from('tips').select('tip_ref, status, odds, best_odds, advised_odds').in('tip_ref', tipRefs);
+      const { data: legTips, error: legErr } = await supabase.from('tips').select('tip_ref, status, odds, best_odds, advised_odds').in('tip_ref', tipRefs);
+      // A failed read is not the same as legs that are genuinely absent. The
+      // second needs manual review; the first just needs another run, and
+      // saying "needs manual review" for it sends someone looking for rows
+      // that are there.
+      if (legErr) {
+        console.error(`❌ Acca ${acca.date}: could not read leg tips — ${legErr.message}; will retry next run`);
+        continue;
+      }
       if (!legTips || legTips.length < tipRefs.length) {
         console.warn(`⚠️ Acca ${acca.date}: ${tipRefs.length - (legTips?.length || 0)} leg tip(s) missing from tips table — cannot settle, needs manual review`);
         continue;
@@ -2668,7 +2680,13 @@ async function settleResultsInner() {
       } else {
         pl = parseFloat((-parseFloat(acca.stake ?? 1)).toFixed(2));
       }
-      await supabase.from('daily_accas').update({ result, profit_loss: pl }).eq('id', acca.id);
+      const { error: updErr } = await supabase.from('daily_accas').update({ result, profit_loss: pl }).eq('id', acca.id);
+      if (updErr) {
+        // Left pending on purpose: the next run re-settles it. Logging matters
+        // because otherwise the acca silently never leaves 'pending'.
+        console.error(`❌ Acca ${acca.date}: settle write failed — ${updErr.message}; stays pending for the next run`);
+        continue;
+      }
       console.log(`📋 Acca ${acca.date} settled: ${result} (${pl >= 0 ? '+' : ''}${pl}u)`);
     }
   } catch(e) { console.error('Acca settlement error:', e.message); }
@@ -2708,7 +2726,12 @@ async function updateStatsCache() {
     const lost  = data.filter(r => r.result === 'LOST').length;
     const total = won + lost;
     const pl    = data.reduce((s,r) => s + parseFloat(r.profit_loss || 0), 0);
-    const stk   = data.reduce((s,r) => s + parseFloat(r.stake ?? 1), 0);
+    // A push returns the stake, so it is not turnover. Counting it would
+    // inflate the ROI denominator and understate the return. Wins and losses
+    // are already the only rows in the win-rate figures above, so this keeps
+    // both headline numbers over the same set.
+    const settledRows = data.filter(r => r.result === 'WON' || r.result === 'LOST');
+    const stk   = settledRows.reduce((s,r) => s + parseFloat(r.stake ?? 1), 0);
     const { data: cached, error: statsErr } = await supabase.from('stats_cache').update({
       total_tips:   total, total_won: won, total_lost: lost,
       win_rate:     total > 0 ? parseFloat((won/total*100).toFixed(1)) : 0,
