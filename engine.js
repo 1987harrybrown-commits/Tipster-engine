@@ -3331,14 +3331,17 @@ async function getSaturdayAcca() {
   const e = new Date(dayStart.getTime() + 24 * 3600000 - 1);     // 23:59:59 UK
   const { data: tips } = await supabase.from('tips').select('*').eq('status','pending').eq('sport','Football')
     .gte('event_time', s.toISOString()).lte('event_time', e.toISOString())
-    .gte('confidence', 72).order('confidence', { ascending: false }).limit(4);
-  if (!tips || tips.length < 3) return null;
+    .gte('confidence', 72).order('confidence', { ascending: false }).limit(40);
+  // Legs have to be bets, and the fetch has to reach past the informational
+  // picks to find them — see generateDailyAcca for why they crowd the top.
+  const bets = (tips || []).filter(t => parseFloat(t.stake ?? 1) > 0).slice(0, 4);
+  if (bets.length < 3) return null;
   // tip_ref and confidence carried through, matching the shape
   // generateDailyAcca writes. The settler resolves an acca's legs by tip_ref
   // and skips any acca without them, so without this the Saturday acca could
   // not be settled even if it were recorded. It still is not recorded — see
   // the note below — but the data no longer blocks it.
-  const sels = tips.map(t => ({ match: `${t.home_team} vs ${t.away_team}`, selection: t.selection,
+  const sels = bets.map(t => ({ match: `${t.home_team} vs ${t.away_team}`, selection: t.selection,
                                 odds: advisedPrice(t), tip_ref: t.tip_ref, confidence: t.confidence }));
   return { selections: sels, combinedOdds: sels.reduce((a,s) => a * parseFloat(s.odds), 1), reasoning: `${sels.length} high-confidence selections from today's card.` };
 }
@@ -3532,10 +3535,14 @@ async function tagFreeTips() {
 
 async function tagDailyBestBet() {
   try {
-    const now = new Date();
-    const ukTomorrow = new Date(now.getTime() + 86400000).toLocaleDateString('en-CA', { timeZone: 'Europe/London' });
-    const s = ukTomorrow + 'T00:00:00Z';
-    const e = ukTomorrow + 'T23:59:59Z';
+    // A UK date pasted onto 'T00:00:00Z' is not the UK day. During BST, UK
+    // midnight is 23:00Z the day before, so this window started an hour late
+    // and a fixture kicking off between 00:00 and 01:00 UK could never be the
+    // best bet — the same drift getTodaysTips already documents as fixed.
+    const dayStart = new Date(ukDayStart().getTime() + 24 * 3600000);   // tomorrow, UK
+    const ukTomorrow = ukDateString(dayStart);
+    const s = dayStart.toISOString();
+    const e = new Date(dayStart.getTime() + 24 * 3600000 - 1).toISOString();
 
     const { data: existing } = await supabase.from('tips').select('id')
       .eq('is_best_bet', true).gte('event_time', s).lte('event_time', e).maybeSingle();
@@ -3543,16 +3550,23 @@ async function tagDailyBestBet() {
 
     // Fetch candidates — select model_edge and quality_score for ranking
     const { data: tips } = await supabase.from('tips')
-      .select('id, tip_ref, home_team, away_team, confidence, odds, model_edge, quality_score')
+      .select('id, tip_ref, home_team, away_team, confidence, odds, model_edge, quality_score, stake')
       .eq('status', 'pending')
       .gte('event_time', s)
       .lte('event_time', e);
 
     if (!tips?.length) return;
 
+    // The Best Bet is a bet. Informational picks carry stake 0 and were never
+    // advised, so promoting one as the single strongest selection of the day
+    // is the worst place for this leak to surface. stake is now selected for
+    // it; the column was not being read.
+    const bets = tips.filter(t => parseFloat(t.stake ?? 1) > 0);
+    if (!bets.length) return;
+
     // Rank by real edge + quality score composite (item 10)
     // 70% model_edge (normalised to 25% max) + 30% quality_score
-    const ranked = tips
+    const ranked = bets
       .map(t => {
         const edge = parseFloat(t.model_edge || 0);
         const qs   = parseFloat(t.quality_score || 0);
@@ -3569,14 +3583,28 @@ async function tagDailyBestBet() {
 
 async function generateDailyAcca() {
   try {
-    const today = new Date().toLocaleDateString('en-CA', { timeZone: 'Europe/London' });
+    const today = ukDateString();
     const { data: existing } = await supabase.from('daily_accas').select('id').eq('date', today).maybeSingle();
     if (existing) return { skipped: true };
-    const s = today + 'T00:00:00Z';
-    const e = today + 'T23:59:59Z';
-    const { data: tips } = await supabase.from('tips').select('*').eq('status', 'pending').gte('event_time', s).lte('event_time', e).gte('confidence', 84).order('confidence', { ascending: false }).limit(5);
-    if (!tips || tips.length < 3) return { generated: false, reason: 'insufficient_tips' };
-    const legs = tips.slice(0, 5);
+    // ukDayStart, not the date pasted onto 'T00:00:00Z' — see tagDailyBestBet.
+    const dayStart = ukDayStart();
+    const s = dayStart.toISOString();
+    const e = new Date(dayStart.getTime() + 24 * 3600000 - 1).toISOString();
+    // An acca is a bet, so its legs have to be bets.
+    //
+    // This selects on confidence >= 84, which is exactly where the stake-0
+    // informational picks live — they are short-priced, and short prices score
+    // high. Unfiltered, the daily acca could be built entirely from selections
+    // nobody was ever advised to back, then published with a stake of 1 and
+    // settled into the record as though it were a real bet.
+    //
+    // Over-fetch before filtering, for the same reason getTodaysTips does: at
+    // this confidence floor the informational picks come first, so a limit of
+    // 5 could be filled by them and leave nothing.
+    const { data: tips } = await supabase.from('tips').select('*').eq('status', 'pending').gte('event_time', s).lte('event_time', e).gte('confidence', 84).order('confidence', { ascending: false }).limit(50);
+    const bets = (tips || []).filter(t => parseFloat(t.stake ?? 1) > 0);
+    if (bets.length < 3) return { generated: false, reason: 'insufficient_tips' };
+    const legs = bets.slice(0, 5);
     const sportCounts = legs.reduce((acc, t) => { acc[t.sport] = (acc[t.sport] || 0) + 1; return acc; }, {});
     const dominantSport = Object.entries(sportCounts).sort((a, b) => b[1] - a[1])[0][0];
     const sportLabel = Object.keys(sportCounts).length > 1 ? 'Mixed' : dominantSport;
