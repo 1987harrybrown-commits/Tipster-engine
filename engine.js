@@ -936,7 +936,11 @@ function parseTeamForm(events, teamId) {
 // ─── CONTEXT MODIFIERS FOR MODEL ─────────────────────────────
 // Returns { attackMult, defenceMult, dataQuality, notes } for a team
 // based on form, rest, injuries and lineups.
-function getContextModifiers(teamSide, ctx, isHome) {
+// leagueAvgGoals is what a team on this side of a fixture in this sport scores
+// in an average game. It has to be passed in because this function is shared
+// between football and NHL, whose scoring rates differ by a factor of two, and
+// the recent-form adjustment below is only meaningful relative to one of them.
+function getContextModifiers(teamSide, ctx, isHome, leagueAvgGoals) {
   if (!ctx) return { attackMult: 1.0, defenceMult: 1.0, restPenalty: 0, dataQuality: 0.85, notes: 'No context' };
 
   const form    = isHome ? ctx.homeForm    : ctx.awayForm;
@@ -969,8 +973,23 @@ function getContextModifiers(teamSide, ctx, isHome) {
     // ── Recent goals adjustment ────────────────────────────
     // If team's recent form goals are very different from season avg,
     // blend them in slightly
-    if (form.gamesPlayed >= 3) {
-      const recentAttAdj = (form.goalsFor - 1.3) * 0.10; // small nudge
+    if (form.gamesPlayed >= 3 && Number.isFinite(leagueAvgGoals) && leagueAvgGoals > 0) {
+      // Proportional to the league, not to a constant.
+      //
+      // This was `(form.goalsFor - 1.3) * 0.10`, and 1.3 is roughly what a
+      // football team scores in a game. The same function is used for NHL,
+      // where a team averages 3.10 — so a side scoring exactly the league
+      // average came out at (3.10 - 1.3) * 0.10 = +0.18, an eighteen percent
+      // attack boost for being unremarkable. Both sides got it, so both lambdas
+      // rose together: P(Over 5.5) went from 58.6% to 73.8%, a fair price of
+      // 1.71 quoted as 1.36. The engine believed it had enormous edge on every
+      // NHL over it could see.
+      //
+      // The comment on the original said "if recent form goals are very
+      // different from season avg", which is the right idea — 1.3 was standing
+      // in for the season average and only worked for the sport it came from.
+      // A ratio says the same thing in a way that cannot be wrong per sport.
+      const recentAttAdj = ((form.goalsFor / leagueAvgGoals) - 1) * 0.10;
       // A modifier has a safe default that a lambda does not: no adjustment.
       attackMult = clampFinite(attackMult + recentAttAdj, 0.7, 1.4) ?? 1;
     }
@@ -993,10 +1012,15 @@ function getContextModifiers(teamSide, ctx, isHome) {
     notes.push('Full squad ✓');
   }
 
+  // Both multiply straight into expected goals, so both need bounding. Only
+  // attackMult was clamped, and only inside the recent-form branch — so a team
+  // with fewer than three recent matches, or with none, came out unbounded, and
+  // defenceMult was never bounded at all. Neutral is the right fallback for a
+  // modifier: an unusable adjustment means no adjustment.
   return {
-    attackMult:  parseFloat(attackMult.toFixed(3)),
-    defenceMult: parseFloat(defenceMult.toFixed(3)),
-    dataQuality: parseFloat(dataQuality.toFixed(3)),
+    attackMult:  parseFloat((clampFinite(attackMult, 0.7, 1.4) ?? 1).toFixed(3)),
+    defenceMult: parseFloat((clampFinite(defenceMult, 0.7, 1.4) ?? 1).toFixed(3)),
+    dataQuality: parseFloat((clampFinite(dataQuality, 0.5, 1.0) ?? 0.85).toFixed(3)),
     notes:       notes.join(' | '),
     restDays:    form?.restDays || null,
   };
@@ -1956,8 +1980,8 @@ async function analyseFootballFixture(event, sport) {
     // (the pre-modifier matrix used to be built here and never read — an
     //  81-cell Poisson grid per fixture per cycle, discarded immediately)
     const ctx      = matchContextCache[event.id] || null;
-    const homeMod  = getContextModifiers('home', ctx, true);
-    const awayMod  = getContextModifiers('away', ctx, false);
+    const homeMod  = getContextModifiers('home', ctx, true,  leagueAvg.homeGoals);
+    const awayMod  = getContextModifiers('away', ctx, false, leagueAvg.awayGoals);
 
     // Apply multipliers to expected goals
     let lHmod = clampFinite(lH * homeMod.attackMult * awayMod.defenceMult, 0.3, 4.0);
@@ -2135,8 +2159,8 @@ async function analyseNHLFixture(event, sport) {
 
     // Apply match context (form, rest, H2H) to NHL lambda
     const ctx     = matchContextCache[event.id] || null;
-    const homeMod = getContextModifiers('home', ctx, true);
-    const awayMod = getContextModifiers('away', ctx, false);
+    const homeMod = getContextModifiers('home', ctx, true,  NHL_LEAGUE_AVG_GF);
+    const awayMod = getContextModifiers('away', ctx, false, NHL_LEAGUE_AVG_GF);
 
     lH = clampFinite(lH * homeMod.attackMult * awayMod.defenceMult, 0.5, 6.0);
     lA = clampFinite(lA * awayMod.attackMult * homeMod.defenceMult, 0.5, 6.0);
