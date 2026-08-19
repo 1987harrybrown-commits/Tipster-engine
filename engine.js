@@ -3058,11 +3058,11 @@ function esc(v) {
 
 function emailBase(content, userId) {
   const unsubUrl = `${SITE_URL.replace('www.','')}/unsubscribe?token=${generateUnsubToken(userId)}&uid=${userId}`;
-  return `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>The Tipster Edge</title></head>
+  return `<!DOCTYPE html><html lang="en-GB"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>The Tipster Edge</title></head>
 <body style="margin:0;padding:0;background:#07090d;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;">
-<table width="100%" cellpadding="0" cellspacing="0" style="background:#07090d;padding:32px 16px;">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#07090d;padding:32px 16px;">
 <tr><td align="center">
-<table width="100%" cellpadding="0" cellspacing="0" style="max-width:520px;">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:520px;">
 <tr><td style="padding-bottom:24px;">
 <p style="font-family:monospace;font-size:11px;text-transform:uppercase;letter-spacing:4px;color:#18e07a;margin:0;">The Tipster Edge</p>
 </td></tr>
@@ -3125,7 +3125,7 @@ function buildProEmail({ tip, allTips, userId, firstName }) {
 <h1 style="font-size:20px;font-weight:800;color:#dde6f0;margin:0 0 4px;">Morning, ${g}. Here's your full card.</h1>
 <p style="font-size:12px;color:#6c83a3;margin:0 0 22px;">${allTips.length} tips ready.</p>
 <p style="font-family:monospace;font-size:9px;text-transform:uppercase;letter-spacing:2px;color:#18e07a;margin:0 0 8px;">Best Pick · [${esc(tip.tip_ref)}]</p>
-<table width="100%" cellpadding="0" cellspacing="0" style="background:#111620;border-radius:7px;margin-bottom:16px;">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#111620;border-radius:7px;margin-bottom:16px;">
 <tr><td style="padding:14px 16px;">
 <p style="font-size:11px;color:#6c83a3;margin:0 0 3px;font-family:monospace;text-transform:uppercase;">${esc(tip.sport)} · ${esc(tip.league)}</p>
 <p style="font-size:17px;font-weight:800;color:#dde6f0;margin:0 0 2px;">${esc(tip.home_team)} vs ${esc(tip.away_team)}</p>
@@ -3135,7 +3135,7 @@ function buildProEmail({ tip, allTips, userId, firstName }) {
 ${livePriceNote(tip, { block: true })}
 <p style="font-family:monospace;font-size:10px;color:${ec};margin:4px 0 0;">${es} edge · ${tip.stake}u stake</p>
 </td></tr></table>
-${extras ? `<table width="100%" cellpadding="0" cellspacing="0" style="background:#0c0f15;border:1px solid #1c2535;border-radius:7px;margin-bottom:20px;">${extras}</table>` : ''}
+${extras ? `<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#0c0f15;border:1px solid #1c2535;border-radius:7px;margin-bottom:20px;">${extras}</table>` : ''}
 <div style="text-align:center;"><a href="${SITE_URL}/#tips" style="display:inline-block;background:#f0b429;color:#07090d;font-size:13px;font-weight:700;padding:12px 28px;border-radius:5px;text-decoration:none;">View Full Card</a></div>${PRICE_FOOTNOTE}`;
   return emailBase(content, userId);
 }
@@ -3149,7 +3149,7 @@ function buildFreeEmail({ tip, proTipCount, userId, firstName }) {
 <p style="font-family:monospace;font-size:10px;text-transform:uppercase;letter-spacing:3px;color:#18e07a;margin:0 0 10px;">Bet of the Day</p>
 <h1 style="font-size:20px;font-weight:800;color:#dde6f0;margin:0 0 4px;">Morning, ${g}.</h1>
 <p style="font-size:12px;color:#6c83a3;margin:0 0 22px;">Your daily pick · Ref: <span style="font-family:monospace;">[${esc(tip.tip_ref || '-')}]</span></p>
-<table width="100%" cellpadding="0" cellspacing="0" style="background:#111620;border-radius:7px;margin-bottom:16px;">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#111620;border-radius:7px;margin-bottom:16px;">
 <tr><td style="padding:14px 16px;">
 <p style="font-size:11px;color:#6c83a3;margin:0 0 3px;font-family:monospace;text-transform:uppercase;">${esc(tip.sport)} · ${esc(tip.league)}</p>
 <p style="font-size:17px;font-weight:800;color:#dde6f0;margin:0 0 2px;">${esc(tip.home_team)} vs ${esc(tip.away_team)}</p>
@@ -3159,7 +3159,7 @@ function buildFreeEmail({ tip, proTipCount, userId, firstName }) {
 ${livePriceNote(tip, { block: true })}
 <p style="font-family:monospace;font-size:10px;color:${ec};margin:4px 0 0;">${es} edge</p>
 </td></tr></table>
-<table width="100%" cellpadding="0" cellspacing="0" style="background:#0c0f15;border:1px solid rgba(240,180,41,0.25);border-radius:7px;margin-bottom:20px;">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#0c0f15;border:1px solid rgba(240,180,41,0.25);border-radius:7px;margin-bottom:20px;">
 <tr><td style="padding:16px 18px;">
 <p style="font-family:monospace;font-size:9px;text-transform:uppercase;letter-spacing:2px;color:#f0b429;margin:0 0 8px;">Pro members got ${proTipCount} more tips at 07:00</p>
 <a href="${SITE_URL}/#pricing" style="display:inline-block;background:#f0b429;color:#07090d;font-size:12px;font-weight:700;padding:9px 20px;border-radius:4px;text-decoration:none;">Go Pro — £9.99/mo</a>
@@ -3177,7 +3177,7 @@ function buildSaturdayEmail({ selections, combinedOdds, reasoning, userId }) {
 <p style="font-family:monospace;font-size:10px;text-transform:uppercase;letter-spacing:3px;color:#18e07a;margin:0 0 10px;">Weekend Accumulator</p>
 <h1 style="font-size:22px;font-weight:800;color:#dde6f0;margin:0 0 6px;">Saturday's Best ${selections.length}-Fold</h1>
 <p style="font-size:12px;color:#6c83a3;margin:0 0 24px;">Combined odds: <span style="font-family:monospace;font-weight:700;color:#f0b429;font-size:15px;">${parseFloat(combinedOdds).toFixed(2)}</span></p>
-<table width="100%" cellpadding="0" cellspacing="0" style="background:#111620;border-radius:7px;margin-bottom:20px;">${rows}</table>
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#111620;border-radius:7px;margin-bottom:20px;">${rows}</table>
 <div style="text-align:center;"><a href="${SITE_URL}/#tips" style="display:inline-block;background:#18e07a;color:#07090d;font-size:13px;font-weight:700;padding:13px 28px;border-radius:5px;text-decoration:none;">View Full Weekend Card</a></div>`;
   return emailBase(content, userId);
 }
@@ -4158,10 +4158,10 @@ const server = http.createServer((req, res) => { (async () => {
       if (req.method !== 'POST') {
         const action = `/unsubscribe?token=${encodeURIComponent(token)}&uid=${encodeURIComponent(uid)}`;
         res.writeHead(200, { 'Content-Type': 'text/html' });
-        res.end('<html><head><meta name="robots" content="noindex"><meta name="viewport" content="width=device-width, initial-scale=1.0">'
+        res.end('<!DOCTYPE html><html lang="en-GB"><head><meta charset="utf-8"><meta name="robots" content="noindex"><meta name="viewport" content="width=device-width, initial-scale=1.0">'
           + '<title>Unsubscribe | The Tipster Edge</title></head>'
           + '<body style="font-family:system-ui,-apple-system,sans-serif;text-align:center;padding:60px 20px;background:#07090d;color:#dde6f0;">'
-          + '<h2 style="font-weight:800;">Unsubscribe</h2>'
+          + '<h1 style="font-size:22px;font-weight:800;">Unsubscribe</h1>'
           + '<p style="color:#6c83a3;font-size:14px;max-width:420px;margin:0 auto 22px;">Stop receiving tips emails from The Tipster Edge? You can re-enable them any time from your account.</p>'
           + `<form method="POST" action="${esc(action)}" style="margin:0;">`
           + '<button type="submit" style="background:#18e07a;color:#07090d;border:0;font-size:14px;font-weight:700;padding:12px 28px;border-radius:5px;cursor:pointer;">Yes, unsubscribe me</button>'
@@ -4181,11 +4181,11 @@ const server = http.createServer((req, res) => { (async () => {
       if (unsubErr || !optedOut || !optedOut.length) {
         console.error('Unsubscribe failed for', uid, unsubErr ? unsubErr.message : 'no matching user');
         res.writeHead(500, { 'Content-Type': 'text/html' });
-        res.end('<html><body style="font-family:sans-serif;text-align:center;padding:60px;background:#07090d;color:#dde6f0;"><h2>Something went wrong</h2><p>We could not update your preferences just now. Please email <a href="mailto:support@thetipsteredge.com" style="color:#18e07a;">support@thetipsteredge.com</a> and we will remove you manually.</p></body></html>');
+        res.end('<!DOCTYPE html><html lang="en-GB"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex"><title>Unsubscribe | The Tipster Edge</title></head><body style="font-family:sans-serif;text-align:center;padding:60px;background:#07090d;color:#dde6f0;"><h1 style="font-size:22px;font-weight:800;">Something went wrong</h1><p>We could not update your preferences just now. Please email <a href="mailto:support@thetipsteredge.com" style="color:#18e07a;">support@thetipsteredge.com</a> and we will remove you manually.</p></body></html>');
         return;
       }
       res.writeHead(200, { 'Content-Type': 'text/html' });
-      res.end('<html><body style="font-family:sans-serif;text-align:center;padding:60px;background:#07090d;color:#dde6f0;"><h2>Unsubscribed</h2><p>You have been removed from all emails.</p><a href="https://www.thetipsteredge.com/account.html" style="color:#18e07a;">Manage preferences</a></body></html>');
+      res.end('<!DOCTYPE html><html lang="en-GB"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex"><title>Unsubscribed | The Tipster Edge</title></head><body style="font-family:sans-serif;text-align:center;padding:60px;background:#07090d;color:#dde6f0;"><h1 style="font-size:22px;font-weight:800;">Unsubscribed</h1><p>You have been removed from all emails.</p><a href="https://www.thetipsteredge.com/account.html" style="color:#18e07a;">Manage preferences</a></body></html>');
     } catch(e) { res.writeHead(400); res.end('Invalid token'); }
     return;
   }
