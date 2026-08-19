@@ -4116,8 +4116,33 @@ http.createServer((req, res) => { (async () => {
           res.writeHead(400, { ...cors, 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ error: 'Body must be a JSON object' })); return;
         }
-        const { userId, email, plan } = payload;
-        if (!userId || !email || !plan) { res.writeHead(400, cors); res.end('Missing params'); return; }
+        // Resolve the caller from their JWT rather than trusting the body.
+        //
+        // This route took userId and email as request parameters, which is
+        // exactly what authedUser exists to prevent — its own comment says any
+        // endpoint acting on a specific user's data must go through it.
+        // /verify-pro, /stripe/portal and /ensure-profile all do; this one was
+        // missed. Unauthenticated, anyone could mint checkout sessions against
+        // arbitrary ids and addresses, and probe which accounts already hold a
+        // subscription by reading the 409.
+        const caller = await authedUser(req);
+        if (!caller) {
+          res.writeHead(401, { ...cors, 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'Not signed in' })); return;
+        }
+        const userId = caller.id;
+        const email  = caller.email;
+        const { plan } = payload;
+        if (!email) { res.writeHead(400, cors); res.end('Account has no email address'); return; }
+
+        // Anything that was not 'annual' silently fell through to the monthly
+        // price, so a typo or a junk value quietly charged a different plan
+        // than the one named.
+        const PRICES = { monthly: STRIPE_PRICE_MONTHLY, annual: STRIPE_PRICE_ANNUAL };
+        if (!plan || !Object.prototype.hasOwnProperty.call(PRICES, plan)) {
+          res.writeHead(400, { ...cors, 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'plan must be "monthly" or "annual"' })); return;
+        }
 
         // Refuse a second checkout for someone who is already subscribed.
         // createCheckoutSession passes customer_email rather than customer, so
@@ -4136,7 +4161,7 @@ http.createServer((req, res) => { (async () => {
           }
         }
 
-        const session = await createCheckoutSession(userId, email, plan === 'annual' ? STRIPE_PRICE_ANNUAL : STRIPE_PRICE_MONTHLY, plan);
+        const session = await createCheckoutSession(userId, email, PRICES[plan], plan);
         if (!session) { res.writeHead(500, { ...cors, 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'Failed' })); return; }
         res.writeHead(200, { ...cors, 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ url: session.url }));
