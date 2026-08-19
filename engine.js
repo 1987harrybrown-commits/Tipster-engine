@@ -3303,6 +3303,15 @@ async function handleStripeWebhook(event) {
       const uid = s.metadata?.user_id;
       if (!uid) break;
 
+      // Stripe delivers at least once, and answering 500 on a failed write
+      // makes redelivery more likely, not less — so this has to be safe to run
+      // twice. The upgrade itself is naturally idempotent; the welcome email is
+      // not. Read the prior state so a replay does not greet the same customer
+      // again.
+      const { data: before } = await supabase.from('users')
+        .select('subscription_status').eq('id', uid).maybeSingle();
+      const alreadyPro = before && before.subscription_status === 'pro';
+
       // The most consequential write in the system: someone has just paid.
       // Its result used to be discarded, and because the route answered 200
       // before running any of this, a failure here meant Stripe never retried
@@ -3312,6 +3321,14 @@ async function handleStripeWebhook(event) {
         .eq('id', uid).select('id');
       if (error) { console.error('Stripe checkout.completed upgrade failed:', error.message); return false; }
       if (!upgraded || !upgraded.length) { console.error(`Stripe checkout.completed: no user row for ${uid} — payment taken, account NOT upgraded`); return false; }
+
+      // Only greet someone who was not already Pro. A redelivered event now
+      // upgrades again harmlessly and stays quiet, instead of sending a second
+      // "Welcome to Pro" to an existing subscriber.
+      if (alreadyPro) {
+        console.log(`Stripe checkout.completed: ${uid} was already pro — replay, no welcome email`);
+        break;
+      }
 
       // The welcome email is best-effort and deliberately not awaited into the
       // return value: a mail failure must not make Stripe redeliver the event
