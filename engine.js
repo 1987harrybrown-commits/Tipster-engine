@@ -2286,9 +2286,19 @@ async function saveTips(tips) {
         if (oddsDiff > 0.01 || confDiff > 1 || bookChanged || bestImproved) {
           const updateKey = existing.tip_ref ? 'tip_ref' : 'id';
           const updateVal = existing.tip_ref || existing.id;
+          // stake is deliberately NOT here, for the same reason advised_odds is
+          // not: it is half the instruction. The email says "2.00, stake 1.5u",
+          // and the price is frozen at publication — so resizing the stake on a
+          // later refresh settles a bet nobody was advised to place. An
+          // improving price used to do exactly that: a tip emailed at 1.5u
+          // could settle at 2.5u against the advised 2.00, overstating the win
+          // by two thirds.
+          //
+          // odds and best_odds still track the live and peak prices, which are
+          // display and line-movement inputs rather than advice.
           await supabase.from('tips').update({
             odds: tip.odds, best_odds: newBest, bookmaker: tip.bookmaker,
-            confidence: tip.confidence, stake: tip.stake,
+            confidence: tip.confidence,
             selection: tip.selection, market: tip.market, notes: tip.notes,
             model_edge: tip.model_edge, model_prob: tip.model_prob,
             implied_prob: tip.implied_prob, fair_odds: tip.fair_odds,
