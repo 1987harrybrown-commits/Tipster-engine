@@ -3166,9 +3166,15 @@ async function getTodaysTips(limit = 15) {
 
   // Over-fetch, because the informational picks filtered out below would
   // otherwise eat into the limit.
-  const { data } = await supabase.from('tips').select('*').eq('status','pending')
+  // Throws rather than returning nothing. Every caller is a dispatch, and an
+  // empty list is indistinguishable from a quiet day — so a blip at 07:00 sent
+  // paying subscribers nothing and logged "no tips to send". runDaily releases
+  // its guard when a job throws, so failing here buys the rest of the send
+  // window to retry instead of writing the day off.
+  const { data, error } = await supabase.from('tips').select('*').eq('status','pending')
     .gte('event_time', s.toISOString()).lte('event_time', e.toISOString())
     .order('confidence', { ascending: false }).limit(limit * 3);
+  if (error) throw new Error(`getTodaysTips read failed: ${error.message}`);
 
   // Every caller of this function builds an email that recommends bets.
   // applyStrictRules publishes short-price selections with stake 0 and tier
@@ -3186,7 +3192,11 @@ async function getTodaysTips(limit = 15) {
 
 async function getBetOfTheDay() {
   const today = new Date().toISOString().split('T')[0];
-  const { data: ov } = await supabase.from('email_overrides').select('*').eq('date', today).eq('type','daily').maybeSingle();
+  // An override that cannot be read is not the same as no override, but the
+  // fallback to automatic selection is the right behaviour either way — say so
+  // rather than failing the dispatch.
+  const { data: ov, error: ovErr } = await supabase.from('email_overrides').select('*').eq('date', today).eq('type','daily').maybeSingle();
+  if (ovErr) console.error('getBetOfTheDay override read failed:', ovErr.message, '— falling back to automatic selection');
   if (ov?.bet_selection) return { home_team: ov.bet_match?.split(' vs ')[0]||'Home', away_team: ov.bet_match?.split(' vs ')[1]||'Away', selection: ov.bet_selection, odds: ov.bet_odds||1.8, confidence: ov.bet_confidence||80, stake: 1, notes: ov.bet_reasoning||'', league:'', sport:'Football', tip_ref:'OVERRIDE' };
   const tips = await getTodaysTips(1);
   return tips[0] || null;
@@ -3448,7 +3458,17 @@ async function processAdminJobs() {
     if (jobsErr) { console.error('Job queue read failed:', jobsErr.message); return; }
     if (!jobs?.length) return;
     for (const job of jobs) {
-      await supabase.from('admin_jobs').update({ status: 'processing' }).eq('id', job.id);
+      // Claim the job before doing the work, and verify the claim landed.
+      //
+      // This was fire-and-forget: if the update failed, the row stayed
+      // 'pending' and the next tick — thirty seconds later — picked it up
+      // again. Since manual sends force past the already-sent guard, that is a
+      // second dispatch to the entire list. The eq('status','pending') makes
+      // the claim atomic, so two overlapping ticks cannot both take it.
+      const { data: claimed, error: claimErr } = await supabase.from('admin_jobs')
+        .update({ status: 'processing' }).eq('id', job.id).eq('status', 'pending').select('id');
+      if (claimErr) { console.error(`Job ${job.id}: could not claim — ${claimErr.message}`); continue; }
+      if (!claimed || !claimed.length) { console.log(`Job ${job.id}: already claimed elsewhere — skipping`); continue; }
       try {
         const p = JSON.parse(job.payload || '{}');
         if (job.job_type === 'test_email')        { const r = await sendTestEmail(p.to, p.type||'daily'); await supabase.from('admin_jobs').update({ status: r.success?'done':'failed', result: JSON.stringify(r) }).eq('id', job.id); }
