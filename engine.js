@@ -157,6 +157,18 @@ const OVERS_MIN_EDGE    = 0;
 const ELITE_H2H_EDGE    = 10;
 const ELITE_OVERS_EDGE  = 14;
 
+// Football over-2.5 was an unfinished integration: the market was fetched on
+// every event and the model computed the probability, but no candidate was
+// ever built from either, so the data was collected and thrown away.
+//
+// It is finished now, and off. Turning it on publishes a market subscribers
+// are not currently advised to bet, which is a product decision rather than a
+// fix — so it is one boolean rather than an open question. Everything else it
+// needs already works: the totals line is de-vigged against its own Under, the
+// settler grades any "Over X" selection, and 2.5 is a half line so it cannot
+// push.
+const PUBLISH_FOOTBALL_OVERS = false;
+
 // Odds tiers:
 //   INSIGHT_ODDS_MIN  — show as "Short Price Watch" (informational, stake 0)
 //   BET_ODDS_MIN      — minimum odds for a real bet recommendation
@@ -1702,7 +1714,7 @@ async function analyseFootballFixture(event, sport) {
 
     const dataQuality = Math.min(homeMod.dataQuality, awayMod.dataQuality);
     const modMatrix = buildScoreMatrix(lHmod, lAmod);
-    const { homeWin, draw, awayWin } = calcOutcomes(modMatrix);
+    const { homeWin, draw, awayWin, over25 } = calcOutcomes(modMatrix);
     // No over-2.5 candidate is built for football. calcOutcomes still returns
     // the probability and the market still carries the price, so finishing that
     // market is a matter of adding a candidate here — but publishing a new
@@ -1753,6 +1765,23 @@ async function analyseFootballFixture(event, sport) {
       if (conf >= MIN_CONFIDENCE && falseEdgeCheck(c, market)) candidates.push(c);
     }
 
+    // Over 2.5 — priced against the de-vigged Over probability, like every
+    // other market here. Requires over25True, so a line with no Under to
+    // de-vig against is skipped rather than priced off a vigged number.
+    if (PUBLISH_FOOTBALL_OVERS
+        && market.over25Odds >= INSIGHT_ODDS_MIN && market.over25Odds <= ODDS_ELITE_MAX
+        && market.over25True > 0) {
+      const edge  = calcEdge(over25, market.over25True);
+      const kelly = kellyStake(over25, market.over25Odds);
+      const games = Math.min(hStats?.homeGames || 0, aStats?.awayGames || 0);
+      const conf  = confidenceFromSignals({ modelProb: over25, dataQualityTier: dataQuality, sport: 'Football', gamesPlayed: games });
+      const qs    = scoreCandidate({ edgePct: edge, modelProb: over25, dataQualityTier: dataQuality });
+      const c = { market: 'over25', edge, modelProb: over25, trueImplied: market.over25True, dataQualityTier: dataQuality,
+        fairPrice: fairOdds(over25), bookOdds: market.over25Odds, bookmaker: market.over25Book,
+        stake: kelly, conf, qualityScore: qs, selection: 'Over 2.5' };
+      if (conf >= MIN_CONFIDENCE && falseEdgeCheck(c, market)) candidates.push(c);
+    }
+
     if (!candidates.length) return null;
 
     const vetoed = candidates.filter(c => !vetoCandidate({
@@ -1773,7 +1802,7 @@ async function analyseFootballFixture(event, sport) {
       event_time:    event.commence_time,
       event_id:      event.id,
       selection:     pick.selection,
-      market:        'h2h',
+      market:        pick.market === 'over25' ? 'totals' : 'h2h',
       odds:          parseFloat(pick.bookOdds.toFixed(2)),
       stake:         pick.stake,
       confidence:    pick.conf,
@@ -2082,7 +2111,10 @@ function applyStrictRules(tip, existingBestOdds = null) {
 
   if (!isH2H && !isTotals)    return null;
   if (isUnder)                 return null;
-  if (isFootball && isTotals)  return null;
+  // Football totals were rejected outright because none were ever published.
+  // With PUBLISH_FOOTBALL_OVERS off nothing reaches here anyway; the gate
+  // follows the flag so the two cannot disagree.
+  if (isFootball && isTotals && !PUBLISH_FOOTBALL_OVERS) return null;
 
   const odds = parseFloat(tip.odds || 0);
   if (odds < INSIGHT_ODDS_MIN) return null; // below 1.05 — not worth showing
