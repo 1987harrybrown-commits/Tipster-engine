@@ -3191,7 +3191,15 @@ async function getSubscribers(type = 'daily', tier = 'all') {
   // a partial list through as if it were the whole audience.
   try {
     return await selectAll('users', 'id, email, first_name, subscription_status', q => {
-      q = q.eq('email_opt_in', true).eq(col, true);
+      // `not is false`, not `eq true`, because null means opted in here.
+      //
+      // account.html renders these checkboxes with `email_daily !== false`, so a
+      // null shows as ON — and /ensure-profile creates a profile row without
+      // setting either column. Matching on `eq true` therefore skipped every
+      // user whose row came from that path: their account page said they were
+      // subscribed and they received nothing. Only an explicit false is an
+      // opt-out, which is what the page has always claimed.
+      q = q.eq('email_opt_in', true).not(col, 'is', false);
       if (tier === 'pro')  q = q.eq('subscription_status', 'pro');
       if (tier === 'free') q = q.neq('subscription_status', 'pro');
       return q;
@@ -4211,6 +4219,10 @@ http.createServer((req, res) => { (async () => {
           first_name:          caller.user_metadata?.first_name || null,
           subscription_status: 'free',
           email_opt_in:        true,
+          // Set explicitly. Left unset these are null, which every reader has
+          // to agree to interpret — and for a while they did not.
+          email_daily:         true,
+          email_saturday:      true,
         });
         // 23505 means a trigger won the race — the row exists, which is the goal.
         if (error && error.code !== '23505') {
