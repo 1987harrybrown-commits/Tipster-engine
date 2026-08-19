@@ -227,10 +227,60 @@ const sofascoreCache = {
 // Sofascore API wrapper — rate limited to 5 req/sec
 let rapidApiCallCount = 0;
 let rapidApiCallDate  = '';
+let rapidApiBudgetWarned = false;
+
+// The API is metered and nothing was metering it. rapidApiCallCount was
+// incremented, logged every tenth call, and never once compared against
+// anything — so a retry storm, a restart loop, or a fixture list larger than
+// expected would spend the month's quota with nothing in the way. Several
+// comments elsewhere cite "each restart spends RapidAPI quota" as a reason to
+// keep the process alive, so the cost was understood; it just had no ceiling.
+//
+// The budget is a hard stop for the rest of the UK day. Set
+// RAPIDAPI_DAILY_BUDGET to match the plan; the default is deliberately well
+// above a normal day (a full morning fetch plus a midday reprice) so it only
+// ever fires on something going wrong.
+const RAPIDAPI_DAILY_BUDGET = parseInt(process.env.RAPIDAPI_DAILY_BUDGET || '1500', 10);
+
+// 22 hours: comfortably past the ~18h overnight gap that normal operation
+// produces, comfortably short of a full day. Anything above this means a fetch
+// has failed rather than that the schedule is between refreshes.
+const ODDS_MAX_AGE_MS = 22 * 3600 * 1000;
+
+// A 429 is retryable, which is right for a per-minute limit and exactly wrong
+// for an exhausted quota: the call is repeated with a 500ms backoff, then a
+// second, and every one of those counts. Iterating a few hundred events that
+// way turns hitting the limit into three times the spend, all of it failing.
+//
+// A cooldown covers both. A per-minute limit clears well inside it; a quota
+// limit stops costing anything.
+const RAPIDAPI_COOLDOWN_MS = 15 * 60 * 1000;
+let rapidApiCooldownUntil = 0;
+
+// Returns false when a call must not be made. Rolls the daily counter itself,
+// so there is one place that decides what day it is.
+function apiBudgetAllows(path) {
+  const today = ukDateString();
+  if (rapidApiCallDate !== today) {
+    rapidApiCallDate = today;
+    rapidApiCallCount = 0;
+    rapidApiBudgetWarned = false;
+  }
+  if (Date.now() < rapidApiCooldownUntil) return false;
+  if (rapidApiCallCount >= RAPIDAPI_DAILY_BUDGET) {
+    if (!rapidApiBudgetWarned) {
+      rapidApiBudgetWarned = true;
+      console.error(`🚨 RapidAPI daily budget of ${RAPIDAPI_DAILY_BUDGET} reached — `
+        + `refusing further calls until tomorrow (first refused: ${path})`);
+    }
+    return false;
+  }
+  return true;
+}
 
 function trackApiCall() {
   const today = ukDateString();
-  if (rapidApiCallDate !== today) { rapidApiCallDate = today; rapidApiCallCount = 0; }
+  if (rapidApiCallDate !== today) { rapidApiCallDate = today; rapidApiCallCount = 0; rapidApiBudgetWarned = false; }
   rapidApiCallCount++;
   if (rapidApiCallCount % 10 === 0) console.log(`📡 RapidAPI calls today: ${rapidApiCallCount}`);
 }
@@ -239,6 +289,9 @@ function trackApiCall() {
 const SOFASCORE_MAX_ATTEMPTS = 3;
 
 async function sofascoreFetch(path, params = {}, attempt = 1) {
+  // Checked on every attempt, not just the first: a retry is another call and
+  // costs the same as the one before it.
+  if (!apiBudgetAllows(path)) return null;
   const url = new URL(`${SOFASCORE_BASE}${path}`);
   for (const [k, v] of Object.entries(params)) url.searchParams.set(k, v);
   trackApiCall();
@@ -274,7 +327,23 @@ async function sofascoreFetch(path, params = {}, attempt = 1) {
     if (!res.ok) {
       // 429 and 5xx are worth another go. 401/403/404 are not: the key is wrong
       // or the path does not exist, and retrying only burns quota.
-      if (res.status === 429 || res.status >= 500) return retry(`HTTP ${res.status}`);
+      if (res.status === 429) {
+        // Honour Retry-After when the API sends one; otherwise fall back to the
+        // fixed cooldown. Either way, stop the rest of this batch rather than
+        // asking a few hundred more times.
+        const after = parseInt(res.headers.get('retry-after') || '0', 10);
+        const waitMs = Number.isFinite(after) && after > 0
+          ? Math.min(after * 1000, RAPIDAPI_COOLDOWN_MS)
+          : RAPIDAPI_COOLDOWN_MS;
+        if (attempt >= SOFASCORE_MAX_ATTEMPTS) {
+          rapidApiCooldownUntil = Date.now() + waitMs;
+          console.error(`🚨 RapidAPI rate limited (429) after ${attempt} attempts — `
+            + `pausing all calls for ${Math.round(waitMs / 60000)} min`);
+          return null;
+        }
+        return retry('HTTP 429');
+      }
+      if (res.status >= 500) return retry(`HTTP ${res.status}`);
       console.log(`⚠️ Sofascore ${path}: ${res.status}`);
       return null;
     }
@@ -2958,6 +3027,28 @@ async function runEngine() {
   const hasData = Object.values(sofascoreCache.events).some(arr => arr.length > 0);
   if (!hasData) {
     console.log('⏳ Cache empty — waiting for morning fetch...');
+    return;
+  }
+
+  // And do not advise a bet at a price nobody has checked recently.
+  //
+  // Odds are refreshed twice a day, at 06:00 and 13:00, so the longest they are
+  // legitimately allowed to get is the overnight gap — about 17 hours, 18
+  // across a clock change. Nothing checked. If a morning fetch failed, the
+  // cache kept yesterday's events, generateTips happily found the ones still
+  // inside its 48-hour window, and the engine went on publishing tips every
+  // fifteen minutes at prices from the previous day.
+  //
+  // A fully stale cache was already harmless — every event falls outside the
+  // window and no tips come out. This is the partial case, which is the one
+  // that produces confident output from data nobody would stand behind.
+  const oddsAgeMs = sofascoreCache.oddsFetchedAt
+    ? Date.now() - new Date(sofascoreCache.oddsFetchedAt).getTime()
+    : Infinity;
+  if (oddsAgeMs > ODDS_MAX_AGE_MS) {
+    const hrs = Number.isFinite(oddsAgeMs) ? (oddsAgeMs / 3600000).toFixed(1) + 'h' : 'never fetched';
+    console.error(`🚨 Odds are ${hrs} old (limit ${ODDS_MAX_AGE_MS / 3600000}h) — `
+      + `not publishing tips until a fetch succeeds`);
     return;
   }
 
