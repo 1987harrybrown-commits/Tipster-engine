@@ -218,6 +218,19 @@ const LINE_MOVE_REJECT_PP = 2.5;
 const MATRIX_MAX_GOALS  = 12;
 const FOOTBALL_EDGE_PREMIUM = 0;  // unused
 const MIN_QUALITY_SCORE = 0.10;
+// What counts as a short rest, per sport. These have to differ because the
+// schedules do: an NHL side plays 82 games in about 185 days, one every 2.26,
+// so two days off is a normal week rather than congestion. A football side
+// plays 38 league games across roughly 270 days.
+//
+// The bands were a single pair, `<= 2` and `<= 3`, applied to both. In football
+// that is genuine fixture congestion. In the NHL it described the ordinary
+// state of every team, so the fatigue penalty fired on essentially every game —
+// and with both sides carrying it, both lambdas came out about 2.3% low for no
+// reason. The case that actually matters there is the back-to-back.
+const REST_BANDS_FOOTBALL = { heavy: 2, mild: 3 };
+const REST_BANDS_NHL      = { heavy: 0, mild: 1 };   // heavy = a back-to-back
+
 const NHL_HOME_ADVANTAGE  = 0.20;
 const NHL_LEAGUE_AVG_GF   = 3.10;
 // Same reasoning, and it mattered far more here: NHL lambdas run about twice
@@ -988,7 +1001,7 @@ function parseTeamForm(events, teamId) {
 // in an average game. It has to be passed in because this function is shared
 // between football and NHL, whose scoring rates differ by a factor of two, and
 // the recent-form adjustment below is only meaningful relative to one of them.
-function getContextModifiers(teamSide, ctx, isHome, leagueAvgGoals) {
+function getContextModifiers(teamSide, ctx, isHome, leagueAvgGoals, restBands) {
   if (!ctx) return { attackMult: 1.0, defenceMult: 1.0, restPenalty: 0, dataQuality: 0.85, notes: 'No context' };
 
   const form    = isHome ? ctx.homeForm    : ctx.awayForm;
@@ -1007,11 +1020,18 @@ function getContextModifiers(teamSide, ctx, isHome, leagueAvgGoals) {
     notes.push(`Form: ${form.wins}W${form.draws}D${form.losses}L`);
 
     // ── Rest days penalty ─────────────────────────────────
-    if (form.restDays <= 2) {
+    // Bands come from the caller because they mean different things per sport
+    // — see REST_BANDS_FOOTBALL and REST_BANDS_NHL. Without them, no penalty:
+    // an adjustment that cannot be calibrated is better left out than guessed.
+    const bands = restBands && Number.isFinite(restBands.heavy) && Number.isFinite(restBands.mild)
+      ? restBands : null;
+    if (!bands) {
+      notes.push(`Rest: ${form.restDays}d`);
+    } else if (form.restDays <= bands.heavy) {
       attackMult  *= 0.93; // fatigue reduces attacking output
       defenceMult *= 1.05; // and weakens defence
       notes.push(`Rest: ${form.restDays}d ⚠️`);
-    } else if (form.restDays <= 3) {
+    } else if (form.restDays <= bands.mild) {
       attackMult  *= 0.97;
       notes.push(`Rest: ${form.restDays}d`);
     } else {
@@ -2028,8 +2048,8 @@ async function analyseFootballFixture(event, sport) {
     // (the pre-modifier matrix used to be built here and never read — an
     //  81-cell Poisson grid per fixture per cycle, discarded immediately)
     const ctx      = matchContextCache[event.id] || null;
-    const homeMod  = getContextModifiers('home', ctx, true,  leagueAvg.homeGoals);
-    const awayMod  = getContextModifiers('away', ctx, false, leagueAvg.awayGoals);
+    const homeMod  = getContextModifiers('home', ctx, true,  leagueAvg.homeGoals, REST_BANDS_FOOTBALL);
+    const awayMod  = getContextModifiers('away', ctx, false, leagueAvg.awayGoals, REST_BANDS_FOOTBALL);
 
     // Apply multipliers to expected goals
     let lHmod = clampFinite(lH * homeMod.attackMult * awayMod.defenceMult, 0.3, 4.0);
@@ -2207,8 +2227,8 @@ async function analyseNHLFixture(event, sport) {
 
     // Apply match context (form, rest, H2H) to NHL lambda
     const ctx     = matchContextCache[event.id] || null;
-    const homeMod = getContextModifiers('home', ctx, true,  NHL_LEAGUE_AVG_GF);
-    const awayMod = getContextModifiers('away', ctx, false, NHL_LEAGUE_AVG_GF);
+    const homeMod = getContextModifiers('home', ctx, true,  NHL_LEAGUE_AVG_GF, REST_BANDS_NHL);
+    const awayMod = getContextModifiers('away', ctx, false, NHL_LEAGUE_AVG_GF, REST_BANDS_NHL);
 
     lH = clampFinite(lH * homeMod.attackMult * awayMod.defenceMult, 0.5, 6.0);
     lA = clampFinite(lA * awayMod.attackMult * homeMod.defenceMult, 0.5, 6.0);
