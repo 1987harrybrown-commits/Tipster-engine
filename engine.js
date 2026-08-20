@@ -118,6 +118,22 @@ async function selectAll(table, columns, applyFilters = null) {
 // Legacy rows (pre-v9.9) have no advised_odds and fall back to `odds`.
 // Returns NaN for unusable input, matching bare parseFloat: callers already
 // guard with Number.isFinite (settlement) or a falsy check (backfill).
+// Is this a bet, or something published for information?
+//
+// applyStrictRules marks short-price selections `tier: 'insight'` with
+// `stake: 0` — two facts about the same decision. The engine tested only the
+// stake; updateStatsCache and the website test both. On the live table those
+// two answers differ for real rows: two carry tier 'insight' with a stake of 1
+// and 2, written by a build that set the tier without zeroing the stake.
+//
+// Which means the dispatchers could email one of those as a bet and tag it as
+// a free tip, while the published record — correctly — excluded it. One
+// definition now, and it is the stricter one, because a row that says
+// "informational" in either field is not something to advise.
+function isBet(tip) {
+  return !!tip && tip.tier !== 'insight' && parseFloat(tip.stake ?? 1) > 0;
+}
+
 function advisedPrice(tip) {
   return parseFloat(tip?.advised_odds ?? tip?.odds);
 }
@@ -3602,7 +3618,7 @@ async function updateStatsCache() {
     // There is no way to include them in ROI — you cannot compute a return on a
     // stake of zero — so the only coherent resolution is to report the record
     // of actual bets. Both figures now cover the same staked rows.
-    const data = rows.filter(r => r.tier !== 'insight' && parseFloat(r.stake ?? 1) > 0);
+    const data = rows.filter(isBet);
     const skipped = rows.length - data.length;
     if (skipped) console.log(`📈 Excluding ${skipped} informational pick(s) from the published record`);
 
@@ -3618,7 +3634,7 @@ async function updateStatsCache() {
     // disagreeing with the other. A ledger that disagrees with its own total is
     // the one failure the published record could not survive, so it is worth
     // one pass over rows already in hand to say so.
-    const leaked = rows.filter(r => !(r.tier !== 'insight' && parseFloat(r.stake ?? 1) > 0))
+    const leaked = rows.filter(r => !isBet(r))
                        .reduce((sum, r) => sum + Math.abs(parseFloat(r.profit_loss || 0)), 0);
     if (leaked > 0.005) {
       console.error(`🚨 LEDGER DRIFT: rows excluded from the published figures carry `
@@ -4176,7 +4192,7 @@ async function getTodaysTips(limit = 15) {
   //
   // A missing stake counts as staked (defaulting to 1), matching how stakes are
   // read everywhere else; only an explicit 0 is treated as informational.
-  const staked = (data || []).filter(t => parseFloat(t.stake ?? 1) > 0);
+  const staked = (data || []).filter(isBet);
 
   // A card longer than the limit is silently cut here, and every caller builds
   // an email that presents what it got as the day's card. getBetOfTheDay asks
@@ -4232,7 +4248,7 @@ async function getSaturdayAcca() {
     .gte('confidence', 72).order('confidence', { ascending: false }).limit(40);
   // Legs have to be bets, and the fetch has to reach past the informational
   // picks to find them — see generateDailyAcca for why they crowd the top.
-  const bets = (tips || []).filter(t => parseFloat(t.stake ?? 1) > 0).slice(0, 4);
+  const bets = (tips || []).filter(isBet).slice(0, 4);
   if (bets.length < 3) return null;
   // tip_ref and confidence carried through, matching the shape
   // generateDailyAcca writes. The settler resolves an acca's legs by tip_ref
@@ -4371,7 +4387,7 @@ async function tagFreeTips() {
     // could render locked on the site they clicked through to.
     //
     // stake is now selected for this; the column was not even being read.
-    const bets = tips.filter(t => parseFloat(t.stake ?? 1) > 0);
+    const bets = tips.filter(isBet);
     const freeIds = bets.slice(0, FREE_TIPS_PER_DAY).map(t => t.id);
     const free = new Set(freeIds);
     // Everything else, informational picks included — they are a Pro extra,
@@ -4426,7 +4442,7 @@ async function tagDailyBestBet() {
     // advised, so promoting one as the single strongest selection of the day
     // is the worst place for this leak to surface. stake is now selected for
     // it; the column was not being read.
-    const bets = tips.filter(t => parseFloat(t.stake ?? 1) > 0);
+    const bets = tips.filter(isBet);
     if (!bets.length) return;
 
     // Rank by real edge + quality score composite (item 10)
@@ -4467,7 +4483,7 @@ async function generateDailyAcca() {
     // this confidence floor the informational picks come first, so a limit of
     // 5 could be filled by them and leave nothing.
     const { data: tips } = await supabase.from('tips').select('*').eq('status', 'pending').gte('event_time', s).lte('event_time', e).gte('confidence', 84).order('confidence', { ascending: false }).limit(50);
-    const bets = (tips || []).filter(t => parseFloat(t.stake ?? 1) > 0);
+    const bets = (tips || []).filter(isBet);
     if (bets.length < 3) return { generated: false, reason: 'insufficient_tips' };
     const legs = bets.slice(0, 5);
     const sportCounts = legs.reduce((acc, t) => { acc[t.sport] = (acc[t.sport] || 0) + 1; return acc; }, {});
