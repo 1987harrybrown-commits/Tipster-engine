@@ -2180,6 +2180,23 @@ async function analyseFootballFixture(event, sport) {
     }
 
     // Draw — only tip if model has meaningful draw probability
+    // UNREACHABLE as things stand, and worth saying so rather than leaving it
+    // to be rediscovered. confidenceFromSignals sets conf = round(modelProb *
+    // 100), and the gate below is conf >= MIN_CONFIDENCE, which is 52. A draw
+    // in football sits around 0.25 to 0.30 — 0.2825 for an average fixture on
+    // the corrected DC_RHO — so conf comes out in the twenties and the
+    // candidate is always dropped. It has never published a tip.
+    //
+    // The cause is that confidence and win probability are the same number
+    // here. That is defensible for a moneyline, where "how likely is this to
+    // win" and "how much do we like it" nearly coincide; it is not for any
+    // market whose winning probability is structurally below a half. The same
+    // arithmetic caps the whole engine at about 3.15 in price, whatever
+    // ODDS_ELITE_MAX says — see DEPLOY.md.
+    //
+    // Left in place rather than deleted: publishing draws is a decision about
+    // what subscribers are advised to bet, not a tidy-up, and the candidate is
+    // complete and correct apart from the gate it cannot pass.
     if (market.drawOdds >= INSIGHT_ODDS_MIN && draw > 0.20 && market.trueDraw > 0) {
       const edge = calcEdge(draw, market.trueDraw);
       const kelly = kellyStake(draw, market.drawOdds);
