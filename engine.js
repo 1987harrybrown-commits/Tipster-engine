@@ -4330,7 +4330,12 @@ const STRIPE_SECRET_KEY      = process.env.STRIPE_SECRET_KEY      || '';
 const STRIPE_WEBHOOK_SECRET  = process.env.STRIPE_WEBHOOK_SECRET  || '';
 const STRIPE_PRICE_MONTHLY   = process.env.STRIPE_PRICE_MONTHLY   || 'price_1TBEpeFWJjdJlwwsgLilMcBt';
 const STRIPE_PRICE_ANNUAL    = process.env.STRIPE_PRICE_ANNUAL    || 'price_1TBEqbFWJjdJlwwsTH08T82z';
-const STRIPE_PUBLISHABLE_KEY = process.env.STRIPE_PUBLISHABLE_KEY || '';
+// There is no STRIPE_PUBLISHABLE_KEY here, and no /stripe/config route to serve
+// it from. Checkout redirects to the session URL the server creates, so the
+// browser never constructs a Stripe object and never needed the key — the route
+// answered every caller with an empty string and nothing in either repository
+// read it. One fewer unauthenticated endpoint, and one fewer environment
+// variable to wonder why is unset.
 
 async function stripeRequest(path, method = 'GET', body = null) {
   if (!STRIPE_SECRET_KEY) return null;
@@ -5304,11 +5309,6 @@ const server = http.createServer((req, res) => { (async () => {
       } catch(e) { res.writeHead(500, cors); res.end('Server error'); }
     })();
     return;
-  }
-
-  if (url.pathname === '/stripe/config') {
-    res.writeHead(200, { ...cors, 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ publishableKey: STRIPE_PUBLISHABLE_KEY })); return;
   }
 
   if (url.pathname === '/stripe/portal' && req.method === 'POST') {
