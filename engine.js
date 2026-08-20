@@ -1379,26 +1379,72 @@ function goalieQualityMultiplier(goalieName, teamName) {
   };
 }
 
-function currentSeason() {
-  const now = new Date();
-  const month = now.getMonth() + 1;
-  return month >= 7 ? now.getFullYear() : now.getFullYear() - 1;
+// The season to ask the NHL and NBA APIs about. Nothing else uses this —
+// football seasons are handled by Sofascore's own season list.
+//
+// The boundary was July, and both of these leagues start in October. So from 1
+// July every year the engine asked for a season that did not exist yet. Checked
+// rather than assumed: on 20 August 2026, seasonId 20262027 returns 0 teams
+// from api.nhle.com and 20252026 returns 32. Every NHL tip published in that
+// window ran on league-average defaults while presenting a confidence figure
+// that implies team data.
+//
+// October is the boundary because that is when these seasons begin. Between
+// July and September it now names the season that just finished, which is the
+// best data available about these teams until the new one has games in it.
+const SEASON_START_MONTH = 10;
+function currentSeason(now = new Date()) {
+  return (now.getMonth() + 1) >= SEASON_START_MONTH
+    ? now.getFullYear()
+    : now.getFullYear() - 1;
 }
+
+// How many games a season needs before its numbers describe a team rather than
+// a handful of nights. Below this the previous season is the better answer, and
+// the alternative on offer is not "wait" but "use the league average".
+const SEASON_MIN_GAMES = 5;
 
 async function fetchNHLAllTeams() {
   const today = ukDateString();
   if (nhlAllTeamsCache && nhlAllTeamsCacheDate === today) return nhlAllTeamsCache;
-  const year = currentSeason();
-  const seasonId = `${year}${year + 1}`;
-  try {
+
+  const seasonFor = (year) => `${year}${year + 1}`;
+  const load = async (seasonId) => {
     const res = await fetch(
       `https://api.nhle.com/stats/rest/en/team/summary?cayenneExp=seasonId=${seasonId}%20and%20gameTypeId=2`
     );
     if (!res.ok) return null;
     const data = await res.json();
-    nhlAllTeamsCache = data.data || [];
+    return data.data || [];
+  };
+
+  try {
+    const year = currentSeason();
+    let seasonId = seasonFor(year);
+    let teams = await load(seasonId);
+
+    // A season that has started is not the same as a season with numbers in it.
+    // Through the first fortnight every team is under SEASON_MIN_GAMES, and
+    // fetchNHLTeamStats rejects those rows one by one — so the model silently
+    // falls back to league averages for the opening weeks of every season. Last
+    // season's rates are a far better description of a team than the league
+    // average, so use them until this one has something to say.
+    const usable = (rows) => (rows || []).filter(t => (t.gamesPlayed || 0) >= SEASON_MIN_GAMES).length;
+    if (usable(teams) === 0) {
+      const prevId = seasonFor(year - 1);
+      const prev = await load(prevId);
+      if (usable(prev) > 0) {
+        console.log(`🏒 NHL ${seasonId} has no team with ${SEASON_MIN_GAMES}+ games yet `
+          + `— using ${prevId}`);
+        teams = prev;
+        seasonId = prevId;
+      }
+    }
+    if (teams === null) return null;
+
+    nhlAllTeamsCache = teams;
     nhlAllTeamsCacheDate = today;
-    console.log(`🏒 NHL team stats loaded: ${nhlAllTeamsCache.length} teams`);
+    console.log(`🏒 NHL team stats loaded: ${nhlAllTeamsCache.length} teams (season ${seasonId})`);
     return nhlAllTeamsCache;
   } catch(e) { console.error('NHL API error:', e.message); return null; }
 }
@@ -1411,7 +1457,7 @@ async function fetchNHLTeamStats(teamName) {
   const team = allTeams.find(t =>
     nameMatch(t.teamFullName, teamName) || nameMatch(t.teamName, teamName)
   );
-  if (!team || (team.gamesPlayed || 0) < 5) return null;
+  if (!team || (team.gamesPlayed || 0) < SEASON_MIN_GAMES) return null;
   const result = {
     teamId:       team.teamId,
     gamesPlayed:  team.gamesPlayed,
@@ -1447,13 +1493,12 @@ const NBA_TEAM_ABBREVS = {
   'Toronto Raptors': 'TOR', 'Utah Jazz': 'UTA', 'Washington Wizards': 'WAS',
 };
 
-async function fetchNBAAllTeamStats() {
-  const today = ukDateString();
-  if (nbaAllTeamsCache && nbaAllTeamsCacheDate === today) return nbaAllTeamsCache;
-
-  const season = currentSeason();
-  const seasonStr = `${season}-${String(season + 1).slice(2)}`; // e.g. "2024-25"
-
+// One season's team stats, or null if that season has nothing to give.
+//
+// Split out of fetchNBAAllTeamStats so the season can be chosen by whether it
+// has data, rather than by the calendar alone. seasonStr is the NBA's own form,
+// e.g. "2025-26".
+async function loadNBASeason(seasonStr) {
   try {
     const url = `https://stats.nba.com/stats/leaguedashteamstats?Conference=&DateFrom=&DateTo=&Division=&GameScope=&GameSegment=&Height=&LastNGames=0&LeagueID=00&Location=&MeasureType=Base&Month=0&OpponentTeamID=0&Outcome=&PORound=0&PaceAdjust=N&PerMode=PerGame&Period=0&PlayerExperience=&PlayerPosition=&PlusMinus=N&Rank=N&Season=${seasonStr}&SeasonSegment=&SeasonType=Regular+Season&ShotClockRange=&StarterBench=&TeamID=0&TwoWay=0&VsConference=&VsDivision=`;
 
@@ -1469,7 +1514,7 @@ async function fetchNBAAllTeamStats() {
     });
 
     if (!res.ok) {
-      console.log(`  🏀 NBA stats API HTTP ${res.status}`);
+      console.log(`  🏀 NBA stats API HTTP ${res.status} (${seasonStr})`);
       return null;
     }
 
@@ -1477,7 +1522,7 @@ async function fetchNBAAllTeamStats() {
     const headers = data.resultSets?.[0]?.headers || [];
     const rows    = data.resultSets?.[0]?.rowSet   || [];
 
-    if (!rows.length) { console.log('  🏀 NBA stats: no rows returned'); return null; }
+    if (!rows.length) { console.log(`  🏀 NBA stats: no rows for ${seasonStr}`); return null; }
 
     // Build lookup: teamName → { ptsFor, ptsAgainst, gamesPlayed, teamId }
     const idx = (h) => headers.indexOf(h);
@@ -1493,7 +1538,7 @@ async function fetchNBAAllTeamStats() {
       const pts  = parseFloat(row[ptsIdx] || 0);
       // OPP_PTS may not be in Base — fallback handled below
       const oppPts = oppPtsIdx !== -1 ? parseFloat(row[oppPtsIdx] || 0) : 0;
-      if (name && gp >= 5) {
+      if (name && gp >= SEASON_MIN_GAMES) {
         result[name] = { ptsFor: pts, ptsAgainst: oppPts, gamesPlayed: gp };
       }
     }
@@ -1525,14 +1570,43 @@ async function fetchNBAAllTeamStats() {
       } catch(e) { /* silent — model still works with pts allowed estimate */ }
     }
 
-    nbaAllTeamsCache     = result;
-    nbaAllTeamsCacheDate = today;
-    console.log(`  🏀 NBA team stats loaded: ${Object.keys(result).length} teams`);
     return result;
   } catch(e) {
-    console.log(`  🏀 NBA stats fetch error: ${e.message}`);
+    console.log(`  🏀 NBA stats fetch error (${seasonStr}): ${e.message}`);
     return null;
   }
+}
+
+async function fetchNBAAllTeamStats() {
+  const today = ukDateString();
+  if (nbaAllTeamsCache && nbaAllTeamsCacheDate === today) return nbaAllTeamsCache;
+
+  const year  = currentSeason();
+  const label = (y) => `${y}-${String(y + 1).slice(2)}`;   // "2025-26"
+
+  let seasonStr = label(year);
+  let result = await loadNBASeason(seasonStr);
+
+  // Same reasoning as the NHL side. A season that has started is not a season
+  // with numbers in it: every team is below SEASON_MIN_GAMES for the opening
+  // fortnight, which leaves this map empty and the model on league averages.
+  // Last season's rates describe these teams far better than that.
+  if (!result || Object.keys(result).length === 0) {
+    const prevStr = label(year - 1);
+    const prev = await loadNBASeason(prevStr);
+    if (prev && Object.keys(prev).length) {
+      console.log(`  🏀 NBA ${seasonStr} has no team with ${SEASON_MIN_GAMES}+ games yet `
+        + `— using ${prevStr}`);
+      result = prev;
+      seasonStr = prevStr;
+    }
+  }
+  if (!result) return null;
+
+  nbaAllTeamsCache     = result;
+  nbaAllTeamsCacheDate = today;
+  console.log(`  🏀 NBA team stats loaded: ${Object.keys(result).length} teams (season ${seasonStr})`);
+  return result;
 }
 
 async function fetchNBATeamStats(teamName) {
