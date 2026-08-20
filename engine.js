@@ -2947,12 +2947,21 @@ async function fetchSofascoreResult(eventId) {
 // Returns the true cumulative total so the caller can re-seed from it.
 async function recomputeRunningPL() {
   const rows = await selectAll('results_history', 'id, profit_loss, running_pl, settled_at');
-  // A comparator must never return NaN. new Date(null).getTime() and any
-  // unparseable settled_at both give NaN, and NaN !== NaN is true, so the old
-  // comparator took the `ta - tb` branch and returned NaN — which leaves the
-  // sort order undefined. Every running_pl is derived from this ordering, so
-  // one bad timestamp could scramble the whole ledger rather than just its own
-  // row. Undated rows sort first, deterministically, then by primary key.
+  // A comparator must never return NaN. An unparseable settled_at gives NaN
+  // from getTime(), and NaN !== NaN is true, so the old comparator took the
+  // `ta - tb` branch and returned NaN — which leaves the sort order undefined.
+  // Every running_pl is derived from this ordering, so one bad timestamp could
+  // scramble the whole ledger rather than just its own row.
+  //
+  // What this does NOT do, despite an earlier version of this comment saying
+  // so: treat a null settled_at as unusable. `new Date(null)` is not NaN — null
+  // coerces to 0 — so a null sorts at the epoch, while a genuinely unparseable
+  // value sorts at -Infinity. Two buckets rather than one.
+  //
+  // Both land before every real row, and both are deterministic, which is what
+  // the ordering needs. Left alone on purpose: the behaviour is harmless and
+  // test_renumber.js already asserts it row by row, so this was a comment that
+  // disagreed with working code rather than code that needed changing.
   const at = (r) => {
     const t = new Date(r.settled_at).getTime();
     return Number.isFinite(t) ? t : -Infinity;
@@ -3451,6 +3460,27 @@ async function updateStatsCache() {
     const data = rows.filter(r => r.tier !== 'insight' && parseFloat(r.stake ?? 1) > 0);
     const skipped = rows.length - data.length;
     if (skipped) console.log(`📈 Excluding ${skipped} informational pick(s) from the published record`);
+
+    // The published total and the ledger total agree only because every row
+    // excluded above carries a P/L of zero. That is true by construction —
+    // settlement computes P/L from the stake, and these are the rows with no
+    // stake — but nothing checked it, and the two figures are derived
+    // separately: total_pl here sums the bets, while recomputeRunningPL
+    // accumulates every row in the ledger.
+    //
+    // If that ever stopped holding, the running_pl column and the headline
+    // figure would drift apart silently, each internally consistent and
+    // disagreeing with the other. A ledger that disagrees with its own total is
+    // the one failure the published record could not survive, so it is worth
+    // one pass over rows already in hand to say so.
+    const leaked = rows.filter(r => !(r.tier !== 'insight' && parseFloat(r.stake ?? 1) > 0))
+                       .reduce((sum, r) => sum + Math.abs(parseFloat(r.profit_loss || 0)), 0);
+    if (leaked > 0.005) {
+      console.error(`🚨 LEDGER DRIFT: rows excluded from the published figures carry `
+        + `${leaked.toFixed(2)}u of P/L between them. running_pl accumulates every row and `
+        + `total_pl sums only the staked ones, so the two have separated. Needs manual review.`);
+    }
+
     if (!data.length) return;
 
     const won   = data.filter(r => r.result === 'WON').length;
