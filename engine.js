@@ -20,8 +20,9 @@
 //            has been corrected to describe the constants rather than the
 //            constants changed to match the line.)
 //   Edge:    no minimum is enforced. MIN_EDGE_PCT exists but is referenced
-//            nowhere, and ELITE_H2H_EDGE / ELITE_OVERS_EDGE only pick the
-//            displayed grade. What actually excludes a no-edge bet is Kelly:
+//            nowhere, and ELITE_H2H_EDGE / ELITE_OVERS_EDGE only pick a grade
+//            that is never displayed — it is appended to tips.notes, and
+//            nothing reads that column. See the note on applyStrictRules. What actually excludes a no-edge bet is Kelly:
 //            the fraction is <= 0 whenever modelProb <= 1/odds, so it sizes at
 //            0 and the tip publishes as insight. Measured over everything that
 //            clears the confidence and odds filters, 1.6% of combinations have
@@ -2638,6 +2639,20 @@ function applyStrictRules(tip, existingBestOdds = null) {
   const bookCount = tip.book_count || 1;
   if (grade === 'A+' && bookCount < 2) grade = 'A';
 
+  // The grade goes nowhere.
+  //
+  // Its only destination is the notes column, and nothing reads that column:
+  // not buildProEmail, buildFreeEmail or buildSaturdayEmail, none of the six
+  // Vercel handlers, and no page on the site. So ELITE_H2H_EDGE,
+  // ELITE_OVERS_EDGE and the book-count downgrade above are a complete grading
+  // system whose entire output is a string nobody can see.
+  //
+  // Left computing rather than removed, because notes also carries the model
+  // diagnostics — expected goals, the fair price, the edge, the form context —
+  // and those are the first thing anyone would want when a tip looks wrong.
+  // Surfacing them somewhere is a small piece of work; deleting them is not
+  // recoverable. Recorded in DEPLOY.md as a decision.
+
   // ── Short Price Watch — odds below BET_ODDS_MIN ──────────
   // Published as informational only — no stake, marked as insight
   if (odds < BET_ODDS_MIN) {
@@ -2799,6 +2814,22 @@ async function saveTips(tips) {
       // It is the price we told subscribers to take, and the only honest
       // basis for settlement. `odds` tracks the live price; `best_odds`
       // tracks the peak seen — neither is what we actually advised.
+      // Spreads the whole tip object, so every key an analyser returns has to
+      // exist as a column or the insert fails outright. Worth knowing before
+      // adding a field to one of them.
+      //
+      // Three of the columns written here are never read back, by anything:
+      //
+      //   notes           the model diagnostics and the grade — see
+      //                   applyStrictRules. No reader anywhere.
+      //   fair_odds       written on insert and on every refresh, read nowhere.
+      //                   The site shows the edge instead, which is derived
+      //                   from the same pair of numbers.
+      //   is_short_price  set true or false in three places and read in none.
+      //
+      // best_odds looks like a fourth and is not: nothing displays it, but
+      // applyStrictRules reads it back as the peak price for the line-move
+      // check, so it is internal rather than dead.
       const { error } = await supabase.from('tips').insert({ ...tip, best_odds: tip.odds, advised_odds: tip.odds });
       if (error) { if (error.code === '23505') skipped++; else console.error('Insert error:', error.message); }
       else saved++;
