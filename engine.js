@@ -1286,6 +1286,26 @@ async function fetchNHLGoalieData() {
 // Elite goalie (SV% ≥ .920) → reduces goals against
 // Weak goalie  (SV% ≤ .895) → increases goals against
 // No data → neutral (1.0)
+// Recovered by fitting the band table this replaced: see goalieQualityMultiplier.
+const GOALIE_DAMPING          = 0.67;
+const GOALIE_FALLBACK_AVG_SV  = 0.905;
+const GOALIE_MIN_SAMPLE       = 8;      // teams needed before an average means anything
+
+// The league's average starting save percentage, from the goalies actually
+// cached today. Falls back to the fitted constant when too few are known — an
+// average over three teams is noise, and centring the whole scale on noise is
+// worse than centring it on a stale constant.
+function nhlLeagueAverageSavePct() {
+  const svs = Object.values(nhlGoalieCache)
+    .map(g => g && g.savePercent)
+    .filter(v => Number.isFinite(v) && v > 0.5 && v < 1);
+  if (svs.length < GOALIE_MIN_SAMPLE) return GOALIE_FALLBACK_AVG_SV;
+  const mean = svs.reduce((a, b) => a + b, 0) / svs.length;
+  // A mean outside this range means the feed changed shape rather than that the
+  // league did.
+  return (mean > 0.86 && mean < 0.94) ? mean : GOALIE_FALLBACK_AVG_SV;
+}
+
 function goalieQualityMultiplier(goalieName, teamName) {
   // Try exact team name, then fuzzy
   const data = nhlGoalieCache[teamName] ||
@@ -1294,13 +1314,34 @@ function goalieQualityMultiplier(goalieName, teamName) {
   if (!data || !data.savePercent) return { multiplier: 1.0, label: null };
 
   const sv = data.savePercent;
-  let multiplier;
-  if      (sv >= 0.930) multiplier = 0.82;  // elite — saves 93%+
-  else if (sv >= 0.920) multiplier = 0.90;  // very good
-  else if (sv >= 0.910) multiplier = 0.96;  // average
-  else if (sv >= 0.900) multiplier = 1.03;  // below average
-  else if (sv >= 0.890) multiplier = 1.10;  // weak
-  else                  multiplier = 1.18;  // very weak
+
+  // Measured against the league, not against a fixed table.
+  //
+  // This was six bands from 0.82 at 93% down to 1.18 below 89%. Fitting
+  // `1 + d * ((1-sv)/(1-avg) - 1)` to those six points recovers avg = 0.905 and
+  // d = 0.67 with an rms of 0.005 — so the bands were a discretised form of
+  // exactly this, calibrated against a league save percentage of 0.905. The
+  // shape was right; two things about it were not.
+  //
+  // Goals allowed scale with the shots that go in, so (1 - sv) is the quantity
+  // that matters, and the damping is there because save percentage is partly
+  // noise and partly the defence in front of the goalie.
+  //
+  // First, no band produced 1.0. They stepped 0.96 -> 1.03 straight over it, so
+  // a goalie at exactly the league average was given a 3.5% penalty. That
+  // double-counts: NHL_LEAGUE_AVG_GF already describes scoring against average
+  // goaltending, and the multiplier is applied on top of it.
+  //
+  // Second, 0.905 was frozen. League save percentage moves by era — it ran
+  // above 0.915 in the mid-2010s and below 0.900 recently — so the whole scale
+  // drifts out of centre over time with nothing to say it has. The average now
+  // comes from the goalie cache itself, which holds every team's starter, and
+  // falls back to the fitted constant when too few are known to average.
+  const avg = nhlLeagueAverageSavePct();
+  const raw_ = 1 + GOALIE_DAMPING * (((1 - sv) / (1 - avg)) - 1);
+  // The old bands stopped at 0.82 and 1.18; an outlier goalie should not move
+  // the model further than the table ever allowed.
+  const multiplier = Math.min(1.18, Math.max(0.82, parseFloat(raw_.toFixed(4))));
 
   return {
     multiplier,
