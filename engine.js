@@ -3486,10 +3486,20 @@ async function settleResultsInner() {
 
       const { data: already } = await supabase.from('results_history').select('id').eq('tip_ref', tip.tip_ref).maybeSingle();
 
-      await supabase.from('tips').update({
+      // The ledger row and the tip's own status are two writes, and only the
+      // second was checked. If this one fails the tip stays `pending` while
+      // results_history holds its result — the site shows it as unsettled for
+      // ever. It does retry on the next run, because this happens before the
+      // `already` check, so the failure is recoverable; what it was not is
+      // visible.
+      const { error: statusErr } = await supabase.from('tips').update({
         status: push ? 'void' : won ? 'won' : 'lost', profit_loss: pl,
         result_updated_at: new Date().toISOString()
       }).eq('tip_ref', tip.tip_ref);
+      if (statusErr) {
+        console.error(`🚨 [${tip.tip_ref}] settled but its status could not be written `
+          + `(${statusErr.message}) — it stays pending and will be retried`);
+      }
 
       if (already) continue;
 
@@ -4473,7 +4483,13 @@ async function tagDailyBestBet() {
       .sort((a, b) => b.composite - a.composite);
 
     const best = ranked[0];
-    await supabase.from('tips').update({ is_best_bet: true }).eq('id', best.id);
+    const { data: tagged, error: tagErr } = await supabase.from('tips')
+      .update({ is_best_bet: true }).eq('id', best.id).select('id');
+    if (tagErr || !tagged || !tagged.length) {
+      console.error(`⚠️ Best bet NOT tagged [${ukTomorrow}]: `
+        + (tagErr ? tagErr.message : 'the write was refused, no rows changed'));
+      return;
+    }
     console.log(`🏆 Best bet tagged [${ukTomorrow}]: [${best.tip_ref}] ${best.home_team} vs ${best.away_team} (edge: ${best.model_edge}% qs: ${best.quality_score})`);
   } catch(e) { console.error('tagDailyBestBet error:', e.message); }
 }
@@ -5444,8 +5460,31 @@ const server = http.createServer((req, res) => { (async () => {
         // incomplete, paused — and leaves the column alone.
         const mapped = mapSubStatus(sub.status);
         const isPro = mapped === 'pro';
+        // An update Supabase REFUSES returns no error and no rows, so the
+        // result has to be read rather than assumed — and this answer is not
+        // just a status, it is the account page's instruction to overwrite what
+        // it is showing. Answering `verified: true` over a write that did not
+        // land shows the reader a subscription state that reverts on their next
+        // reload, and they cannot tell which of the two visits was lying.
+        //
+        // `verified: false` is the existing contract for "could not confirm,
+        // change nothing", so a failed write uses it. The check against Stripe
+        // did succeed; what failed is recording it, and the honest thing is to
+        // leave the reader looking at what is on record.
         if (mapped && mapped !== user.subscription_status) {
-          await supabase.from('users').update({ subscription_status: mapped }).eq('id', userId);
+          const { data: wrote, error: writeErr } = await supabase.from('users')
+            .update({ subscription_status: mapped }).eq('id', userId).select('id');
+          if (writeErr || !wrote || !wrote.length) {
+            console.error(`🚨 /verify-pro could not record ${mapped} for ${userId}: `
+              + (writeErr ? writeErr.message : 'the write was refused, no rows changed'));
+            res.writeHead(200, { ...cors, 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({
+              isPro: user.subscription_status === 'pro',
+              verified: false,
+              subscriptionStatus: sub.status,
+            }));
+            return;
+          }
         }
         res.writeHead(200, { ...cors, 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ isPro, verified: true, subscriptionStatus: sub.status }));
