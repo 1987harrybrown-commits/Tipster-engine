@@ -186,7 +186,27 @@ const BET_ODDS_MIN      = 1.35; // Minimum odds for a real bet
 const ODDS_CORE_MAX     = 5.00;  // unused — there is no core/elite split in the code
 const ODDS_ELITE_MAX    = 10.0;
 
-const LINE_MOVE_REJECT  = 0.10;
+// How far a price may move against us before a refresh is refused, measured in
+// implied-probability POINTS.
+//
+// This was 0.10 in decimal odds, and a fixed decimal step means something
+// different at every price:
+//
+//     1.35 -> 1.25   5.93 points of implied probability
+//     2.00 -> 1.90   2.63 points
+//     5.00 -> 4.90   0.41 points
+//    10.00 -> 9.90   0.10 points
+//
+// So it fired on a 1% relative drift at long odds — 10.00 to 9.90 is noise —
+// while tolerating a genuine steam move at short ones. Long-priced tips
+// therefore stopped taking refreshes almost immediately, freezing their live
+// and best prices at publication, which is what the site shows next to the
+// advised price.
+//
+// Everything else in this engine reasons in implied probability, and that is
+// the natural unit for "the market moved against us". 2.5 points is what the
+// old constant meant at 2.00, the middle of the published range.
+const LINE_MOVE_REJECT_PP = 2.5;
 // The score matrix is truncated at this many goals per side and then
 // renormalised, so whatever Poisson mass sits above it is redistributed across
 // the rest — which biases every probability drawn from it.
@@ -212,7 +232,35 @@ const NHL_MATRIX_MAX      = 16;
 const NBA_HOME_ADVANTAGE  = 3.5;
 const NBA_LEAGUE_AVG_PTS  = 113;
 const NBA_SCORE_STD_DEV   = 12.0;
-const DC_RHO = 0.10;
+// The Dixon-Coles low-score correction. It was +0.10, and the sign was
+// backwards.
+//
+// dixonColesTau below is the standard formulation, term for term:
+//
+//     tau(0,0) = 1 - lH*lA*rho     tau(0,1) = 1 + lH*rho
+//     tau(1,0) = 1 + lA*rho        tau(1,1) = 1 - rho
+//
+// The term exists because independent Poisson under-predicts 0-0 and 1-1, so
+// rho is negative and the correction RAISES those two scorelines. Dixon and
+// Coles fitted about -0.13 on English league data, and that is the value in
+// general use.
+//
+// A positive rho runs every one of those four terms the other way: it lowers
+// 0-0 and 1-1 and raises 1-0 and 0-1. Measured on an average fixture
+// (lH 1.55, lA 1.18), that is
+//
+//     draw  22.76% at +0.10, 25.15% at 0, 28.25% at -0.13
+//     home  47.06%           45.86%       44.31%
+//
+// against an observed Premier League draw rate of roughly 24-26%. So the old
+// value pushed draws below what actually happens while inflating home and away
+// — and the engine publishes a Draw selection, so it suppressed those tips
+// and manufactured edge on the other two at the same time. A backwards
+// correction is worse than none.
+//
+// The sign is not in doubt; the magnitude is a fitting question this repository
+// has no data to answer, so it takes the published value rather than a guess.
+const DC_RHO = -0.13;
 
 // ─── LEAGUE AVERAGES (Football) ───────────────────────────────
 const LEAGUE_AVERAGES = {
@@ -2421,10 +2469,11 @@ function applyStrictRules(tip, existingBestOdds = null) {
   if (odds < INSIGHT_ODDS_MIN) return null; // below 1.05 — not worth showing
   if (odds > ODDS_ELITE_MAX)   return null;
 
-  // Line movement check
-  if (existingBestOdds && existingBestOdds > 0) {
-    const lineMove = existingBestOdds - odds;
-    if (lineMove >= LINE_MOVE_REJECT) return null;
+  // Line movement check. Shortening odds mean a rising implied probability, so
+  // the move is measured there rather than in decimal steps — see the constant.
+  if (existingBestOdds && existingBestOdds > 0 && odds > 0) {
+    const movePP = (100 / odds) - (100 / existingBestOdds);
+    if (movePP >= LINE_MOVE_REJECT_PP) return null;
   }
 
   // Edge — informational only, used for grade display
