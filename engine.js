@@ -94,6 +94,22 @@ function safeEqual(a, b) {
 // PostgREST caps every response at 1000 rows. Any query whose result
 // set can grow past that MUST paginate or it truncates silently — which
 // is how the settler started treating a full ledger as "missing".
+// An update, with both of the ways it can fail to change anything.
+//
+// Supabase reports a rejected write two different ways: an error object, or —
+// when a row-level policy refuses the row — no error and no rows at all. Code
+// that checks only the first treats the second as a success.
+//
+// Every caller below already carried a comment explaining why a failed write
+// must not be treated as done. Each of those comments was true of one failure
+// mode and silent about the other. This makes them true of both.
+async function updateChecked(table, patch, applyFilter) {
+  const { data, error } = await applyFilter(supabase.from(table).update(patch)).select('id');
+  if (error) return { ok: false, why: error.message };
+  if (!data || !data.length) return { ok: false, why: 'the write was refused — no rows changed' };
+  return { ok: true, rows: data.length };
+}
+
 async function selectAll(table, columns, applyFilters = null) {
   const PAGE = 1000;
   let out = [], from = 0;
@@ -3092,8 +3108,8 @@ async function recomputeRunningPL() {
   for (const r of rows) {
     acc = parseFloat((acc + parseFloat(r.profit_loss || 0)).toFixed(2));
     if (parseFloat(r.running_pl) === acc) continue;   // NaN on NULL -> always rewrites
-    const { error } = await supabase.from('results_history').update({ running_pl: acc }).eq('id', r.id);
-    if (error) { console.error(`  ❌ running_pl renumber [id ${r.id}]:`, error.message); continue; }
+    const wrote = await updateChecked('results_history', { running_pl: acc }, q => q.eq('id', r.id));
+    if (!wrote.ok) { console.error(`  ❌ running_pl renumber [id ${r.id}]: ${wrote.why}`); continue; }
     fixed++;
   }
   if (fixed) console.log(`  🔢 Renumbered running_pl on ${fixed}/${rows.length} ledger rows.`);
@@ -3140,10 +3156,12 @@ async function settleResultsInner() {
   for (const t of [...pendingTips, ...alreadyGraded].filter(t => !t.tip_ref)) {
     const prefixes = { 'Football':'FB','Basketball':'BB','Ice Hockey':'IH' };
     const ref = `${prefixes[t.sport]||'TT'}-${Date.now().toString(36).toUpperCase().slice(-4)}${Math.random().toString(36).toUpperCase().slice(-4)}`;
-    const { error } = await supabase.from('tips').update({ tip_ref: ref }).eq('id', t.id);
+    const wrote = await updateChecked('tips', { tip_ref: ref }, q => q.eq('id', t.id));
     // Leave t.tip_ref NULL on failure — a ref we did not persist must not be
     // treated as backfillable, or the ledger row would reference nothing.
-    if (error) { console.error(`  ❌ tip_ref assign [id ${t.id}]:`, error.message); continue; }
+    // That is as true of a refused write as of a failed one, and only the
+    // second was being caught.
+    if (!wrote.ok) { console.error(`  ❌ tip_ref assign [id ${t.id}]: ${wrote.why}`); continue; }
     t.tip_ref = ref;
     if (t.status !== 'pending') console.log(`  🏷️ Assigned ${ref} to graded tip id ${t.id} (was NULL) — now eligible for backfill`);
   }
@@ -3591,7 +3609,9 @@ async function settleResultsInner() {
       } else {
         pl = parseFloat((-parseFloat(acca.stake ?? 1)).toFixed(2));
       }
-      const { error: updErr } = await supabase.from('daily_accas').update({ result, profit_loss: pl }).eq('id', acca.id);
+      const updWrote = await updateChecked('daily_accas', { result, profit_loss: pl },
+                                           q => q.eq('id', acca.id));
+      const updErr = updWrote.ok ? null : { message: updWrote.why };
       if (updErr) {
         // Left pending on purpose: the next run re-settles it. Logging matters
         // because otherwise the acca silently never leaves 'pending'.
