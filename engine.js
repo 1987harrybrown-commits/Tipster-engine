@@ -5040,12 +5040,42 @@ const server = http.createServer((req, res) => { (async () => {
         if (!caller) { res.writeHead(401, { ...cors, 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'Unauthorized' })); return; }
         const userId = caller.id;
         const { data: user } = await supabase.from('users').select('stripe_customer_id, stripe_subscription_id, subscription_status').eq('id', userId).single();
-        if (!user?.stripe_subscription_id) { res.writeHead(200, { ...cors, 'Content-Type': 'application/json' }); res.end(JSON.stringify({ isPro: false })); return; }
+        if (!user?.stripe_subscription_id) { res.writeHead(200, { ...cors, 'Content-Type': 'application/json' }); res.end(JSON.stringify({ isPro: false, verified: true })); return; }
+
         const sub = await stripeRequest(`/subscriptions/${user.stripe_subscription_id}`);
-        const isPro = sub && (sub.status === 'active' || sub.status === 'trialing');
-        if (!isPro && user.subscription_status === 'pro') await supabase.from('users').update({ subscription_status: 'free' }).eq('id', userId);
+
+        // No answer is not the same as a negative answer.
+        //
+        // stripeRequest returns null for a timeout, a 5xx, a 4xx and a missing
+        // API key alike, and this used to read that as "not active" and write
+        // the account down to free. A Stripe blip, or a key that had not been
+        // set, downgraded a paying subscriber — and /stripe/portal, which calls
+        // the same helper, already answers 502 in exactly this case rather than
+        // acting on it.
+        //
+        // Report what is on record, say it was not verified, and change nothing.
+        // A genuinely cancelled subscription still reaches us through
+        // customer.subscription.deleted, which is the path that should be
+        // trusted for it.
+        if (!sub || !sub.status) {
+          res.writeHead(200, { ...cors, 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ isPro: user.subscription_status === 'pro', verified: false }));
+          return;
+        }
+
+        // Through the same mapping the webhook uses, rather than a flat 'free'.
+        // past_due is not free: the checkout guard counts it as a live
+        // subscription and refuses a second one, so writing those accounts down
+        // to free here would let a subscriber whose card had failed start a
+        // second subscription alongside the first. null means transient —
+        // incomplete, paused — and leaves the column alone.
+        const mapped = mapSubStatus(sub.status);
+        const isPro = mapped === 'pro';
+        if (mapped && mapped !== user.subscription_status) {
+          await supabase.from('users').update({ subscription_status: mapped }).eq('id', userId);
+        }
         res.writeHead(200, { ...cors, 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ isPro: !!isPro }));
+        res.end(JSON.stringify({ isPro, verified: true, subscriptionStatus: sub.status }));
       } catch(e) { res.writeHead(500, cors); res.end(JSON.stringify({ error: 'Internal error' })); }
     })();
     return;
