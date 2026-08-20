@@ -3642,6 +3642,22 @@ async function updateStatsCache() {
         + `total_pl sums only the staked ones, so the two have separated. Needs manual review.`);
     }
 
+    // Every aggregate here and on the site compares against the upper-case
+    // form, so a row spelled any other way is counted as neither won nor lost
+    // — while its profit_loss still sums into P/L. The two headline figures
+    // then describe different populations, which is precisely what the
+    // insight-pick filter above exists to prevent.
+    //
+    // The live ledger held fourteen such rows: win rate over 93, ROI over 107.
+    // schema-migration.sql normalises them; this says so if it happens again.
+    const CANONICAL = ['WON', 'LOST', 'VOID'];
+    const odd = data.filter(r => !CANONICAL.includes(r.result));
+    if (odd.length) {
+      console.error(`🚨 ${odd.length} ledger row(s) carry a result this code cannot read `
+        + `(${[...new Set(odd.map(r => JSON.stringify(r.result)))].join(', ')}). They are in `
+        + `P/L and not in the win rate, so the two figures describe different sets of tips.`);
+    }
+
     if (!data.length) return;
 
     const won   = data.filter(r => r.result === 'WON').length;
