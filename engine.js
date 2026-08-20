@@ -228,6 +228,18 @@ const MIN_QUALITY_SCORE = 0.10;
 // state of every team, so the fatigue penalty fired on essentially every game —
 // and with both sides carrying it, both lambdas came out about 2.3% low for no
 // reason. The case that actually matters there is the back-to-back.
+// How many players are on the field at once, used to turn a count of missing
+// players into a fraction of the side. A flat "3% per absence" is a different
+// statement in a sport that fields eleven and one that dresses eighteen
+// skaters, and the same absence list cost both the same.
+//
+// The impact constants are chosen so football is unchanged: 0.33 over eleven
+// is exactly the 0.03 per player it applied before.
+const SQUAD_SIZE_FOOTBALL = 11;
+const SQUAD_SIZE_NHL      = 18;   // skaters dressed; the goalie is modelled separately
+const MISSING_ATTACK_IMPACT  = 0.33;   // if a whole side were missing
+const MISSING_DEFENCE_IMPACT = 0.22;
+
 const REST_BANDS_FOOTBALL = { heavy: 2, mild: 3 };
 const REST_BANDS_NHL      = { heavy: 0, mild: 1 };   // heavy = a back-to-back
 
@@ -923,14 +935,14 @@ async function fetchMatchContext(eventId, homeTeamId, awayTeamId, sport) {
 
 // ─── FETCH LINEUPS (called at 21:00 UK) ──────────────────────
 async function fetchLineupsForToday() {
-  const today = new Date().toLocaleDateString('en-CA', { timeZone: 'Europe/London' });
+  const today = ukDateString();
   let fetched = 0;
 
   for (const sport of SPORTS) {
     const events = sofascoreCache.events[sport.key] || [];
     for (const event of events) {
       const eventDate = event.commence_time?.split('T')[0];
-      if (eventDate !== today && eventDate !== new Date(Date.now() + 86400000).toLocaleDateString('en-CA', { timeZone: 'Europe/London' })) continue;
+      if (eventDate !== today && eventDate !== ukDateString(new Date(Date.now() + 86400000))) continue;
       try {
         await new Promise(r => setTimeout(r, 200));
         const lineupData = await sofascoreFetch('/matches/get-lineups', { matchId: event.id });
@@ -1001,7 +1013,7 @@ function parseTeamForm(events, teamId) {
 // in an average game. It has to be passed in because this function is shared
 // between football and NHL, whose scoring rates differ by a factor of two, and
 // the recent-form adjustment below is only meaningful relative to one of them.
-function getContextModifiers(teamSide, ctx, isHome, leagueAvgGoals, restBands) {
+function getContextModifiers(teamSide, ctx, isHome, leagueAvgGoals, restBands, squadSize) {
   if (!ctx) return { attackMult: 1.0, defenceMult: 1.0, restPenalty: 0, dataQuality: 0.85, notes: 'No context' };
 
   const form    = isHome ? ctx.homeForm    : ctx.awayForm;
@@ -1067,15 +1079,30 @@ function getContextModifiers(teamSide, ctx, isHome, leagueAvgGoals, restBands) {
   }
 
   // ── Missing players (from lineups) ────────────────────────
-  // Position-weighted impact: forwards matter more for attack,
-  // defenders/GK for defence
+  // NOT position-weighted. The comment here used to say it was — "forwards
+  // matter more for attack, defenders/GK for defence" — and no such weighting
+  // exists; the impact is a flat count. It could not exist either, because
+  // fetchLineupsForToday keeps only { name, reason } from each entry and throws
+  // the position away. Saying so plainly beats describing a model the code does
+  // not implement.
+  //
+  // Taken as a fraction of the side rather than a flat rate per player: three
+  // absences out of eleven is a different thing from three out of eighteen, and
+  // the same list used to cost both sports the same. Football is unchanged.
   if (missing.length > 0) {
-    const attackImpact  = missing.length * 0.03; // ~3% per missing player
-    const defenceImpact = missing.length * 0.02;
-    attackMult  = Math.max(0.75, attackMult  - attackImpact);
-    defenceMult = Math.max(0.80, defenceMult + defenceImpact);
+    if (Number.isFinite(squadSize) && squadSize > 0) {
+      const share = Math.min(1, missing.length / squadSize);
+      attackMult  = Math.max(0.75, attackMult  - share * MISSING_ATTACK_IMPACT);
+      defenceMult = Math.max(0.80, defenceMult + share * MISSING_DEFENCE_IMPACT);
+    }
+    // Without a squad size the absences are recorded and not priced, rather
+    // than priced with a number that means nothing.
     notes.push(`Missing: ${missing.map(p => p.name).join(', ')}`);
-    dataQuality = Math.min(dataQuality, 0.95); // slight quality boost — we HAVE lineup data
+    // A CAP, not a boost. This is Math.min, so it can only lower the tier —
+    // from 1.0 to 0.95 — and the comment used to call it a quality boost. The
+    // cap itself is right: knowing who is out beats not knowing, but a side
+    // missing people is still a less certain thing to model.
+    dataQuality = Math.min(dataQuality, 0.95);
   } else if (ctx.lineups?.homeConfirmed) {
     notes.push('Full squad ✓');
   }
@@ -2048,8 +2075,8 @@ async function analyseFootballFixture(event, sport) {
     // (the pre-modifier matrix used to be built here and never read — an
     //  81-cell Poisson grid per fixture per cycle, discarded immediately)
     const ctx      = matchContextCache[event.id] || null;
-    const homeMod  = getContextModifiers('home', ctx, true,  leagueAvg.homeGoals, REST_BANDS_FOOTBALL);
-    const awayMod  = getContextModifiers('away', ctx, false, leagueAvg.awayGoals, REST_BANDS_FOOTBALL);
+    const homeMod  = getContextModifiers('home', ctx, true,  leagueAvg.homeGoals, REST_BANDS_FOOTBALL, SQUAD_SIZE_FOOTBALL);
+    const awayMod  = getContextModifiers('away', ctx, false, leagueAvg.awayGoals, REST_BANDS_FOOTBALL, SQUAD_SIZE_FOOTBALL);
 
     // Apply multipliers to expected goals
     let lHmod = clampFinite(lH * homeMod.attackMult * awayMod.defenceMult, 0.3, 4.0);
@@ -2227,8 +2254,8 @@ async function analyseNHLFixture(event, sport) {
 
     // Apply match context (form, rest, H2H) to NHL lambda
     const ctx     = matchContextCache[event.id] || null;
-    const homeMod = getContextModifiers('home', ctx, true,  NHL_LEAGUE_AVG_GF, REST_BANDS_NHL);
-    const awayMod = getContextModifiers('away', ctx, false, NHL_LEAGUE_AVG_GF, REST_BANDS_NHL);
+    const homeMod = getContextModifiers('home', ctx, true,  NHL_LEAGUE_AVG_GF, REST_BANDS_NHL, SQUAD_SIZE_NHL);
+    const awayMod = getContextModifiers('away', ctx, false, NHL_LEAGUE_AVG_GF, REST_BANDS_NHL, SQUAD_SIZE_NHL);
 
     lH = clampFinite(lH * homeMod.attackMult * awayMod.defenceMult, 0.5, 6.0);
     lA = clampFinite(lA * awayMod.attackMult * homeMod.defenceMult, 0.5, 6.0);
