@@ -3809,7 +3809,7 @@ async function getSubscribers(type = 'daily', tier = 'all') {
   // throws on failure, so that contract is preserved here rather than letting
   // a partial list through as if it were the whole audience.
   try {
-    return await selectAll('users', 'id, email, first_name, subscription_status', q => {
+    const rows = await selectAll('users', 'id, email, first_name, subscription_status', q => {
       // `not is false`, not `eq true`, because null means opted in here.
       //
       // account.html renders these checkboxes with `email_daily !== false`, so a
@@ -3823,6 +3823,27 @@ async function getSubscribers(type = 'daily', tier = 'all') {
       if (tier === 'free') q = q.neq('subscription_status', 'pro');
       return q;
     });
+
+    // An audience is people who can be sent to.
+    //
+    // /ensure-profile takes the address from the caller's token, and a token
+    // without one — phone or anonymous sign-in — creates a row with a null
+    // email. Such a row passes every filter above, so the dispatcher sends to
+    // it, Resend refuses, and email_log records a 'failed'. The resume check
+    // only skips recipients logged 'sent', so that row is retried on every
+    // dispatch from then on: a permanent failure in the count and a wasted API
+    // call each time, for someone who was never reachable.
+    //
+    // Filtered here rather than in the query so an empty string is caught as
+    // well as a null, and so the exclusion can be reported instead of quietly
+    // shrinking the audience.
+    const usable = (rows || []).filter(u => u && typeof u.email === 'string' && u.email.includes('@'));
+    const dropped = (rows || []).length - usable.length;
+    if (dropped) {
+      console.warn(`⚠️ ${dropped} subscriber row(s) have no usable email address — `
+        + `excluded from the ${type}/${tier} audience`);
+    }
+    return usable;
   } catch (err) {
     console.error(`getSubscribers(${type}/${tier}) failed:`, err.message);
     return null;
@@ -4636,6 +4657,28 @@ const rateLimitMap = new Map();
 const RATE_LIMIT   = 60;
 const RATE_WINDOW  = 60 * 1000;
 
+// The Stripe webhook gets its own allowance.
+//
+// The limiter is keyed on client address, and this route's caller is Stripe.
+// Its authentication is the HMAC signature, not the address, so limiting it by
+// address buys no security — a request without the secret is already refused
+// with a 400. What it can do is drop payment events: Stripe replays a backlog
+// after an outage, and a replay of more than sixty in a minute would meet a 429.
+// Those are retried rather than lost, but a subscription sits in the wrong state
+// meanwhile, and the retry schedule runs for days.
+//
+// Not exempt, because an unlimited endpoint is an unlimited endpoint whatever
+// guards its contents — every request still costs a body read and an HMAC.
+// Raised instead, which keeps the ceiling and moves it above anything Stripe
+// would plausibly send.
+const RATE_LIMIT_WEBHOOK = 300;
+function limitForPath(pathname) {
+  return pathname === '/stripe/webhook' ? RATE_LIMIT_WEBHOOK : RATE_LIMIT;
+}
+
+// The last time the expired entries were swept out.
+let rateSweptAt = 0;
+
 // Resolve the client address for rate limiting.
 //
 // x-forwarded-for is a list that each proxy appends its observed peer to, so
@@ -4658,18 +4701,26 @@ function clientIpFrom(req) {
   return req.socket?.remoteAddress || '';
 }
 
-function isRateLimited(ip) {
+function isRateLimited(ip, limit = RATE_LIMIT) {
   const now   = Date.now();
   const entry = rateLimitMap.get(ip) || { count: 0, start: now };
   if (now - entry.start > RATE_WINDOW) { entry.count = 1; entry.start = now; }
   else entry.count++;
   rateLimitMap.set(ip, entry);
-  if (rateLimitMap.size > 1000) {
+
+  // Sweep at most once a window, rather than on every request once the map is
+  // over a thousand entries. The old condition swept whenever the map was
+  // large, and a spread of more than a thousand active addresses inside one
+  // window leaves nothing to delete — so it walked the whole map on every
+  // request and deleted nothing, turning the limiter itself into the cost.
+  // Once a window is enough: entries are only removable after they expire.
+  if (rateLimitMap.size > 1000 && now - rateSweptAt > RATE_WINDOW) {
+    rateSweptAt = now;
     for (const [key, val] of rateLimitMap) {
       if (now - val.start > RATE_WINDOW) rateLimitMap.delete(key);
     }
   }
-  return entry.count > RATE_LIMIT;
+  return entry.count > limit;
 }
 
 // Resolve the caller from their Supabase JWT. Returns null if unauthenticated.
@@ -4742,7 +4793,11 @@ const server = http.createServer((req, res) => { (async () => {
   if (req.method === 'OPTIONS') { res.writeHead(204, cors); res.end(); return; }
 
   const clientIp = clientIpFrom(req);
-  if (isRateLimited(clientIp)) { res.writeHead(429, { ...cors, 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'Too many requests' })); return; }
+  if (isRateLimited(clientIp, limitForPath(url.pathname))) {
+    res.writeHead(429, { ...cors, 'Content-Type': 'application/json', 'Retry-After': '60' });
+    res.end(JSON.stringify({ error: 'Too many requests' }));
+    return;
+  }
 
   if (url.pathname === '/') {
     res.writeHead(200, { ...cors, 'Content-Type': 'text/plain' });
