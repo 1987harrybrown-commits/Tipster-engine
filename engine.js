@@ -377,12 +377,38 @@ function apiBudgetAllows(path) {
   return true;
 }
 
+// Whether a call could be made right now.
+//
+// apiBudgetAllows() is the gate the fetcher uses, and it rolls the counter and
+// warns as a side effect. This asks the same question without those, for code
+// that needs to know WHY it has no data rather than whether to go and ask for
+// it. It does not roll the day: a stale count from yesterday makes it answer
+// false, and every caller treats false as "do not draw a conclusion", which is
+// the safe direction.
+function apiCallsAvailable() {
+  return Date.now() >= rapidApiCooldownUntil
+      && rapidApiCallCount < RAPIDAPI_DAILY_BUDGET;
+}
+
 function trackApiCall() {
   const today = ukDateString();
   if (rapidApiCallDate !== today) { rapidApiCallDate = today; rapidApiCallCount = 0; rapidApiBudgetWarned = false; }
   rapidApiCallCount++;
   if (rapidApiCallCount % 10 === 0) console.log(`📡 RapidAPI calls today: ${rapidApiCallCount}`);
 }
+
+// When a tip stops being worth asking about.
+//
+// Ask-before-voiding means a tip that never resolves is retried on every cycle,
+// which is every fifteen minutes, forever — and each retry costs metered calls.
+// Sofascore's last-matches endpoint pages back three pages, so a fixture a month
+// old is not reachable through it in any case: past this, asking again cannot
+// produce a different answer, and the tip is voided without a call.
+//
+// The gap between 72 hours and 30 days is the range where the answer really can
+// change: a service that was down, a budget that was spent, a source that was
+// slow to publish.
+const SETTLE_ASK_UNTIL_HOURS = 24 * 30;
 
 // How many times a single Sofascore request is attempted before giving up.
 const SOFASCORE_MAX_ATTEMPTS = 3;
@@ -3139,12 +3165,51 @@ async function settleResultsInner() {
 
   for (const tip of pending) {
     try {
+      // What to do when this tip has no score.
+      //
+      // This decision used to be made BEFORE asking: anything more than 72
+      // hours past kick-off was voided on the spot, without a single request.
+      // The 72 hours stood in for "we have tried and failed repeatedly", and
+      // those are only the same thing while the settler is running. They come
+      // apart exactly when it matters — if the service is down for three days,
+      // the first run after it comes back voids every tip from those three
+      // days rather than grading them, and a void writes no ledger row at all.
+      // The published record loses the period silently, and the win rate and
+      // ROI on the site are then computed from a truncated history.
+      //
+      // That is not hypothetical. The deployed build has been frozen since 12
+      // August, so there is a week of pending tips waiting for exactly this.
+      //
+      // Ask first, decide after. And do not conclude anything at all while the
+      // data source is unreachable: sofascoreFetch returns null for a spent
+      // budget, a 429 cooldown, a timeout and a genuine "no result" alike, and
+      // three of those four mean we never asked.
       const hoursOld = (now - new Date(tip.event_time).getTime()) / 3600000;
-      if (hoursOld > 72) {
+
+      // Old enough that no answer is coming. Voided without a call, because
+      // asking again every fifteen minutes for the rest of the service's life
+      // is the only other option.
+      if (hoursOld > SETTLE_ASK_UNTIL_HOURS) {
         await supabase.from('tips').update({ status: 'void' }).eq('tip_ref', tip.tip_ref);
-        console.log(`⚪ VOID (no result after 72h): [${tip.tip_ref}] ${tip.home_team} vs ${tip.away_team}`);
+        console.log(`⚪ VOID (${Math.round(hoursOld / 24)} days old, beyond the window `
+          + `the source retains): [${tip.tip_ref}] ${tip.home_team} vs ${tip.away_team}`);
         continue;
       }
+
+      const noResult = async (why) => {
+        if (hoursOld <= 72) {
+          console.log(`⏳ ${why}: ${tip.home_team} vs ${tip.away_team}`);
+          return;
+        }
+        if (!apiCallsAvailable()) {
+          console.log(`⏸️ ${why} and ${Math.round(hoursOld)}h old, but the data source is `
+            + `unavailable — [${tip.tip_ref}] left pending rather than voided`);
+          return;
+        }
+        await supabase.from('tips').update({ status: 'void' }).eq('tip_ref', tip.tip_ref);
+        console.log(`⚪ VOID (asked, no result after ${Math.round(hoursOld)}h): `
+          + `[${tip.tip_ref}] ${tip.home_team} vs ${tip.away_team}`);
+      };
 
       let homeScore = null, awayScore = null;
 
@@ -3180,12 +3245,15 @@ async function settleResultsInner() {
               }
             } catch(e2) { console.log(`  ⚠️ last-matches fallback failed: ${e2.message}`); }
           }
-          if (homeScore === null) { console.log(`⏳ No result yet: ${tip.home_team} vs ${tip.away_team}`); continue; }
+          if (homeScore === null) { await noResult('No result yet'); continue; }
         }
       } else {
         // Fallback: name match from cache for tips created before event_id was stored
         const sport = SPORTS.find(s => s.league === tip.league);
-        if (!sport) continue;
+        // A league this build does not know about is a permanent dead end for
+        // this tip, but it still goes through noResult so that the 72-hour rule
+        // stays the one place a void is decided.
+        if (!sport) { await noResult('League not configured'); continue; }
 
         // Step 1: check live cache (upcoming/in-progress games)
         const cachedEvents = sofascoreCache.events[sport.key] || [];
@@ -3230,31 +3298,34 @@ async function settleResultsInner() {
                   console.log(`  📊 Score from last-matches: ${hs}-${as_}`);
                 } else {
                   const result = await fetchSofascoreResult(found.id);
-                  if (!result) { console.log(`⏳ No result yet: ${tip.home_team} vs ${tip.away_team}`); continue; }
+                  if (!result) { await noResult('No result yet'); continue; }
                   homeScore = result.homeScore;
                   awayScore = result.awayScore;
                 }
               } else {
-                console.log(`⏳ No cached event for: ${tip.home_team} vs ${tip.away_team}`);
+                await noResult('No cached event');
                 continue;
               }
             } else {
-              console.log(`⏳ No cached event for: ${tip.home_team} vs ${tip.away_team}`);
+              // A null here is just as likely to be a spent budget as an empty
+              // season list, which is why this goes through noResult too.
+              await noResult('No cached event');
               continue;
             }
           } catch (e) {
+            // A throw means we could not ask. Never a void.
             console.log(`⚠️ Last matches fetch failed for ${tip.league}: ${e.message}`);
             continue;
           }
         } else {
           const result = await fetchSofascoreResult(cachedEvent.id);
-          if (!result) { console.log(`⏳ No result yet: ${tip.home_team} vs ${tip.away_team}`); continue; }
+          if (!result) { await noResult('No result yet'); continue; }
           homeScore = result.homeScore;
           awayScore = result.awayScore;
         }
       }
 
-      if (homeScore === null || awayScore === null) continue;
+      if (homeScore === null || awayScore === null) { await noResult('No score returned'); continue; }
 
       // Grade the selection. Resolve the side against BOTH teams — the old
       // ternary treated "not a home-name match" as "must be away", so a single
