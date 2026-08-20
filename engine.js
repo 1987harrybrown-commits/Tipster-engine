@@ -3806,6 +3806,45 @@ function verifyUnsubToken(token, uid) {
 // 403 coming back is proof the request reached this process through the site
 // — which a 200 from some other page would not be. Log-only, and never
 // blocking: the frontend being slow is not a reason to delay starting.
+// What this build can and cannot do, said once at boot.
+//
+// Two variables are hard boot guards, and everything else degrades quietly:
+// without RESEND_API_KEY every dispatch logs a skip and returns success,
+// without RAPIDAPI_KEY every fetch fails and the card stays empty, without
+// STRIPE_SECRET_KEY checkout returns 502 and /verify-pro answers "unverified"
+// for ever. Each of those is a deliberate degradation and each is invisible
+// unless you already suspect it — a service that looks healthy and quietly
+// does nothing is the most expensive kind of misconfiguration.
+//
+// Names only. Never the values.
+function logConfiguration() {
+  const rows = [
+    ['Supabase',      !!SUPABASE_URL && !!process.env.SUPABASE_SERVICE_KEY,
+     'SUPABASE_URL + SUPABASE_SERVICE_KEY', 'nothing can be read or written'],
+    ['Sofascore',     !!RAPIDAPI_KEY,
+     'RAPIDAPI_KEY', 'no fixtures, no odds, no results — the card stays empty'],
+    ['Resend',        !!RESEND_API_KEY,
+     'RESEND_API_KEY', 'every dispatch is skipped and logged as skipped'],
+    ['Stripe',        !!STRIPE_SECRET_KEY,
+     'STRIPE_SECRET_KEY', 'checkout answers 502 and no subscription can be bought'],
+    ['Stripe webhook', !!STRIPE_WEBHOOK_SECRET,
+     'STRIPE_WEBHOOK_SECRET', 'payment events are refused, so nobody becomes Pro'],
+    ['Unsub signing', !!UNSUB_SECRET && UNSUB_SECRET !== STRIPE_WEBHOOK_SECRET,
+     'UNSUB_SECRET', 'links are signed with the Stripe secret, so rotating it '
+     + 'breaks every unsubscribe link already delivered'],
+  ];
+  console.log('   Configuration:');
+  for (const [name, ok, vars, consequence] of rows) {
+    if (ok) console.log(`     ${name}: on`);
+    else console.log(`     ⚠️ ${name}: OFF (${vars}) — ${consequence}`);
+  }
+  const proxyHops = Math.max(1, parseInt(process.env.TRUSTED_PROXY_HOPS || '1', 10) || 1);
+  console.log(`     Rate limit: ${RATE_LIMIT}/min, ${RATE_LIMIT_WEBHOOK}/min on the Stripe `
+    + `webhook, reading the client address ${proxyHops} hop(s) from the right of `
+    + `x-forwarded-for`);
+  console.log(`     RapidAPI budget: ${RAPIDAPI_DAILY_BUDGET} calls per UK day`);
+}
+
 async function checkUnsubscribeLink() {
   const probeUrl = `${SITE_URL}/unsubscribe?token=probe&uid=probe`;
   let status;
@@ -5597,6 +5636,8 @@ process.on('uncaughtException', (err) => {
   console.log(`   Season: ${currentSeason()}/${currentSeason()+1}`);
   console.log(`   Data source: Sofascore (RapidAPI Pro)`);
   console.log(`   Schedule: Morning fetch 06:00 | Midday refresh 13:00 | Tips every 15min`);
+
+  logConfiguration();
 
   // Not awaited: it reports on the frontend, and startup does not depend on it.
   checkUnsubscribeLink().catch(e => console.error('Unsubscribe link check error:', e && e.message));
