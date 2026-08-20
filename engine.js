@@ -3599,7 +3599,7 @@ async function sendEmail({ to, subject, html, type = 'general', userId = null })
   try {
     const extraHeaders = {};
     if (userId) {
-      const unsub = `${SITE_URL.replace('www.','')}/unsubscribe?token=${generateUnsubToken(userId)}&uid=${userId}`;
+      const unsub = `${SITE_URL}/unsubscribe?token=${generateUnsubToken(userId)}&uid=${userId}`;
       extraHeaders['List-Unsubscribe'] = `<${unsub}>`;
       extraHeaders['List-Unsubscribe-Post'] = 'List-Unsubscribe=One-Click';
     }
@@ -3644,6 +3644,43 @@ function verifyUnsubToken(token, uid) {
   return safeEqual(token, generateUnsubToken(uid));
 }
 
+// The unsubscribe link is the one address in an email that nothing clicks in
+// testing and everything depends on.
+//
+// It is served by THIS process but reached through the site, via a rewrite in
+// the frontend's vercel.json. So a frontend deployed without that rewrite
+// leaves every unsubscribe link in every email answering 404 — and nothing
+// here would know, because the engine's own route is fine. It was answering
+// 404 in production while this check was being written.
+//
+// That is a legal obligation as much as a deliverability one. PECR requires a
+// working means of refusing further messages in every one sent, and a bulk
+// sender whose only way out is the spam button loses the inbox with it.
+//
+// The route answers 403 to a well-formed token with a wrong signature, so a
+// 403 coming back is proof the request reached this process through the site
+// — which a 200 from some other page would not be. Log-only, and never
+// blocking: the frontend being slow is not a reason to delay starting.
+async function checkUnsubscribeLink() {
+  const probeUrl = `${SITE_URL}/unsubscribe?token=probe&uid=probe`;
+  let status;
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 10000);
+    try {
+      status = (await fetch(probeUrl, { redirect: 'follow', signal: controller.signal })).status;
+    } finally { clearTimeout(timer); }
+  } catch (e) {
+    console.warn(`⚠️ Could not reach the unsubscribe link (${probeUrl}): ${e.message}`);
+    return null;
+  }
+  if (status === 403) console.log('   Unsubscribe link: reachable');
+  else console.error(`🚨 UNSUBSCRIBE LINK BROKEN — ${probeUrl} answered ${status}, expected 403. `
+    + `Every email already sent carries this address, and nobody can get out. `
+    + `Check the /unsubscribe rewrite in the frontend's vercel.json.`);
+  return status;
+}
+
 // Escape values interpolated into email HTML.
 //
 // Three sources reach these templates and none were escaped: team names and
@@ -3665,7 +3702,7 @@ function emailBase(content, userId) {
   // advice actually arrives through, so they were the one surface where it
   // mattered most and the only one where it was absent. It goes in the shared
   // shell rather than the templates so a fifth email cannot be added without it.
-  const unsubUrl = `${SITE_URL.replace('www.','')}/unsubscribe?token=${generateUnsubToken(userId)}&uid=${userId}`;
+  const unsubUrl = `${SITE_URL}/unsubscribe?token=${generateUnsubToken(userId)}&uid=${userId}`;
   return `<!DOCTYPE html><html lang="en-GB"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>The Tipster Edge</title></head>
 <body style="margin:0;padding:0;background:#07090d;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;">
 <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#07090d;padding:32px 16px;">
@@ -3678,7 +3715,7 @@ function emailBase(content, userId) {
 <tr><td style="padding-top:20px;text-align:center;">
 <p style="font-size:11px;color:#6c83a3;margin:0 0 10px;">© The Tipster Edge · <a href="${unsubUrl}" style="color:#6c83a3;">Unsubscribe</a></p>
 <p style="font-size:10px;line-height:1.7;color:#6c83a3;margin:0;">&#9888; <strong style="color:#6c83a3;">18+ only.</strong> Tips are for informational purposes only. Past performance does not guarantee future results. Please gamble responsibly.</p>
-<p style="font-size:10px;line-height:1.7;color:#6c83a3;margin:6px 0 0;"><a href="${SITE_URL.replace('www.','')}/responsible-gambling.html" style="color:#6c83a3;text-decoration:underline;">Responsible Gambling</a> · <a href="https://www.begambleaware.org" style="color:#6c83a3;text-decoration:underline;">BeGambleAware.org</a> · National Gambling Helpline 0808 8020 133</p>
+<p style="font-size:10px;line-height:1.7;color:#6c83a3;margin:6px 0 0;"><a href="${SITE_URL}/responsible-gambling.html" style="color:#6c83a3;text-decoration:underline;">Responsible Gambling</a> · <a href="https://www.begambleaware.org" style="color:#6c83a3;text-decoration:underline;">BeGambleAware.org</a> · National Gambling Helpline 0808 8020 133</p>
 </td></tr>
 </table>
 </td></tr>
@@ -4331,8 +4368,8 @@ async function createCheckoutSession(userId, email, priceId, plan) {
   return stripeRequest('/checkout/sessions', 'POST', {
     'mode': 'subscription', 'customer_email': email,
     'line_items[0][price]': priceId, 'line_items[0][quantity]': '1',
-    'success_url': 'https://thetipsteredge.com/account.html?upgraded=1',
-    'cancel_url': 'https://thetipsteredge.com/#pricing',
+    'success_url': `${SITE_URL}/account.html?upgraded=1`,
+    'cancel_url': `${SITE_URL}/#pricing`,
     'metadata[user_id]': userId, 'metadata[plan]': plan,
     'subscription_data[metadata][user_id]': userId,
     'allow_promotion_codes': 'true', 'billing_address_collection': 'auto',
@@ -5287,7 +5324,7 @@ const server = http.createServer((req, res) => { (async () => {
         const { data: user } = await supabase.from('users').select('stripe_customer_id').eq('id', caller.id).single();
         if (!user?.stripe_customer_id) { res.writeHead(404, { ...cors, 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'No billing account' })); return; }
 
-        const session = await stripeRequest('/billing_portal/sessions', 'POST', { customer: user.stripe_customer_id, return_url: 'https://thetipsteredge.com/account.html' });
+        const session = await stripeRequest('/billing_portal/sessions', 'POST', { customer: user.stripe_customer_id, return_url: `${SITE_URL}/account.html` });
         if (!session) { res.writeHead(502, { ...cors, 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'Failed' })); return; }
         res.writeHead(200, { ...cors, 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ url: session.url }));
@@ -5371,6 +5408,9 @@ process.on('uncaughtException', (err) => {
   console.log(`   Season: ${currentSeason()}/${currentSeason()+1}`);
   console.log(`   Data source: Sofascore (RapidAPI Pro)`);
   console.log(`   Schedule: Morning fetch 06:00 | Midday refresh 13:00 | Tips every 15min`);
+
+  // Not awaited: it reports on the frontend, and startup does not depend on it.
+  checkUnsubscribeLink().catch(e => console.error('Unsubscribe link check error:', e && e.message));
 
   // Every async call below is guarded. A rejection from any of them would
   // otherwise be unhandled, and Node terminates the process on those — one
