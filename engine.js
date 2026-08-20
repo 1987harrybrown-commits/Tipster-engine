@@ -4432,8 +4432,52 @@ async function generateDailyAcca() {
 // ADMIN JOB QUEUE
 // ═══════════════════════════════════════════════════════════════
 
+// How long a claimed job may stay claimed before it is offered again.
+//
+// A job is marked 'processing' before the work starts. If the process goes away
+// mid-dispatch — which it does on every deploy, since shutdown() deliberately
+// does not wait for an in-flight dispatch — the row stays 'processing' and is
+// never picked up again. The admin pressed the button, saw "queued", and
+// nothing was ever sent.
+//
+// Reclaiming is safe because dispatchToSubscribers resumes per recipient:
+// anyone already logged 'sent' today is skipped, so a second attempt finishes
+// the list rather than mailing it twice. That also makes an early reclaim
+// harmless, which matters because the age is measured from created_at — there
+// is no claimed_at column to measure from, and adding one is a migration.
+const ADMIN_JOB_STALE_MS = 15 * 60 * 1000;
+
+// What a finished dispatch means for the job that asked for it.
+//
+// Every send job used to be marked 'done' whatever came back, including
+// { skipped: 'no bet of the day' } and { sent: 0, failed: 40 }. The comment
+// beside it said that recording the real outcome mattered, and then the line
+// below it wrote 'done'. This is that comment, implemented.
+function jobStatusFor(result) {
+  if (!result || typeof result !== 'object') return 'failed';
+  if (result.aborted) return 'failed';
+  const sent = Number(result.sent) || 0;
+  const failed = Number(result.failed) || 0;
+  if (result.skipped && !sent && !failed) return 'skipped';
+  if (sent && failed) return 'partial';
+  if (sent) return 'done';
+  if (failed) return 'failed';
+  // Nothing sent, nothing failed, nothing skipped: the audience was empty.
+  return 'no_recipients';
+}
+
 async function processAdminJobs() {
   try {
+    // Offer stranded jobs again before looking for new ones.
+    const staleBefore = new Date(Date.now() - ADMIN_JOB_STALE_MS).toISOString();
+    const { data: reclaimed, error: reclaimErr } = await supabase.from('admin_jobs')
+      .update({ status: 'pending' })
+      .eq('status', 'processing').lt('created_at', staleBefore).select('id');
+    if (reclaimErr) console.error('Stale job reclaim failed:', reclaimErr.message);
+    else if (reclaimed && reclaimed.length) {
+      console.log(`♻️ Reclaimed ${reclaimed.length} job(s) left 'processing' — retrying`);
+    }
+
     // The error was discarded, so a failed read looked identical to an empty
     // queue and admin actions would silently never run.
     const { data: jobs, error: jobsErr } = await supabase.from('admin_jobs')
@@ -4458,9 +4502,9 @@ async function processAdminJobs() {
         // force: a person pressed the button. Recording the result matters —
         // marking the job 'done' when the dispatch skipped or reached nobody
         // tells the admin it worked.
-        else if (job.job_type === 'send_daily')    { const r = await sendDailyEmails({ force: true });    await supabase.from('admin_jobs').update({ status: 'done', result: JSON.stringify(r || {}) }).eq('id', job.id); }
-        else if (job.job_type === 'send_saturday') { const r = await sendSaturdayEmails({ force: true }); await supabase.from('admin_jobs').update({ status: 'done', result: JSON.stringify(r || {}) }).eq('id', job.id); }
-        else if (job.job_type === 'send_pro')      { const r = await sendProEmails({ force: true });      await supabase.from('admin_jobs').update({ status: 'done', result: JSON.stringify(r || {}) }).eq('id', job.id); }
+        else if (job.job_type === 'send_daily')    { const r = await sendDailyEmails({ force: true });    await supabase.from('admin_jobs').update({ status: jobStatusFor(r), result: JSON.stringify(r || {}) }).eq('id', job.id); }
+        else if (job.job_type === 'send_saturday') { const r = await sendSaturdayEmails({ force: true }); await supabase.from('admin_jobs').update({ status: jobStatusFor(r), result: JSON.stringify(r || {}) }).eq('id', job.id); }
+        else if (job.job_type === 'send_pro')      { const r = await sendProEmails({ force: true });      await supabase.from('admin_jobs').update({ status: jobStatusFor(r), result: JSON.stringify(r || {}) }).eq('id', job.id); }
         else { await supabase.from('admin_jobs').update({ status: 'unknown_type' }).eq('id', job.id); }
       } catch(e) { await supabase.from('admin_jobs').update({ status: 'failed', result: e.message }).eq('id', job.id); }
     }
