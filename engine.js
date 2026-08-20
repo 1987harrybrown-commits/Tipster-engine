@@ -4177,6 +4177,18 @@ async function getTodaysTips(limit = 15) {
   // A missing stake counts as staked (defaulting to 1), matching how stakes are
   // read everywhere else; only an explicit 0 is treated as informational.
   const staked = (data || []).filter(t => parseFloat(t.stake ?? 1) > 0);
+
+  // A card longer than the limit is silently cut here, and every caller builds
+  // an email that presents what it got as the day's card. getBetOfTheDay asks
+  // for one on purpose, so only a real card-sized limit is worth reporting.
+  //
+  // Measured against the real table on 20 August 2026: 32 days of tips, a mean
+  // of 3.4 bets a day and a maximum of 14. The Pro cap was 15, so it had never
+  // bitten — and was one busy Saturday from doing so without a word.
+  if (limit > 1 && staked.length > limit) {
+    console.warn(`⚠️ ${staked.length} bets today but only ${limit} will be sent — `
+      + `${staked.length - limit} dropped from the card`);
+  }
   return staked.slice(0, limit);
 }
 
@@ -4240,9 +4252,13 @@ async function getSaturdayAcca() {
 // always forces: that is a person deciding to send, usually because the first
 // attempt went wrong, and silently doing nothing while reporting success is
 // worse than a duplicate they asked for.
+// How many tips the Pro card carries. Comfortably above the busiest day this
+// engine has produced (14), so the warning in getTodaysTips stays a warning.
+const PRO_CARD_MAX_TIPS = 25;
+
 async function sendProEmails({ force = false } = {}) {
   console.log('📧 Pro dispatch 07:00...');
-  const tips = await getTodaysTips(15);
+  const tips = await getTodaysTips(PRO_CARD_MAX_TIPS);
   if (!tips.length) return { skipped: 'no tips to send' };
   const subs = await getSubscribers('daily', 'pro');
   return await dispatchToSubscribers('Pro', subs, (u) => ({
