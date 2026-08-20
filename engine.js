@@ -2051,6 +2051,27 @@ function pickBestCandidate(candidates) {
   return best;
 }
 
+// Refuse a candidate on the shape of the match rather than on its price.
+//
+// Worth writing down which of these can fire, because four conditions read as
+// four filters and two of them are already guaranteed by the callers:
+//
+//   hasCoreData        football returns null earlier when stats are missing,
+//                      and the other two call sites pass a literal true.
+//                      Never false at any caller.
+//   hasCompleteMarket  every caller has already returned on a null market.
+//                      Never false either.
+//   topOutcomeProb     live for football, where three outcomes share the
+//                      probability and the best can sit below 0.42. Dead for
+//                      the two-way sports: their probabilities sum to exactly
+//                      one, so the larger is never below 0.50.
+//   probGap            live everywhere. For a two-way sport it is the only
+//                      condition that can fire, and it rejects a match the
+//                      model calls within five points of even.
+//
+// So: a coin-flip filter for the NHL and NBA, and coin-flip plus
+// no-clear-favourite for football. Leaving the redundant conditions is fine;
+// believing all four do something is not.
 function vetoCandidate({ sport, hasCoreData, hasCompleteMarket, homeWinProb, drawProb = 0, awayWinProb }) {
   const minTopOutcomeProb = sport === 'Football' ? 0.42 : 0.50;
   let topOutcomeProb, probGap;
@@ -2513,11 +2534,34 @@ async function analyseNBAFixture(event, sport) {
     }
 
     if (!candidates.length) return null;
-    const pick = candidates.reduce((a, b) => {
-      const scoreA = a.edge * 0.7 + (a.qualityScore || 0) * 0.3;
-      const scoreB = b.edge * 0.7 + (b.qualityScore || 0) * 0.3;
-      return scoreA >= scoreB ? a : b;
-    });
+
+    // Football and the NHL both run their candidates through vetoCandidate and
+    // then pickBestCandidate. This path did neither, with nothing saying why,
+    // and had its own selection instead:
+    //
+    //     a.edge * 0.7 + (a.qualityScore || 0) * 0.3
+    //
+    // That shape reads as a 70/30 blend and is not one. edge is in percentage
+    // points, running about 8 to 20; qualityScore is a fraction between 0.15
+    // and 1. So the quality term contributes between 1% and 2% of the total,
+    // not 30% — two orders of magnitude adrift because the two quantities were
+    // never put on the same scale. pickBestCandidate normalises the edge before
+    // weighting it, which is the difference.
+    //
+    // That fault is latent rather than live: home and away probabilities sum to
+    // one and both are gated on conf >= 52, so at most one NBA candidate ever
+    // survives and the ranking has never had two things to compare. It would
+    // become live the moment a totals market is added here, as the NHL has.
+    //
+    // The veto is live now. Of two-way candidates clearing the confidence gate
+    // it rejects 2.1% — the band the model rates between 51.5% and 52.5%, which
+    // is a coin flip it happens to call marginally one way.
+    const vetoed = candidates.filter(c => !vetoCandidate({
+      sport: 'Basketball', hasCoreData: true, hasCompleteMarket: !!market,
+      homeWinProb: homeWinP, awayWinProb: awayWinP,
+    }));
+    const pick = pickBestCandidate(vetoed);
+    if (!pick) return null;
 
     return {
       tip_ref:       generateTipRef('Basketball'),
