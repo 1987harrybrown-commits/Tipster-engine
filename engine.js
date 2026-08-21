@@ -1256,6 +1256,7 @@ async function middayOddsRefresh() {
 // ═══════════════════════════════════════════════════════════════
 
 const nhlTeamCache = {};
+let nhlTeamCacheDate = '';
 let nhlAllTeamsCache = null;
 let nhlAllTeamsCacheDate = '';
 
@@ -1482,6 +1483,18 @@ async function fetchNHLAllTeams() {
 }
 
 async function fetchNHLTeamStats(teamName) {
+  // fetchNHLAllTeams below refreshes daily, so this cache in front of it has
+  // to expire with it. Keyed by season alone it froze a team's scoring rates
+  // at whatever they were the first time that team appeared on a card — five
+  // games in, at their noisiest — and served those for the rest of the season,
+  // because the fresh all-teams data is never consulted for a team already
+  // cached. Everything downstream is built from these two numbers: expected
+  // margin, win probability, confidence, edge, stake.
+  const today = ukDateString();
+  if (nhlTeamCacheDate !== today) {
+    for (const k of Object.keys(nhlTeamCache)) delete nhlTeamCache[k];
+    nhlTeamCacheDate = today;
+  }
   const cacheKey = `${teamName}_${currentSeason()}`;
   if (nhlTeamCache[cacheKey]) return nhlTeamCache[cacheKey];
   const allTeams = await fetchNHLAllTeams();
@@ -1508,6 +1521,7 @@ async function fetchNHLTeamStats(teamName) {
 // ═══════════════════════════════════════════════════════════════
 
 const nbaTeamCache = {};
+let nbaTeamCacheDate = '';
 let nbaAllTeamsCache = null;
 let nbaAllTeamsCacheDate = '';
 
@@ -1642,6 +1656,15 @@ async function fetchNBAAllTeamStats() {
 }
 
 async function fetchNBATeamStats(teamName) {
+  // Same daily expiry as the NHL side, and the same reason. This one also
+  // fronts the opening-fortnight fallback to last season's rates: without an
+  // expiry, a team first requested before the new season had numbers kept
+  // last season's all the way through this one.
+  const today = ukDateString();
+  if (nbaTeamCacheDate !== today) {
+    for (const k of Object.keys(nbaTeamCache)) delete nbaTeamCache[k];
+    nbaTeamCacheDate = today;
+  }
   const cacheKey = `${teamName}_${currentSeason()}`;
   if (nbaTeamCache[cacheKey]) return nbaTeamCache[cacheKey];
 
