@@ -3139,6 +3139,9 @@ async function recomputeRunningPL() {
 // renumber with a concurrent append — corrupting the column the renumber exists
 // to repair.
 let settleInFlight = false;
+// Whether this process has verified the cumulative column yet. See the
+// block at the end of settleResultsInner.
+let runningPLVerified = false;
 
 async function settleResults() {
   if (settleInFlight) {
@@ -3206,7 +3209,18 @@ async function settleResultsInner() {
 
   // Same shape on every return path — the caller logs these counts, and
   // `ok: !!result` on /admin/resettle read a bare return as a failure.
-  if (!pending.length && !missing.length) { console.log('🏁 Nothing to settle.'); return { settled: 0, backfilled: 0 }; }
+  if (!pending.length && !missing.length) {
+    console.log('🏁 Nothing to settle.');
+    // Still worth one pass at the cumulative column if this process has not
+    // checked it yet — a ledger that is already wrong will never settle
+    // anything to trigger the repair below.
+    if (!runningPLVerified) {
+      runningPLVerified = true;
+      try { await recomputeRunningPL(); }
+      catch (e) { console.error('running_pl verify failed:', e.message); }
+    }
+    return { settled: 0, backfilled: 0 };
+  }
 
   const { data: lastRow } = await supabase.from('results_history').select('running_pl').order('settled_at', { ascending: false }).limit(1).maybeSingle();
   let currentRunningPL = parseFloat(lastRow?.running_pl || 0);
@@ -3654,6 +3668,28 @@ async function settleResultsInner() {
       console.log(`📋 Acca ${acca.date} settled: ${result} (${pl >= 0 ? '+' : ''}${pl}u)`);
     }
   } catch(e) { console.error('Acca settlement error:', e.message); }
+
+  // Verify the cumulative column rather than trusting it.
+  //
+  // currentRunningPL is seeded from the newest row's running_pl, so every
+  // append is only as correct as that one value. Measured against the live
+  // ledger: 135 of its 136 rows disagree with an accumulation of their own
+  // profit_loss column, and the chain ends 2.42u short of the true total.
+  // index.html draws its cumulative chart straight from running_pl, so the
+  // published curve is wrong by that much — and because the next append
+  // continues from the stale head row, the error is permanent.
+  //
+  // The repair already existed and was correct. It only ran after a
+  // BACKFILL, which is the one case that inserts into the middle of the
+  // ledger — so nothing ever fixed damage that was already there. It runs
+  // whenever the ledger changed now, and once per process regardless.
+  // Against a correct chain it reads the table and writes nothing.
+  if (count || backfilled || !runningPLVerified) {
+    runningPLVerified = true;
+    // recomputeRunningPL logs its own count when it rewrites anything.
+    try { await recomputeRunningPL(); }
+    catch (e) { console.error('running_pl renumber failed:', e.message); }
+  }
 
   console.log(`🏁 Settled ${count} tips${backfilled ? `, backfilled ${backfilled}` : ''}.`);
   return { settled: count, backfilled };
