@@ -598,12 +598,6 @@ async function fetchTournamentStandings(tournamentId, seasonId) {
 }
 
 // Fetch recent team matches for form
-async function fetchTeamRecentMatches(teamId) {
-  await new Promise(r => setTimeout(r, 250));
-  const data = await sofascoreFetch(`/teams/get-last-matches`, { id: teamId, page: 0 });
-  return data?.events || [];
-}
-
 // ─── PARSE SOFASCORE ODDS INTO ENGINE FORMAT ──────────────────
 // Football: "Full time" 1X2 market, choices "1"/"X"/"2"
 // NBA/NHL:  "Full time"/"Home/Away" 2-way market, choices "1"/"2"
