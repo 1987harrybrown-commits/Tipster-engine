@@ -4785,21 +4785,55 @@ function mapSubStatus(stripeStatus) {
 //
 // A match on a fallback key also writes the customer id, so the row heals and
 // the next event for that customer matches on the first key.
-async function updateStripeUser(keys, patch, label) {
+// Matchers are tried in order and the first that hits any row wins, so the
+// order is the semantics. A third element narrows that matcher's query —
+// used to stop a broad customer-wide match from applying an event that
+// belongs to a subscription the customer no longer holds.
+//
+// eventAt is the Stripe timestamp of the event being applied. Stripe
+// guarantees delivery, not order, and retries a failed event for days, so an
+// event can arrive carrying state that something later has already replaced.
+// Every write therefore refuses a row that a newer event has touched, and
+// stamps the row with its own time when it succeeds.
+async function updateStripeUser(keys, patch, label, eventAt) {
   const tried = [];
-  for (const [col, val] of keys) {
+  // lte, not lt. Stripe stamps in whole seconds and sibling events for one
+  // subscription routinely share a second; strict `lt` would let whichever
+  // arrived first block the rest. What this has to refuse is an event from
+  // strictly earlier than the state the row already carries — a retry from
+  // days ago. A true replay of the same event re-applies, which is harmless:
+  // the writes are idempotent and the welcome email is separately deduped.
+  const fresh = eventAt ? (q) => q.or(`stripe_event_at.is.null,stripe_event_at.lte.${eventAt}`) : null;
+  const body  = eventAt ? { ...patch, stripe_event_at: eventAt } : patch;
+  for (const [col, val, refine] of keys) {
     if (!val) continue;
-    tried.push(`${col}=${val}`);
-    const { data, error } = await supabase.from('users').update(patch).eq(col, val).select('id');
+    tried.push(`${col}=${val}` + (refine ? ' (narrowed)' : ''));
+    let q = supabase.from('users').update(body).eq(col, val);
+    if (refine) q = refine(q);
+    if (fresh)  q = fresh(q);
+    const { data, error } = await q.select('id');
     if (error) { console.error(`Stripe ${label} update failed (${col}):`, error.message); return false; }
     if (data && data.length) {
-      if (col !== 'stripe_customer_id') {
-        console.log(`Stripe ${label}: matched on ${col} — checkout.session.completed had not landed yet`);
-      }
+      console.log(`Stripe ${label}: matched on ${col}`);
       return true;
     }
   }
   if (!tried.length) { console.error(`Stripe ${label}: event carried nothing to identify a user by`); return false; }
+  // Nothing moved. Either there is no such user, or there is one and a newer
+  // event already spoke for it — worth telling apart, because the first is a
+  // problem and the second is the guard doing its job.
+  if (eventAt) {
+    for (const [col, val] of keys) {
+      if (!val) continue;
+      const { data } = await supabase.from('users').select('id, stripe_event_at').eq(col, val);
+      const newer = (data || []).find(r => r.stripe_event_at && r.stripe_event_at > eventAt);
+      if (newer) {
+        console.log(`Stripe ${label}: ignored — event is from ${eventAt}, the row was `
+          + `last set by one from ${newer.stripe_event_at}`);
+        return true;
+      }
+    }
+  }
   // Retrying will not conjure a row, so report success and let the warning
   // stand rather than making Stripe redeliver for days.
   console.warn(`⚠️ Stripe ${label}: no user matched ${tried.join(' or ')} — not applied`);
@@ -4811,6 +4845,10 @@ async function updateStripeUser(keys, patch, label) {
 // the only safety net for a database that was briefly unavailable.
 async function handleStripeWebhook(event) {
   console.log('Stripe:', event.type);
+  // Stripe stamps every event with the second it was created. That, not the
+  // order it happens to be delivered in, is what says which of two events
+  // describes the later state.
+  const eventAt = event.created ? new Date(event.created * 1000).toISOString() : null;
   switch(event.type) {
     case 'checkout.session.completed': {
       const s = event.data.object;
@@ -4840,6 +4878,9 @@ async function handleStripeWebhook(event) {
         // these two columns, so leaving them null here means it finds nobody —
         // and the customer pays and is never upgraded, which is the outcome
         // this guard exists to prevent.
+        // Ids only, no subscription_status — so this deliberately carries no
+        // recency stamp either. It records who the customer is without
+        // claiming anything about their access.
         const { error: idErr } = await supabase.from('users')
           .update({ stripe_customer_id: s.customer, stripe_subscription_id: s.subscription })
           .eq('id', uid).select('id');
@@ -4865,11 +4906,31 @@ async function handleStripeWebhook(event) {
       // Its result used to be discarded, and because the route answered 200
       // before running any of this, a failure here meant Stripe never retried
       // and the customer was silently never upgraded.
-      const { data: upgraded, error } = await supabase.from('users')
-        .update({ subscription_status:'pro', stripe_customer_id: s.customer, stripe_subscription_id: s.subscription })
-        .eq('id', uid).select('id');
+      // This one writes directly rather than through updateStripeUser, so it
+      // carries the same recency guard by hand. A redelivered upgrade must not
+      // undo a cancellation that happened in between.
+      let up = supabase.from('users')
+        .update({ subscription_status:'pro', stripe_customer_id: s.customer,
+                  stripe_subscription_id: s.subscription,
+                  ...(eventAt ? { stripe_event_at: eventAt } : {}) })
+        .eq('id', uid);
+      if (eventAt) up = up.or(`stripe_event_at.is.null,stripe_event_at.lte.${eventAt}`);
+      const { data: upgraded, error } = await up.select('id');
       if (error) { console.error('Stripe checkout.completed upgrade failed:', error.message); return false; }
-      if (!upgraded || !upgraded.length) { console.error(`Stripe checkout.completed: no user row for ${uid} — payment taken, account NOT upgraded`); return false; }
+      if (!upgraded || !upgraded.length) {
+        // No row moved. Distinguish a superseded replay from a missing user:
+        // the first is fine and must answer 2xx, the second is money taken for
+        // nothing and has to be retried and shouted about.
+        const { data: who } = await supabase.from('users')
+          .select('id, stripe_event_at').eq('id', uid).maybeSingle();
+        if (who && eventAt && who.stripe_event_at && who.stripe_event_at > eventAt) {
+          console.log(`Stripe checkout.completed: ${uid} already carries a newer event `
+            + `(${who.stripe_event_at}) — replay ignored`);
+          break;
+        }
+        console.error(`Stripe checkout.completed: no user row for ${uid} — payment taken, account NOT upgraded`);
+        return false;
+      }
 
       // Only greet someone who was not already Pro. A redelivered event now
       // upgrades again harmlessly and stays quiet, instead of sending a second
@@ -4896,30 +4957,49 @@ async function handleStripeWebhook(event) {
       // so access correctly continues until subscription.deleted arrives.
       const patch = { subscription_status: mapped };
       if (sub.customer) patch.stripe_customer_id = sub.customer;
+      // Heal the row while passing: an event that arrives before
+      // checkout.session.completed leaves the subscription id unset, and until
+      // it is set every later event has to fall back to matching the customer.
       if (mapped === 'free') patch.stripe_subscription_id = null;
+      else if (sub.id)      patch.stripe_subscription_id = sub.id;
+      // The subscription this event is about, before the customer who owns it:
+      // a customer can hold a newer subscription than the one that fired, and a
+      // redelivery days later must not be applied to it. The broader matchers
+      // stay for the window before checkout.session.completed has recorded an
+      // id at all, and are narrowed to exactly that window.
       if (!await updateStripeUser(
-            [['stripe_customer_id', sub.customer], ['id', sub.metadata?.user_id]],
-            patch, `subscription.updated(${sub.status})`)) return false;
+            [['stripe_subscription_id', sub.id],
+             ['stripe_customer_id', sub.customer, q => q.is('stripe_subscription_id', null)],
+             ['id', sub.metadata?.user_id, q => q.is('stripe_subscription_id', null)]],
+            patch, `subscription.updated(${sub.status})`, eventAt)) return false;
       break;
     }
     case 'customer.subscription.deleted': {
       const sub = event.data.object;
+      // This one had the exact matcher listed last, which meant it was never
+      // reached: the customer-wide match above it always hit first. A
+      // redelivered deletion for a cancelled subscription therefore downgraded
+      // whatever subscription the customer holds now — and nulled the id, so
+      // the live subscription's own invoices could no longer be matched either.
       if (!await updateStripeUser(
-            [['stripe_customer_id', sub.customer], ['id', sub.metadata?.user_id],
-             ['stripe_subscription_id', sub.id]],
+            [['stripe_subscription_id', sub.id],
+             ['stripe_customer_id', sub.customer, q => q.is('stripe_subscription_id', null)],
+             ['id', sub.metadata?.user_id, q => q.is('stripe_subscription_id', null)]],
             { subscription_status:'free', stripe_subscription_id: null },
-            'subscription.deleted')) return false;
+            'subscription.deleted', eventAt)) return false;
       break;
     }
     case 'invoice.payment_failed': {
       const inv = event.data.object;
       const patch = { subscription_status:'past_due' };
-      if (inv.customer) patch.stripe_customer_id = inv.customer;
+      if (inv.customer)     patch.stripe_customer_id = inv.customer;
+      if (inv.subscription) patch.stripe_subscription_id = inv.subscription;
       // An invoice carries no subscription metadata of its own, but it does
       // name the subscription, and that id is stored at checkout.
       if (!await updateStripeUser(
-            [['stripe_customer_id', inv.customer], ['stripe_subscription_id', inv.subscription]],
-            patch, 'payment_failed')) return false;
+            [['stripe_subscription_id', inv.subscription],
+             ['stripe_customer_id', inv.customer, q => q.is('stripe_subscription_id', null)]],
+            patch, 'payment_failed', eventAt)) return false;
       break;
     }
     case 'invoice.payment_succeeded': {
@@ -4933,10 +5013,16 @@ async function handleStripeWebhook(event) {
       if (inv.billing_reason !== 'subscription_cycle'
           && inv.billing_reason !== 'subscription_create') break;
       const patch = { subscription_status:'pro' };
-      if (inv.customer) patch.stripe_customer_id = inv.customer;
+      if (inv.customer)     patch.stripe_customer_id = inv.customer;
+      if (inv.subscription) patch.stripe_subscription_id = inv.subscription;
+      // Same ordering as the rest: the subscription the invoice names, then the
+      // customer only while no subscription id has been recorded. Under a
+      // delayed payment method checkout.session.completed has already stored
+      // the id, so the exact match is the one that fires.
       if (!await updateStripeUser(
-            [['stripe_customer_id', inv.customer], ['stripe_subscription_id', inv.subscription]],
-            patch, `payment_succeeded(${inv.billing_reason})`)) return false;
+            [['stripe_subscription_id', inv.subscription],
+             ['stripe_customer_id', inv.customer, q => q.is('stripe_subscription_id', null)]],
+            patch, `payment_succeeded(${inv.billing_reason})`, eventAt)) return false;
       break;
     }
   }
