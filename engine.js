@@ -4625,10 +4625,24 @@ function jobStatusFor(result) {
 async function processAdminJobs() {
   try {
     // Offer stranded jobs again before looking for new ones.
+    //
+    // Measured from when the job was CLAIMED, not when it was queued. Keyed
+    // on created_at, a job that had waited out the stale window in the queue
+    // — which is what happens when the engine is restarting, the same event
+    // that strands jobs in the first place — was reclaimed on the next tick,
+    // thirty seconds after being picked up and while it was still running.
+    // The next tick then claimed it again, and since the manual sends run
+    // with force, which skips the already-sent check, the second run emails
+    // the whole list a second time.
+    //
+    // Rows claimed before the column existed have no claimed_at, so those
+    // still fall back to created_at and stay recoverable.
     const staleBefore = new Date(Date.now() - ADMIN_JOB_STALE_MS).toISOString();
     const { data: reclaimed, error: reclaimErr } = await supabase.from('admin_jobs')
-      .update({ status: 'pending' })
-      .eq('status', 'processing').lt('created_at', staleBefore).select('id');
+      .update({ status: 'pending', claimed_at: null })
+      .eq('status', 'processing')
+      .or(`claimed_at.lt.${staleBefore},and(claimed_at.is.null,created_at.lt.${staleBefore})`)
+      .select('id');
     if (reclaimErr) console.error('Stale job reclaim failed:', reclaimErr.message);
     else if (reclaimed && reclaimed.length) {
       console.log(`♻️ Reclaimed ${reclaimed.length} job(s) left 'processing' — retrying`);
@@ -4649,7 +4663,8 @@ async function processAdminJobs() {
       // second dispatch to the entire list. The eq('status','pending') makes
       // the claim atomic, so two overlapping ticks cannot both take it.
       const { data: claimed, error: claimErr } = await supabase.from('admin_jobs')
-        .update({ status: 'processing' }).eq('id', job.id).eq('status', 'pending').select('id');
+        .update({ status: 'processing', claimed_at: new Date().toISOString() })
+        .eq('id', job.id).eq('status', 'pending').select('id');
       if (claimErr) { console.error(`Job ${job.id}: could not claim — ${claimErr.message}`); continue; }
       if (!claimed || !claimed.length) { console.log(`Job ${job.id}: already claimed elsewhere — skipping`); continue; }
       try {
