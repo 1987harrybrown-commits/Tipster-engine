@@ -3146,7 +3146,23 @@ async function settleResultsInner() {
   const rhRows    = await selectAll('results_history', 'tip_ref');
   const inHistory = new Set(rhRows.map(r => r.tip_ref));
 
-  const alreadyGraded = await selectAll('tips', '*',
+  // Every graded tip ever, on every settle — hourly, and on every boot. It is
+  // used for exactly two repairs: giving a tip_ref to a graded tip that lacks
+  // one, and finding graded tips missing from the ledger. Both are one-off, so
+  // once the ledger is complete this read finds nothing and costs the same.
+  //
+  // Measured against the live table on 21 August 2026: 136 rows, 105 KB, of
+  // which 0 were missing from the ledger. Most of that is `notes`, the model
+  // diagnostics string nothing reads.
+  //
+  // Naming the columns the repairs actually use halves it today and keeps it
+  // proportional as the table grows. Deliberately not narrowed by date: this is
+  // also what /admin/resettle runs, and bounding it would quietly take away the
+  // operator's way of repairing anything older than the window.
+  const BACKFILL_COLUMNS = 'id, tip_ref, sport, home_team, away_team, selection, '
+    + 'odds, advised_odds, stake, tier, status, confidence, event_time, '
+    + 'result_updated_at, profit_loss';
+  const alreadyGraded = await selectAll('tips', BACKFILL_COLUMNS,
     q => q.in('status', ['won', 'lost']).lt('event_time', nowIso));
 
   // Assign a tip_ref to ANY tip lacking one — graded tips included. tip_ref is
