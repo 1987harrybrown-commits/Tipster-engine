@@ -3181,7 +3181,7 @@ async function settleResultsInner() {
   // operator's way of repairing anything older than the window.
   const BACKFILL_COLUMNS = 'id, tip_ref, sport, home_team, away_team, selection, '
     + 'odds, advised_odds, stake, tier, status, confidence, event_time, '
-    + 'result_updated_at, profit_loss';
+    + 'result_updated_at, profit_loss, is_free';
   const alreadyGraded = await selectAll('tips', BACKFILL_COLUMNS,
     q => q.in('status', ['won', 'lost']).lt('event_time', nowIso));
 
@@ -3289,6 +3289,9 @@ async function settleResultsInner() {
           running_pl:  currentRunningPL,
           settled_at:  tip.result_updated_at || tip.event_time || nowIso,
           confidence:  tip.confidence || 0,
+          // tier is only ever 'pro' or 'insight'; which tips were FREE is
+          // carried by is_free, and the ledger used to lose it at settle.
+          is_free:     tip.is_free === true,
         });
         if (insErr) {
           // Unique violation = another cycle got there first; roll back our tally.
@@ -3586,6 +3589,7 @@ async function settleResultsInner() {
         running_pl:  currentRunningPL,
         settled_at:  new Date().toISOString(),
         confidence: tip.confidence || 0,
+        is_free:    tip.is_free === true,
       });
 
       // currentRunningPL was advanced above on the assumption this insert would
