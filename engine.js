@@ -2243,6 +2243,20 @@ function confidenceFromSignals({ modelProb, dataQualityTier, sport, gamesPlayed 
 // on the same field.
 const UNKNOWN_QUALITY_TIER = 0.85;
 
+// What the NBA model claims to know. It is the only sport whose tier is
+// asserted rather than derived: football builds one from form, rest and
+// lineups, NHL from whether the goalie is confirmed, and this one is stated.
+//
+// Defensible on its own terms — the NBA model has two inputs, season points for
+// and against, and both are present or the fixture is skipped. Less so across
+// sports, because quality_score picks the daily best bet and the accumulator
+// legs from every sport at once, so a claim of 1.0 outranks a football tip that
+// has form and rest and lineups and lost one of them.
+//
+// Left at 1.0 deliberately; lowering it takes three points off every NBA
+// confidence and some would fall under NBA_MIN_CONFIDENCE. See decision 7e.
+const NBA_DATA_QUALITY_TIER = 1.0;
+
 function scoreCandidate({ edgePct, modelProb, dataQualityTier }) {
   const edgeScore    = Math.min(1, Math.max(0, edgePct) / 20);
   const probStrength = Math.min(1, Math.abs(modelProb - 0.5) / 0.5);
@@ -2726,12 +2740,12 @@ async function analyseNBAFixture(event, sport) {
 
     if (market.homeOdds >= INSIGHT_ODDS_MIN && market.homeOdds <= ODDS_ELITE_MAX && market.trueHome > 0) {
       const edge = calcEdge(homeWinP, market.trueHome);
-      const conf  = confidenceFromSignals({ modelProb: homeWinP, dataQualityTier: 1.0, sport: 'Basketball', gamesPlayed: homeStats.gamesPlayed });
+      const conf  = confidenceFromSignals({ modelProb: homeWinP, dataQualityTier: NBA_DATA_QUALITY_TIER, sport: 'Basketball', gamesPlayed: homeStats.gamesPlayed });
       const fec   = falseEdgeCheck({ edge, modelProb: homeWinP, trueImplied: market.trueHome }, market);
       const stake = kellyStake(homeWinP, market.homeOdds);
-      const qs    = scoreCandidate({ edgePct: edge, modelProb: homeWinP, dataQualityTier: 1.0 });
+      const qs    = scoreCandidate({ edgePct: edge, modelProb: homeWinP, dataQualityTier: NBA_DATA_QUALITY_TIER });
       const c = { selection: `${event.home_team} Win`, market: 'home', edge,
-        modelProb: homeWinP, trueImplied: market.trueHome, dataQualityTier: 1.0,
+        modelProb: homeWinP, trueImplied: market.trueHome, dataQualityTier: NBA_DATA_QUALITY_TIER,
         fairPrice: fairOdds(homeWinP), bookOdds: market.homeOdds, bookmaker: market.homeBook,
         stake, conf, qualityScore: qs,
         notes: `Expected: ${homeExpected.toFixed(1)}-${awayExpected.toFixed(1)} | Model: ${(homeWinP*100).toFixed(1)}% | Fair: ${fairOdds(homeWinP)} | Edge: ${edge >= 0 ? '+' : ''}${edge.toFixed(1)}%` };
@@ -2740,12 +2754,12 @@ async function analyseNBAFixture(event, sport) {
 
     if (market.awayOdds >= INSIGHT_ODDS_MIN && market.awayOdds <= ODDS_ELITE_MAX && market.trueAway > 0) {
       const edge = calcEdge(awayWinP, market.trueAway);
-      const conf  = confidenceFromSignals({ modelProb: awayWinP, dataQualityTier: 1.0, sport: 'Basketball', gamesPlayed: awayStats.gamesPlayed });
+      const conf  = confidenceFromSignals({ modelProb: awayWinP, dataQualityTier: NBA_DATA_QUALITY_TIER, sport: 'Basketball', gamesPlayed: awayStats.gamesPlayed });
       const fec   = falseEdgeCheck({ edge, modelProb: awayWinP, trueImplied: market.trueAway }, market);
       const stake = kellyStake(awayWinP, market.awayOdds);
-      const qs    = scoreCandidate({ edgePct: edge, modelProb: awayWinP, dataQualityTier: 1.0 });
+      const qs    = scoreCandidate({ edgePct: edge, modelProb: awayWinP, dataQualityTier: NBA_DATA_QUALITY_TIER });
       const c = { selection: `${event.away_team} Win`, market: 'away', edge,
-        modelProb: awayWinP, trueImplied: market.trueAway, dataQualityTier: 1.0,
+        modelProb: awayWinP, trueImplied: market.trueAway, dataQualityTier: NBA_DATA_QUALITY_TIER,
         fairPrice: fairOdds(awayWinP), bookOdds: market.awayOdds, bookmaker: market.awayBook,
         stake, conf, qualityScore: qs,
         notes: `Expected: ${homeExpected.toFixed(1)}-${awayExpected.toFixed(1)} | Model: ${(awayWinP*100).toFixed(1)}% | Fair: ${fairOdds(awayWinP)} | Edge: ${edge >= 0 ? '+' : ''}${edge.toFixed(1)}%` };
