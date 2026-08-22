@@ -880,7 +880,14 @@ async function morningFetch() {
 // ─── MATCH CONTEXT CACHE ─────────────────────────────────────
 // These are keyed by event id and the process is long-lived, so without a cap
 // they only grow: one entry per fixture, for every fixture ever seen. Team
-// stats are keyed by team and are naturally bounded, so they are left alone.
+// stats are keyed by team and so are bounded by SIZE without any help here.
+//
+// Bounded is not the same as current, though, which is a separate problem with
+// its own fix at the morning refill: a team that leaves a tournament keeps its
+// entry, because nothing writes over a key that is no longer produced, and the
+// fuzzy fallback in findStats walks insertion order — so a departed club is
+// reached before a current one. That is scrubbed per tournament where the
+// stats are written, not capped here.
 //
 // Oldest-first eviction on insertion order, which for these is arrival order —
 // good enough, since the entries that matter are always the recent ones.
