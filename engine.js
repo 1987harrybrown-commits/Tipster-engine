@@ -4258,6 +4258,57 @@ const ADVERTISED_PRICES = [
   ['monthly', () => STRIPE_PRICE_MONTHLY, 999,  'gbp', 'month', '£9.99/mo'],
   ['annual',  () => STRIPE_PRICE_ANNUAL,  9990, 'gbp', 'year',  '£99.90/yr'],
 ];
+// Can a subscriber actually cancel?
+//
+// terms.html says "You may cancel at any time via your account page", and the
+// account page opens a Stripe billing portal session with no `configuration`
+// argument — so it gets whatever the default portal configuration says. Whether
+// cancellation is enabled there is a dashboard setting, invisible from here and
+// invisible to the subscriber until they go looking for a button that is not
+// there.
+//
+// Same shape as the prices, and the same answer: the engine holds the secret
+// key, so it can ask. Reported rather than fatal — a Stripe outage at boot must
+// not stop the service, and "could not be checked" is not "is wrong".
+async function checkBillingPortal() {
+  if (!STRIPE_SECRET_KEY) { console.log('   Billing portal: not checked — no Stripe key'); return; }
+  const answer = await Promise.race([
+    stripeRequest('/billing_portal/configurations?is_default=true&limit=1'),
+    new Promise((r) => setTimeout(() => r(null), 8000)),
+  ]);
+  if (!answer || !Array.isArray(answer.data)) {
+    console.log('   Billing portal: not checked — Stripe did not answer');
+    return;
+  }
+  const config = answer.data[0];
+  if (!config) {
+    console.error('   🚨 BILLING PORTAL: no default configuration exists. Manage Billing '
+      + 'will fail for every subscriber, and terms.html says they can cancel there');
+    return;
+  }
+  const features = config.features || {};
+  const cancel = features.subscription_cancel || {};
+  if (cancel.enabled === false) {
+    console.error('   🚨 BILLING PORTAL: cancellation is switched OFF in the Stripe '
+      + 'dashboard. terms.html says "You may cancel at any time via your account '
+      + 'page" and a subscriber cannot');
+    return;
+  }
+  if (cancel.enabled !== true) {
+    console.log('   Billing portal: reachable, cancellation setting not reported by Stripe');
+    return;
+  }
+  // Immediately vs at period end. The terms say access continues to the end of
+  // the billing period, which is `at_period_end`.
+  const mode = cancel.mode;
+  if (mode && mode !== 'at_period_end') {
+    console.warn(`   ⚠️ Billing portal: cancellation is set to "${mode}", and terms.html `
+      + 'says access continues until the end of the billing period');
+    return;
+  }
+  console.log('   Billing portal: cancellation is on, at period end, as the terms say');
+}
+
 async function checkStripePrices() {
   if (!STRIPE_SECRET_KEY) { console.log('   Prices: not checked — no Stripe key'); return; }
   const look = async ([label, id, pence, currency, interval, shown]) => {
@@ -6422,6 +6473,7 @@ process.on('uncaughtException', (err) => {
   // Not awaited: these report on things outside this process, and startup does
   // not depend on either answer.
   checkStripePrices().catch(e => console.error('Stripe price check error:', e && e.message));
+  checkBillingPortal().catch(e => console.error('Billing portal check error:', e && e.message));
   checkUnsubscribeLink().catch(e => console.error('Unsubscribe link check error:', e && e.message));
 
   // Every async call below is guarded. A rejection from any of them would
