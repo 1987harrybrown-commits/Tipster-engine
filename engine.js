@@ -4109,6 +4109,54 @@ function verifyUnsubToken(token, uid) {
   return safeEqual(token, generateUnsubToken(uid));
 }
 
+// Every reply from /unsubscribe that a person can see, rendered the same way.
+//
+// Three of the four used to be bare words with no Content-Type -- 'Invalid',
+// 'Invalid token', 'Invalid token' -- which a browser shows as a word on a
+// white page with nothing to click. That is the wrong ending for this route in
+// particular: it exists to satisfy PECR's requirement of a working means of
+// refusing further messages, and someone who reaches a dead end while trying
+// to opt out has one option left, which is the spam button.
+//
+// A link that has stopped verifying is ordinary, not suspicious. Rotating
+// UNSUB_SECRET invalidates every link already sent; UNSUB_SECRET falls back to
+// STRIPE_WEBHOOK_SECRET, so rotating that does it too; and mail scanners
+// rewrite and truncate long query strings, which this URL is.
+function unsubPage(heading, bodyHtml) {
+  return '<!DOCTYPE html><html lang="en-GB"><head><meta charset="utf-8">'
+    + '<meta name="viewport" content="width=device-width, initial-scale=1.0">'
+    + '<meta name="robots" content="noindex">'
+    + '<title>' + esc(heading) + ' | The Tipster Edge</title></head>'
+    + '<body style="font-family:system-ui,-apple-system,sans-serif;text-align:center;'
+    + 'padding:60px 20px;background:#07090d;color:#dde6f0;">'
+    + '<h1 style="font-size:22px;font-weight:800;">' + esc(heading) + '</h1>'
+    + bodyHtml
+    + '</body></html>';
+}
+
+// The two ways out of a link that cannot be used. Both are offered because the
+// first needs a login the reader may not have to hand.
+const UNSUB_WAYS_OUT =
+  '<p style="color:#6c83a3;font-size:14px;max-width:440px;margin:0 auto 22px;line-height:1.7;">'
+  + 'You can turn tips emails off from your account, or ask us to do it.</p>'
+  + '<p style="margin:0 0 10px;"><a href="https://www.thetipsteredge.com/account.html" '
+  + 'style="background:#18e07a;color:#07090d;text-decoration:none;font-size:14px;'
+  + 'font-weight:700;padding:13px 28px;border-radius:5px;display:inline-block;">'
+  + 'Manage email preferences</a></p>'
+  + '<p style="color:#6c83a3;font-size:13px;">or email '
+  + '<a href="mailto:support@thetipsteredge.com" style="color:#18e07a;">'
+  + 'support@thetipsteredge.com</a> and we will remove you manually.</p>';
+
+// A link we cannot verify. The wording does not distinguish a missing
+// parameter from a bad signature, because the reader cannot act on the
+// difference and the most likely cause of both is age.
+function unsubUnusablePage() {
+  return unsubPage('This link no longer works',
+    '<p style="color:#6c83a3;font-size:14px;max-width:440px;margin:0 auto 22px;line-height:1.7;">'
+    + 'It may be from an older email, or your mail app may have shortened the '
+    + 'address on the way through.</p>' + UNSUB_WAYS_OUT);
+}
+
 // The unsubscribe link is the one address in an email that nothing clicks in
 // testing and everything depends on.
 //
@@ -6047,9 +6095,17 @@ const server = http.createServer((req, res) => { (async () => {
   if (url.pathname === '/unsubscribe') {
     const token = url.searchParams.get('token');
     const uid   = url.searchParams.get('uid');
-    if (!token || !uid) { res.writeHead(400); res.end('Invalid'); return; }
+    if (!token || !uid) {
+      res.writeHead(400, { 'Content-Type': 'text/html; charset=utf-8' });
+      res.end(unsubUnusablePage());
+      return;
+    }
     try {
-      if (!verifyUnsubToken(token, uid)) { res.writeHead(403); res.end('Invalid token'); return; }
+      if (!verifyUnsubToken(token, uid)) {
+        res.writeHead(403, { 'Content-Type': 'text/html; charset=utf-8' });
+        res.end(unsubUnusablePage());
+        return;
+      }
 
       // A GET must not change anything. Mail security scanners and link
       // prefetchers — Outlook Safe Links, corporate filters, some mobile
@@ -6069,7 +6125,7 @@ const server = http.createServer((req, res) => { (async () => {
           + '<h1 style="font-size:22px;font-weight:800;">Unsubscribe</h1>'
           + '<p style="color:#6c83a3;font-size:14px;max-width:420px;margin:0 auto 22px;">Stop receiving tips emails from The Tipster Edge? You can re-enable them any time from your account.</p>'
           + `<form method="POST" action="${esc(action)}" style="margin:0;">`
-          + '<button type="submit" style="background:#18e07a;color:#07090d;border:0;font-size:14px;font-weight:700;padding:12px 28px;border-radius:5px;cursor:pointer;">Yes, unsubscribe me</button>'
+          + '<button type="submit" style="background:#18e07a;color:#07090d;border:0;font-size:14px;font-weight:700;padding:13px 28px;border-radius:5px;cursor:pointer;">Yes, unsubscribe me</button>'
           + '</form>'
           + '<p style="margin-top:22px;"><a href="https://www.thetipsteredge.com/account.html" style="color:#6c83a3;font-size:13px;">Manage preferences instead</a></p>'
           + '</body></html>');
@@ -6091,7 +6147,13 @@ const server = http.createServer((req, res) => { (async () => {
       }
       res.writeHead(200, { 'Content-Type': 'text/html' });
       res.end('<!DOCTYPE html><html lang="en-GB"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex"><title>Unsubscribed | The Tipster Edge</title></head><body style="font-family:sans-serif;text-align:center;padding:60px;background:#07090d;color:#dde6f0;"><h1 style="font-size:22px;font-weight:800;">Unsubscribed</h1><p>You have been removed from all emails.</p><a href="https://www.thetipsteredge.com/account.html" style="color:#18e07a;">Manage preferences</a></body></html>');
-    } catch(e) { res.writeHead(400); res.end('Invalid token'); }
+    } catch (e) {
+      // Reaching here means verify or the update threw, not that the
+      // reader did anything wrong, so they get the same way out.
+      console.error('Unsubscribe errored for', uid, e.message);
+      res.writeHead(400, { 'Content-Type': 'text/html; charset=utf-8' });
+      res.end(unsubUnusablePage());
+    }
     return;
   }
 
