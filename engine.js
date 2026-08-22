@@ -4048,6 +4048,74 @@ function logConfiguration() {
   console.log(`     RapidAPI budget: ${RAPIDAPI_DAILY_BUDGET} calls per UK day`);
 }
 
+// Does the database have the columns this build writes?
+//
+// logConfiguration above answers "is the service configured", and this answers
+// the other half — "is the schema the one this code was written against".
+// Without it a deploy that runs ahead of schema-migration.sql boots looking
+// perfectly healthy: PostgREST refuses each statement that names a missing
+// column, the failure surfaces as a per-write error buried among the run logs,
+// and the visible symptom is a site that says "No tips yet" for ever.
+//
+// A read of a column the table does not have is refused with 42703, which is
+// exactly the question being asked and costs one cheap request per column.
+async function checkSchema() {
+  const required = [
+    ['tips', 'advised_odds',
+     'EVERY tip insert is refused — nothing will be published at all'],
+    ['tips', 'is_free',
+     'the free tier falls back to position, so the free email and the site can disagree'],
+    ['users', 'stripe_event_at',
+     'EVERY subscription write is refused — nobody who pays is upgraded'],
+    ['admin_jobs', 'claimed_at',
+     'no job can be claimed, so the manual send buttons do nothing'],
+    ['results_history', 'is_free',
+     'the ledger cannot record which tips were free'],
+  ];
+  // In parallel, and time-boxed. Startup waits for this so the message lands
+  // above the failures it explains, which means it must not become a reason
+  // the service comes up late: five sequential round trips to a slow database
+  // delayed the scheduler arming by long enough to matter.
+  // Three answers, not two. A column can be present, absent, or unasked —
+  // and an unreachable database gives the same silence as a healthy one.
+  // Folding "could not ask" into "not missing" would print "all required
+  // columns present" over a database this build never reached, which is the
+  // most misleading line it could put in a deploy log.
+  const probe = async ([table, column, consequence]) => {
+    try {
+      const { error } = await supabase.from(table).select(column).limit(1);
+      if (!error) return { state: 'present' };
+      if (error.code === '42703' || error.code === 'PGRST204'
+          || /column .* does not exist/i.test(error.message || '')) {
+        return { state: 'missing', row: [table, column, consequence] };
+      }
+      return { state: 'unknown', why: error.message };
+    } catch (e) {
+      return { state: 'unknown', why: e && e.message };
+    }
+  };
+  const answered = await Promise.race([
+    Promise.all(required.map(probe)),
+    new Promise((r) => setTimeout(() => r(null), 8000)),
+  ]);
+  if (answered === null) {
+    console.log('   Schema: not checked — the database did not answer in 8s');
+    return;
+  }
+  const missing = answered.filter((a) => a.state === 'missing').map((a) => a.row);
+  const unknown = answered.filter((a) => a.state === 'unknown');
+  if (!missing.length && unknown.length) {
+    console.log(`   Schema: not checked — ${unknown.length} of ${required.length} `
+      + `columns could not be read (${unknown[0].why})`);
+    return;
+  }
+  if (!missing.length) { console.log('   Schema: all required columns present'); return; }
+  console.error('   🚨 SCHEMA INCOMPLETE — run schema-migration.sql before relying on this build:');
+  for (const [table, column, consequence] of missing) {
+    console.error(`     missing ${table}.${column} — ${consequence}`);
+  }
+}
+
 async function checkUnsubscribeLink() {
   const probeUrl = `${SITE_URL}/unsubscribe?token=probe&uid=probe`;
   let status;
@@ -6063,6 +6131,11 @@ process.on('uncaughtException', (err) => {
   console.log(`   Schedule: Morning fetch 06:00 | Midday refresh 13:00 | Tips every 15min`);
 
   logConfiguration();
+
+  // Awaited, unlike the unsubscribe probe below: if the schema is short a
+  // column, every line after this is going to fail in a way that is much
+  // harder to read than one message at the top of the log.
+  await checkSchema().catch(e => console.error('Schema check error:', e && e.message));
 
   // Not awaited: it reports on the frontend, and startup does not depend on it.
   checkUnsubscribeLink().catch(e => console.error('Unsubscribe link check error:', e && e.message));
