@@ -4129,10 +4129,14 @@ function unsubPage(heading, bodyHtml) {
     + '<title>' + esc(heading) + ' | The Tipster Edge</title></head>'
     + '<body style="font-family:system-ui,-apple-system,sans-serif;text-align:center;'
     + 'padding:60px 20px;background:#07090d;color:#dde6f0;">'
-    + '<h1 style="font-size:22px;font-weight:800;">' + esc(heading) + '</h1>'
+    + '<main><h1 style="font-size:22px;font-weight:800;">' + esc(heading) + '</h1>'
     + bodyHtml
-    + '</body></html>';
+    + '</main></body></html>';
 }
+
+// The paragraph style all four replies use, kept in one place so they cannot
+// drift apart the way the hand-written ones had.
+const UNSUB_P = 'color:#6c83a3;font-size:14px;max-width:440px;margin:0 auto 22px;line-height:1.7;';
 
 // The two ways out of a link that cannot be used. Both are offered because the
 // first needs a login the reader may not have to hand.
@@ -6118,17 +6122,16 @@ const server = http.createServer((req, res) => { (async () => {
       // authentication, so no session or form field is needed.
       if (req.method !== 'POST') {
         const action = `/unsubscribe?token=${encodeURIComponent(token)}&uid=${encodeURIComponent(uid)}`;
-        res.writeHead(200, { 'Content-Type': 'text/html' });
-        res.end('<!DOCTYPE html><html lang="en-GB"><head><meta charset="utf-8"><meta name="robots" content="noindex"><meta name="viewport" content="width=device-width, initial-scale=1.0">'
-          + '<title>Unsubscribe | The Tipster Edge</title></head>'
-          + '<body style="font-family:system-ui,-apple-system,sans-serif;text-align:center;padding:60px 20px;background:#07090d;color:#dde6f0;">'
-          + '<h1 style="font-size:22px;font-weight:800;">Unsubscribe</h1>'
-          + '<p style="color:#6c83a3;font-size:14px;max-width:420px;margin:0 auto 22px;">Stop receiving tips emails from The Tipster Edge? You can re-enable them any time from your account.</p>'
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+        res.end(unsubPage('Unsubscribe',
+          `<p style="${UNSUB_P}">Stop receiving tips emails from The Tipster Edge? `
+          + 'You can re-enable them any time from your account.</p>'
           + `<form method="POST" action="${esc(action)}" style="margin:0;">`
-          + '<button type="submit" style="background:#18e07a;color:#07090d;border:0;font-size:14px;font-weight:700;padding:13px 28px;border-radius:5px;cursor:pointer;">Yes, unsubscribe me</button>'
-          + '</form>'
-          + '<p style="margin-top:22px;"><a href="https://www.thetipsteredge.com/account.html" style="color:#6c83a3;font-size:13px;">Manage preferences instead</a></p>'
-          + '</body></html>');
+          + '<button type="submit" style="background:#18e07a;color:#07090d;border:0;'
+          + 'font-size:14px;font-weight:700;padding:13px 28px;border-radius:5px;'
+          + 'cursor:pointer;">Yes, unsubscribe me</button></form>'
+          + '<p style="margin-top:22px;"><a href="https://www.thetipsteredge.com/account.html" '
+          + 'style="color:#6c83a3;font-size:13px;">Manage preferences instead</a></p>'));
         return;
       }
 
@@ -6141,12 +6144,17 @@ const server = http.createServer((req, res) => { (async () => {
         .update({ email_opt_in: false }).eq('id', uid).select('id');
       if (unsubErr || !optedOut || !optedOut.length) {
         console.error('Unsubscribe failed for', uid, unsubErr ? unsubErr.message : 'no matching user');
-        res.writeHead(500, { 'Content-Type': 'text/html' });
-        res.end('<!DOCTYPE html><html lang="en-GB"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex"><title>Unsubscribe | The Tipster Edge</title></head><body style="font-family:sans-serif;text-align:center;padding:60px;background:#07090d;color:#dde6f0;"><h1 style="font-size:22px;font-weight:800;">Something went wrong</h1><p>We could not update your preferences just now. Please email <a href="mailto:support@thetipsteredge.com" style="color:#18e07a;">support@thetipsteredge.com</a> and we will remove you manually.</p></body></html>');
+        res.writeHead(500, { 'Content-Type': 'text/html; charset=utf-8' });
+        res.end(unsubPage('Something went wrong',
+          `<p style="${UNSUB_P}">We could not update your preferences just now, `
+          + 'so you are still subscribed.</p>' + UNSUB_WAYS_OUT));
         return;
       }
-      res.writeHead(200, { 'Content-Type': 'text/html' });
-      res.end('<!DOCTYPE html><html lang="en-GB"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex"><title>Unsubscribed | The Tipster Edge</title></head><body style="font-family:sans-serif;text-align:center;padding:60px;background:#07090d;color:#dde6f0;"><h1 style="font-size:22px;font-weight:800;">Unsubscribed</h1><p>You have been removed from all emails.</p><a href="https://www.thetipsteredge.com/account.html" style="color:#18e07a;">Manage preferences</a></body></html>');
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      res.end(unsubPage('Unsubscribed',
+        `<p style="${UNSUB_P}">You have been removed from all emails.</p>`
+        + '<p><a href="https://www.thetipsteredge.com/account.html" '
+        + 'style="color:#18e07a;font-size:14px;">Manage preferences</a></p>'));
     } catch (e) {
       // Reaching here means verify or the update threw, not that the
       // reader did anything wrong, so they get the same way out.
