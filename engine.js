@@ -3593,8 +3593,20 @@ async function settleResultsInner() {
                 // Extract score directly from event object — /matches/detail 204s on finished games
                 const hs  = found.homeScore?.current ?? found.homeScore?.normaltime ?? null;
                 const as_ = found.awayScore?.current ?? found.awayScore?.normaltime ?? null;
-                // Backfill event_id regardless
-                await supabase.from('tips').update({ event_id: found.id }).eq('tip_ref', tip.tip_ref);
+                // Backfill event_id regardless.
+                //
+                // This is what stops the next pass paying for the same lookup:
+                // the search above walks pages of last-matches, one RapidAPI
+                // call each. The write's result was thrown away, so a failure
+                // was invisible and the tip came back tomorrow to buy the same
+                // answer. updateChecked also catches the silent case — a write
+                // RLS refuses returns no error and no rows.
+                const backfill = await updateChecked('tips', { event_id: found.id },
+                  q => q.eq('tip_ref', tip.tip_ref));
+                if (!backfill.ok) {
+                  console.warn(`⚠️ [${tip.tip_ref}] could not store event_id ${found.id} `
+                    + `(${backfill.why}) — this lookup will be repeated next pass`);
+                }
                 if (hs !== null && as_ !== null) {
                   homeScore = hs;
                   awayScore = as_;
