@@ -4116,6 +4116,65 @@ async function checkSchema() {
   }
 }
 
+// Do the Stripe prices charge what the site advertises?
+//
+// The amounts are not in this codebase: the engine hands Stripe a price id and
+// Stripe decides the figure. Every test here can check that the pages, the
+// JSON-LD offer and the upgrade email agree on £9.99 and £99.90 — none of them
+// can check the only number that actually leaves a customer's account.
+//
+// It was written up as something only the operator could confirm, by opening
+// the two price objects by hand. That was true of the tests and not of the
+// engine, which holds the secret key and can simply ask. A mismatch here
+// charges someone a different figure from the one they agreed to, which is the
+// kind of thing worth finding at boot rather than in a chargeback.
+const ADVERTISED_PRICES = [
+  ['monthly', () => STRIPE_PRICE_MONTHLY, 999,  'gbp', 'month', '£9.99/mo'],
+  ['annual',  () => STRIPE_PRICE_ANNUAL,  9990, 'gbp', 'year',  '£99.90/yr'],
+];
+async function checkStripePrices() {
+  if (!STRIPE_SECRET_KEY) { console.log('   Prices: not checked — no Stripe key'); return; }
+  const look = async ([label, id, pence, currency, interval, shown]) => {
+    const price = await stripeRequest(`/prices/${id()}`);
+    // stripeRequest returns null for a transport failure or a non-2xx, both of
+    // which mean the question went unanswered. Not the same as a wrong price.
+    if (!price || !price.id) return { label, state: 'unknown', shown };
+    const wrong = [];
+    if (price.unit_amount !== pence) {
+      wrong.push(`charges ${price.unit_amount} not ${pence}`);
+    }
+    if (String(price.currency || '').toLowerCase() !== currency) {
+      wrong.push(`is in ${price.currency}, not ${currency}`);
+    }
+    if (price.recurring && price.recurring.interval !== interval) {
+      wrong.push(`renews every ${price.recurring.interval}, not every ${interval}`);
+    }
+    if (price.active === false) wrong.push('is not active');
+    return { label, state: wrong.length ? 'wrong' : 'ok', wrong, shown };
+  };
+  const answers = await Promise.race([
+    Promise.all(ADVERTISED_PRICES.map(look)),
+    new Promise((r) => setTimeout(() => r(null), 8000)),
+  ]);
+  if (answers === null) { console.log('   Prices: not checked — Stripe did not answer in 8s'); return; }
+  const wrong = answers.filter((a) => a.state === 'wrong');
+  const unknown = answers.filter((a) => a.state === 'unknown');
+  if (wrong.length) {
+    console.error('   🚨 STRIPE PRICE MISMATCH — a customer would be charged something '
+      + 'other than the price they agreed to:');
+    for (const a of wrong) {
+      console.error(`     ${a.label} (site shows ${a.shown}) ${a.wrong.join('; ')}`);
+    }
+    return;
+  }
+  if (unknown.length) {
+    console.log(`   Prices: not checked — ${unknown.length} of ${answers.length} `
+      + 'could not be read from Stripe');
+    return;
+  }
+  console.log('   Prices: both match what the site advertises (£9.99/mo, £99.90/yr)');
+}
+
 async function checkUnsubscribeLink() {
   const probeUrl = `${SITE_URL}/unsubscribe?token=probe&uid=probe`;
   let status;
@@ -6137,7 +6196,9 @@ process.on('uncaughtException', (err) => {
   // harder to read than one message at the top of the log.
   await checkSchema().catch(e => console.error('Schema check error:', e && e.message));
 
-  // Not awaited: it reports on the frontend, and startup does not depend on it.
+  // Not awaited: these report on things outside this process, and startup does
+  // not depend on either answer.
+  checkStripePrices().catch(e => console.error('Stripe price check error:', e && e.message));
   checkUnsubscribeLink().catch(e => console.error('Unsubscribe link check error:', e && e.message));
 
   // Every async call below is guarded. A rejection from any of them would
