@@ -277,6 +277,15 @@ const SQUAD_SIZE_NHL      = 18;   // skaters dressed; the goalie is modelled sep
 const MISSING_ATTACK_IMPACT  = 0.33;   // if a whole side were missing
 const MISSING_DEFENCE_IMPACT = 0.22;
 
+// The data-quality tier when no lineup information arrived for a fixture.
+//
+// It has to be below 1.0, which is what a CONFIRMED full squad earns, and
+// below 0.95, which is what a known absence earns — knowing who is out beats
+// not knowing. 0.90 is what the other "a whole input is missing" case (no form
+// data) already uses. Below that, 0.85 is reserved for having no context at
+// all. See DECISIONS.md.
+const NO_LINEUP_DATA_QUALITY = 0.90;
+
 const REST_BANDS_FOOTBALL = { heavy: 2, mild: 3 };
 const REST_BANDS_NHL      = { heavy: 0, mild: 1 };   // heavy = a back-to-back
 
@@ -777,46 +786,6 @@ function buildTeamStatsFromStandings(standings, tournamentId) {
   return teams;
 }
 
-// ─── BUILD FORM FROM RECENT MATCHES ───────────────────────────
-function buildFormFromMatches(matches, teamId) {
-  if (!matches?.length) return null;
-  // Sort explicitly rather than trusting the feed's order. "Last five" has to
-  // mean the five most recent; taking slice(0,5) off however the endpoint
-  // happens to return them would quietly compute form from the OLDEST matches
-  // if the page is ascending, and stale form degrades every tip that uses it.
-  const relevant = matches
-    .filter(m => m.status?.type === 'finished' || m.status?.description === 'Ended')
-    .slice()
-    .sort((a, b) => (b.startTimestamp || 0) - (a.startTimestamp || 0))
-    .slice(0, 5);
-
-  if (relevant.length < 3) return null;
-
-  let wins = 0, draws = 0, losses = 0, gf = 0, ga = 0;
-  const chars = [];
-
-  for (const m of relevant) {
-    const isHome = m.homeTeam?.id === teamId;
-    const hg = m.homeScore?.current ?? m.homeScore?.normaltime ?? 0;
-    const ag = m.awayScore?.current ?? m.awayScore?.normaltime ?? 0;
-    const tg = isHome ? hg : ag;
-    const og = isHome ? ag : hg;
-    gf += tg; ga += og;
-    if (tg > og)       { wins++;   chars.push('W'); }
-    else if (tg === og){ draws++;  chars.push('D'); }
-    else               { losses++; chars.push('L'); }
-  }
-
-  const played = relevant.length;
-  return {
-    formScore:       (wins * 3 + draws) / (played * 3),
-    avgGoalsFor:     gf / played,
-    avgGoalsAgainst: ga / played,
-    formString:      chars.join(''),
-    wins, draws, losses, played,
-  };
-}
-
 // ═══════════════════════════════════════════════════════════════
 // MORNING FETCH — 06:00 UK
 // Pulls all fixtures + odds + team stats for next 48 hours
@@ -1199,6 +1168,14 @@ function getContextModifiers(teamSide, ctx, isHome, leagueAvgGoals, restBands, s
     dataQuality = Math.min(dataQuality, 0.95);
   } else if (ctx.lineups?.homeConfirmed) {
     notes.push('Full squad ✓');
+  } else if (!ctx.lineups) {
+    // Neither branch above fired and there is no lineup data at all, so the
+    // tier used to stay wherever form left it — 1.0, the same as a confirmed
+    // full squad. The model was most confident about the fixture it knew least
+    // about. An unconfirmed lineup with nobody listed out is NOT this case:
+    // that is a prediction, which is information.
+    dataQuality = Math.min(dataQuality, NO_LINEUP_DATA_QUALITY);
+    notes.push('No lineup data');
   }
 
   // Both multiply straight into expected goals, so both need bounding. Only
