@@ -4270,6 +4270,47 @@ const ADVERTISED_PRICES = [
 // Same shape as the prices, and the same answer: the engine holds the secret
 // key, so it can ask. Reported rather than fatal — a Stripe outage at boot must
 // not stop the service, and "could not be checked" is not "is wrong".
+// Can the address we send from actually send?
+//
+// Every email leaves as FROM_EMAIL, and Resend accepts that only while its
+// domain is verified on the account. If it is not, every send is refused and
+// the only sign is one `Email error` line per subscriber at 07:00. The
+// half-configured case is worse: a domain that verified once and then lost a
+// DNS record still leaves the API key working, so the engine boots looking
+// healthy and the morning card simply does not arrive.
+async function checkSendingDomain() {
+  if (!RESEND_API_KEY) { console.log('   Sending domain: not checked — no Resend key'); return; }
+  const domain = String(FROM_EMAIL.split('@')[1] || '').toLowerCase();
+  if (!domain) { console.error('   🚨 SENDING DOMAIN: FROM_EMAIL has no domain in it'); return; }
+  let answer = null;
+  try {
+    answer = await Promise.race([
+      fetch('https://api.resend.com/domains', {
+        headers: { Authorization: `Bearer ${RESEND_API_KEY}` },
+      }).then((r) => (r.ok ? r.json() : null)).catch(() => null),
+      new Promise((r) => setTimeout(() => r(null), 8000)),
+    ]);
+  } catch (e) { answer = null; }
+  const list = answer && (Array.isArray(answer.data) ? answer.data
+    : Array.isArray(answer) ? answer : null);
+  if (!list) { console.log('   Sending domain: not checked — Resend did not answer'); return; }
+
+  const match = list.find((d) => String(d.name || '').toLowerCase() === domain);
+  if (!match) {
+    console.error(`   🚨 SENDING DOMAIN: ${domain} is not on the Resend account. Every `
+      + `email from ${FROM_EMAIL} will be refused, one error per subscriber`);
+    return;
+  }
+  const status = String(match.status || '').toLowerCase();
+  if (status === 'verified') {
+    console.log(`   Sending domain: ${domain} is verified`);
+    return;
+  }
+  // not_started, pending, failed, temporary_failure — none of them can send.
+  console.error(`   🚨 SENDING DOMAIN: ${domain} is "${match.status}" at Resend, not verified. `
+    + 'Nothing will be delivered until its DNS records are in place');
+}
+
 // Is Stripe configured to tell us when somebody pays?
 //
 // The four events below are each the only way the engine learns something it
@@ -6543,6 +6584,7 @@ process.on('uncaughtException', (err) => {
   checkStripePrices().catch(e => console.error('Stripe price check error:', e && e.message));
   checkBillingPortal().catch(e => console.error('Billing portal check error:', e && e.message));
   checkStripeWebhook().catch(e => console.error('Stripe webhook check error:', e && e.message));
+  checkSendingDomain().catch(e => console.error('Sending domain check error:', e && e.message));
   checkUnsubscribeLink().catch(e => console.error('Unsubscribe link check error:', e && e.message));
 
   // Every async call below is guarded. A rejection from any of them would
