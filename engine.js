@@ -5410,6 +5410,65 @@ const server = http.createServer((req, res) => { (async () => {
     res.end(JSON.stringify({ started: true, ...result })); return;
   }
 
+  // Set a subscriber's plan.
+  //
+  // The dashboard used to write users.subscription_status straight from the
+  // browser, with the admin's own login. That only worked because every
+  // signed-in user could write any column of their own row — and the same
+  // grant let ANY user set their own status to 'pro' and take the Pro card for
+  // free, since the tips policy decides entitlement by reading exactly that
+  // column. rls-policies.sql now caps what a browser may write to first_name,
+  // the email preferences and last_login, which closes that and takes this
+  // with it. A privileged write belongs behind the service role anyway.
+  //
+  // Worth knowing before relying on it: Stripe owns this column. A value set
+  // here is overwritten the next time /verify-pro runs for that user — which
+  // their account page does on load — so this comps an account until they next
+  // visit it, not indefinitely.
+  if (url.pathname === '/admin/set-plan' && req.method === 'POST') {
+    if (!safeEqual(adminKey, ADMIN_KEY)) { res.writeHead(403); res.end('Forbidden'); return; }
+    (async () => {
+      try {
+        let body = {};
+        try { body = JSON.parse((await readBody(req)).toString('utf8') || '{}'); }
+        catch (_) { res.writeHead(400, { ...cors, 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ ok: false, error: 'Malformed body' })); return; }
+
+        const email = String(body.email || '').trim().toLowerCase();
+        const plan  = String(body.plan || '').trim();
+        if (!email) {
+          res.writeHead(400, { ...cors, 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'An email address is required' })); return;
+        }
+        // Only the two values the column is allowed to hold from here. past_due
+        // is Stripe's to set, never an operator's.
+        if (plan !== 'pro' && plan !== 'free') {
+          res.writeHead(400, { ...cors, 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: `Plan must be "pro" or "free", not "${plan}"` })); return;
+        }
+
+        // updateChecked selects back, so a mistyped address reports "no user"
+        // rather than silently succeeding — the same trap the dashboard's own
+        // .select() was added for.
+        const wrote = await updateChecked('users', { subscription_status: plan },
+                                          q => q.eq('email', email));
+        if (!wrote.ok) {
+          console.error(`Admin set-plan failed for ${email}:`, wrote.why);
+          res.writeHead(404, { ...cors, 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: wrote.why })); return;
+        }
+        console.log(`Admin set ${email} to ${plan}`);
+        res.writeHead(200, { ...cors, 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, email, plan, rows: wrote.rows }));
+      } catch (e) {
+        console.error('Admin set-plan error:', e.message);
+        res.writeHead(500, { ...cors, 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'Server error' }));
+      }
+    })();
+    return;
+  }
+
   if (url.pathname === '/admin/test-email') {
     if (!safeEqual(adminKey, ADMIN_KEY)) { res.writeHead(403); res.end('Forbidden'); return; }
     const r = await sendTestEmail(url.searchParams.get('to'), url.searchParams.get('type')||'daily');
