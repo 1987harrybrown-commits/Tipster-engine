@@ -2232,11 +2232,23 @@ function confidenceFromSignals({ modelProb, dataQualityTier, sport, gamesPlayed 
   return conf;
 }
 
+// The tier assumed when a candidate arrives without one. Not 1.0: that is the
+// score for a fixture where every input was present, and handing it to one that
+// said nothing about its inputs is how the least-known candidate outranks
+// better-known ones for the daily best bet and the accumulator.
+//
+// 0.85 is what the scale in getContextModifiers already uses for "no context at
+// all", and clampFinite bounds every real tier to [0.5, 1.0] so it cannot be
+// mistaken for a computed value. confidenceFromSignals already fails this way
+// on the same field.
+const UNKNOWN_QUALITY_TIER = 0.85;
+
 function scoreCandidate({ edgePct, modelProb, dataQualityTier }) {
   const edgeScore    = Math.min(1, Math.max(0, edgePct) / 20);
   const probStrength = Math.min(1, Math.abs(modelProb - 0.5) / 0.5);
+  const tier         = Number.isFinite(dataQualityTier) ? dataQualityTier : UNKNOWN_QUALITY_TIER;
   // 60% edge, 25% probability strength, 15% data quality
-  return edgeScore * 0.60 + probStrength * 0.25 + (dataQualityTier || 1.0) * 0.15;
+  return edgeScore * 0.60 + probStrength * 0.25 + tier * 0.15;
 }
 
 function pickBestCandidate(candidates) {
@@ -2245,7 +2257,8 @@ function pickBestCandidate(candidates) {
     const qualityScore = scoreCandidate({
       edgePct:         c.edge,
       modelProb:       c.modelProb,
-      dataQualityTier: c.dataQualityTier || 1.0,
+      dataQualityTier: Number.isFinite(c.dataQualityTier)
+        ? c.dataQualityTier : UNKNOWN_QUALITY_TIER,
     });
     // Composite rank: 70% quality score + 30% normalised edge (capped at 25%)
     const normEdge   = Math.min(1, Math.max(0, c.edge) / 25);
