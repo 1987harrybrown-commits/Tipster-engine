@@ -2992,19 +2992,34 @@ async function saveTips(tips) {
     try {
       // Deduplicate: try event_id first (exact), then fuzzy name match
       let existing = null;
+      // A read that failed is not proof this tip is new. Both probes below
+      // returned null on failure, which is the same value as "no match", and
+      // the insert below acts on it — so one bad response put a second copy of
+      // a tip already on the card. The cycle runs every 15 minutes; skipping is
+      // free.
       if (tip.event_id) {
-        const { data: byId } = await supabase.from('tips').select('id, tip_ref, confidence, odds, best_odds, bookmaker, status')
+        const { data: byId, error: byIdErr } = await supabase.from('tips').select('id, tip_ref, confidence, odds, best_odds, bookmaker, status')
           .eq('event_id', tip.event_id).eq('selection', tip.selection)
           .in('status', ['pending', 'won', 'lost', 'void']).maybeSingle();
+        if (byIdErr) {
+          console.error(`🚨 [${tip.tip_ref}] could not check for an existing tip `
+            + `(${byIdErr.message}) — not saving it this cycle rather than risking a duplicate`);
+          skipped++; continue;
+        }
         existing = byId;
       }
       if (!existing) {
         // Fuzzy name match — catches "Inter" vs "Inter Milan", "Marseille" vs "Olympique de Marseille"
         const date = new Date(tip.event_time).toISOString().split('T')[0];
-        const { data: candidates } = await supabase.from('tips').select('id, tip_ref, confidence, odds, best_odds, bookmaker, status, home_team, away_team')
+        const { data: candidates, error: candErr } = await supabase.from('tips').select('id, tip_ref, confidence, odds, best_odds, bookmaker, status, home_team, away_team')
           .gte('event_time', `${date}T00:00:00Z`).lte('event_time', `${date}T23:59:59Z`)
           .eq('selection', tip.selection)
           .in('status', ['pending', 'won', 'lost', 'void']);
+        if (candErr) {
+          console.error(`🚨 [${tip.tip_ref}] could not check for an existing tip `
+            + `(${candErr.message}) — not saving it this cycle rather than risking a duplicate`);
+          skipped++; continue;
+        }
         existing = (candidates || []).find(c =>
           nameMatch(c.home_team, tip.home_team) && nameMatch(c.away_team, tip.away_team)
         ) || null;
@@ -3323,7 +3338,13 @@ async function settleResultsInner() {
     return { settled: 0, backfilled: 0 };
   }
 
-  const { data: lastRow } = await supabase.from('results_history').select('running_pl').order('settled_at', { ascending: false }).limit(1).maybeSingle();
+  // A failed read seeds the running total at 0, which would renumber every row
+  // written below from zero. Not damage that survives — the recompute at the
+  // end of this function runs whenever anything was written — but it is worth
+  // knowing it happened.
+  const { data: lastRow, error: lastRowErr } = await supabase.from('results_history').select('running_pl').order('settled_at', { ascending: false }).limit(1).maybeSingle();
+  if (lastRowErr) console.error('Could not read the last running total, seeding from 0 '
+    + `(${lastRowErr.message}) — the renumber at the end of this pass corrects it`);
   let currentRunningPL = parseFloat(lastRow?.running_pl || 0);
   const now = Date.now();
   let count = 0, backfilled = 0, dirty = false;
@@ -3676,7 +3697,18 @@ async function settleResultsInner() {
         : won ? parseFloat(((settlementOdds - 1) * settlementStake).toFixed(2))
               : parseFloat((-settlementStake).toFixed(2));
 
-      const { data: already } = await supabase.from('results_history').select('id').eq('tip_ref', tip.tip_ref).maybeSingle();
+      // If this read fails, `already` is null, which is what a tip that has
+      // never been settled also looks like — and the insert below then writes a
+      // second ledger row and adds its P&L to the running total a second time.
+      // The unique constraint that would refuse it lives in
+      // schema-migration.sql, which has not been run, so nothing else is
+      // standing behind this. Settlement retries every pass.
+      const { data: already, error: alreadyErr } = await supabase.from('results_history').select('id').eq('tip_ref', tip.tip_ref).maybeSingle();
+      if (alreadyErr) {
+        console.error(`🚨 [${tip.tip_ref}] could not check whether it is already in the ledger `
+          + `(${alreadyErr.message}) — leaving it for the next pass rather than settling it twice`);
+        continue;
+      }
 
       // The ledger row and the tip's own status are two writes, and only the
       // second was checked. If this one fails the tip stays `pending` while
@@ -4634,16 +4666,23 @@ async function getBetOfTheDay() {
 // Left as a decision. See DEPLOY.md.
 async function getSaturdayAcca() {
   const today = ukDateString();
-  const { data: ov } = await supabase.from('email_overrides').select('*').eq('date', today).eq('type','saturday').maybeSingle();
+  // No override is the ordinary case, and so is the automatic email that
+  // follows. But a failed read looks identical, and then an override the
+  // operator set is silently not applied — worth saying, because the send
+  // itself must not be held up over it.
+  const { data: ov, error: ovErr } = await supabase.from('email_overrides').select('*').eq('date', today).eq('type','saturday').maybeSingle();
+  if (ovErr) console.error("Saturday acca: could not read the operator's override "
+    + `(${ovErr.message}) — sending the automatic selections instead`);
   if (ov?.acca_selections) return { selections: ov.acca_selections, combinedOdds: ov.acca_combined_odds||0, reasoning: ov.acca_reasoning||'' };
   const dayStart = ukDayStart();
   const s = new Date(dayStart.getTime() + 6 * 3600000);          // 06:00 UK
   const e = new Date(dayStart.getTime() + 24 * 3600000 - 1);     // 23:59:59 UK
-  const { data: tips } = await supabase.from('tips').select('*').eq('status','pending').eq('sport','Football')
+  const { data: tips, error: tipsErr } = await supabase.from('tips').select('*').eq('status','pending').eq('sport','Football')
     .gte('event_time', s.toISOString()).lte('event_time', e.toISOString())
     .gte('confidence', 72).order('confidence', { ascending: false }).limit(40);
   // Legs have to be bets, and the fetch has to reach past the informational
   // picks to find them — see generateDailyAcca for why they crowd the top.
+  if (tipsErr) console.error('Could not read candidate tips for the Saturday acca:', tipsErr.message);
   const bets = (tips || []).filter(isBet).slice(0, 4);
   if (bets.length < 3) return null;
   // tip_ref and confidence carried through, matching the shape
@@ -4821,17 +4860,25 @@ async function tagDailyBestBet() {
     const s = dayStart.toISOString();
     const e = new Date(dayStart.getTime() + 24 * 3600000 - 1).toISOString();
 
-    const { data: existing } = await supabase.from('tips').select('id')
+    // Null means "none tagged yet", and so does a failed read — but only one of
+    // them should lead to tagging another. This runs again tomorrow.
+    const { data: existing, error: existingErr } = await supabase.from('tips').select('id')
       .eq('is_best_bet', true).gte('event_time', s).lte('event_time', e).maybeSingle();
+    if (existingErr) {
+      console.error('🚨 Could not check for an existing best bet '
+        + `(${existingErr.message}) — not tagging one rather than tagging a second`);
+      return;
+    }
     if (existing) return;
 
     // Fetch candidates — select model_edge and quality_score for ranking
-    const { data: tips } = await supabase.from('tips')
+    const { data: tips, error: tipsErr } = await supabase.from('tips')
       .select('id, tip_ref, home_team, away_team, confidence, odds, model_edge, quality_score, stake')
       .eq('status', 'pending')
       .gte('event_time', s)
       .lte('event_time', e);
 
+    if (tipsErr) console.error('Could not read candidate tips for the best bet:', tipsErr.message);
     if (!tips?.length) return;
 
     // The Best Bet is a bet. Informational picks carry stake 0 and were never
@@ -4867,7 +4914,13 @@ async function tagDailyBestBet() {
 async function generateDailyAcca() {
   try {
     const today = ukDateString();
-    const { data: existing } = await supabase.from('daily_accas').select('id').eq('date', today).maybeSingle();
+    // Same shape as the best bet above: a failed read reads as "none today".
+    const { data: existing, error: existingErr } = await supabase.from('daily_accas').select('id').eq('date', today).maybeSingle();
+    if (existingErr) {
+      console.error(`🚨 Could not check for today's acca (${existingErr.message}) `
+        + '— not generating one rather than generating a second');
+      return { skipped: true, reason: 'existence_check_failed' };
+    }
     if (existing) return { skipped: true };
     // ukDayStart, not the date pasted onto 'T00:00:00Z' — see tagDailyBestBet.
     const dayStart = ukDayStart();
@@ -4884,7 +4937,10 @@ async function generateDailyAcca() {
     // Over-fetch before filtering, for the same reason getTodaysTips does: at
     // this confidence floor the informational picks come first, so a limit of
     // 5 could be filled by them and leave nothing.
-    const { data: tips } = await supabase.from('tips').select('*').eq('status', 'pending').gte('event_time', s).lte('event_time', e).gte('confidence', 84).order('confidence', { ascending: false }).limit(50);
+    const { data: tips, error: tipsErr } = await supabase.from('tips').select('*').eq('status', 'pending').gte('event_time', s).lte('event_time', e).gte('confidence', 84).order('confidence', { ascending: false }).limit(50);
+    // Not enough tips and no answer both end here. Only one of them is a fact
+    // about the card.
+    if (tipsErr) console.error('Could not read candidate tips for the acca:', tipsErr.message);
     const bets = (tips || []).filter(isBet);
     if (bets.length < 3) return { generated: false, reason: 'insufficient_tips' };
     const legs = bets.slice(0, 5);
@@ -5151,7 +5207,8 @@ async function updateStripeUser(keys, patch, label, eventAt) {
   if (eventAt) {
     for (const [col, val] of keys) {
       if (!val) continue;
-      const { data } = await supabase.from('users').select('id, stripe_event_at').eq(col, val);
+      const { data, error: newerErr } = await supabase.from('users').select('id, stripe_event_at').eq(col, val);
+      if (newerErr) console.error(`Stripe ${label}: could not check for a newer event:`, newerErr.message);
       const newer = (data || []).find(r => r.stripe_event_at && r.stripe_event_at > eventAt);
       if (newer) {
         console.log(`Stripe ${label}: ignored — event is from ${eventAt}, the row was `
@@ -5224,8 +5281,11 @@ async function handleStripeWebhook(event) {
       // twice. The upgrade itself is naturally idempotent; the welcome email is
       // not. Read the prior state so a replay does not greet the same customer
       // again.
-      const { data: before } = await supabase.from('users')
+      // Only used to avoid greeting an existing subscriber again, so a failed
+      // read costs at worst a duplicate welcome email.
+      const { data: before, error: beforeErr } = await supabase.from('users')
         .select('subscription_status').eq('id', uid).maybeSingle();
+      if (beforeErr) console.error('Stripe checkout.completed: could not read the prior state:', beforeErr.message);
       const alreadyPro = before && before.subscription_status === 'pro';
 
       // The most consequential write in the system: someone has just paid.
@@ -5247,8 +5307,9 @@ async function handleStripeWebhook(event) {
         // No row moved. Distinguish a superseded replay from a missing user:
         // the first is fine and must answer 2xx, the second is money taken for
         // nothing and has to be retried and shouted about.
-        const { data: who } = await supabase.from('users')
+        const { data: who, error: whoErr } = await supabase.from('users')
           .select('id, stripe_event_at').eq('id', uid).maybeSingle();
+        if (whoErr) console.error('Stripe checkout.completed: could not check for a replay:', whoErr.message);
         if (who && eventAt && who.stripe_event_at && who.stripe_event_at > eventAt) {
           console.log(`Stripe checkout.completed: ${uid} already carries a newer event `
             + `(${who.stripe_event_at}) — replay ignored`);
@@ -5270,7 +5331,8 @@ async function handleStripeWebhook(event) {
       // return value: a mail failure must not make Stripe redeliver the event
       // and upgrade-plus-email the customer twice.
       (async () => {
-        const { data: u } = await supabase.from('users').select('email,first_name').eq('id', uid).single();
+        const { data: u, error: uErr } = await supabase.from('users').select('email,first_name').eq('id', uid).single();
+        if (uErr) console.error('Welcome email: could not read the recipient:', uErr.message);
         if (u) await sendEmail({ to: u.email, subject: `Welcome to The Tipster Pro, ${u.first_name||'there'}`, html: buildWelcomeEmail({ userId: uid, firstName: u.first_name }), type: 'welcome_pro' });
       })().catch(e => console.error('Welcome email failed:', e.message));
       break;
@@ -5914,7 +5976,14 @@ const server = http.createServer((req, res) => { (async () => {
         const caller = await authedUser(req);
         if (!caller) { res.writeHead(401, { ...cors, 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'Unauthorized' })); return; }
 
-        const { data: existing } = await supabase.from('users').select('id').eq('id', caller.id).maybeSingle();
+        const { data: existing, error: existingErr } = await supabase.from('users').select('id').eq('id', caller.id).maybeSingle();
+        if (existingErr) {
+          // Falling through would insert on a primary key that may already
+          // exist. Say the read failed; the caller retries on the next visit.
+          console.error('ensure-profile: could not check for an existing row:', existingErr.message);
+          res.writeHead(503, { ...cors, 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'Could not check the account, try again shortly' })); return;
+        }
         if (existing) {
           res.writeHead(200, { ...cors, 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ ok: true, created: false })); return;
@@ -5958,7 +6027,16 @@ const server = http.createServer((req, res) => { (async () => {
         const caller = await authedUser(req);
         if (!caller) { res.writeHead(401, { ...cors, 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'Unauthorized' })); return; }
         const userId = caller.id;
-        const { data: user } = await supabase.from('users').select('stripe_customer_id, stripe_subscription_id, subscription_status').eq('id', userId).single();
+        const { data: user, error: userErr } = await supabase.from('users').select('stripe_customer_id, stripe_subscription_id, subscription_status').eq('id', userId).single();
+        // A failed read used to fall into the line below and answer
+        // { isPro: false, verified: true } — which tells a paying subscriber,
+        // with the word "verified" attached, that they are not one. Decline to
+        // answer instead; the caller can ask again.
+        if (userErr && userErr.code !== 'PGRST116') {
+          console.error('verify-subscription: could not read the account:', userErr.message);
+          res.writeHead(503, { ...cors, 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'Could not check the subscription, try again shortly' })); return;
+        }
         if (!user?.stripe_subscription_id) { res.writeHead(200, { ...cors, 'Content-Type': 'application/json' }); res.end(JSON.stringify({ isPro: false, verified: true })); return; }
 
         const sub = await stripeRequest(`/subscriptions/${user.stripe_subscription_id}`);
@@ -6111,8 +6189,17 @@ const server = http.createServer((req, res) => { (async () => {
         // stripe_customer_id/stripe_subscription_id with the new pair and the
         // original subscription keeps billing with nothing in the app pointing
         // at it. The user is charged twice and cancelling only stops the second.
-        const { data: existing } = await supabase.from('users')
+        const { data: existing, error: existingErr } = await supabase.from('users')
           .select('stripe_subscription_id').eq('id', userId).maybeSingle();
+        if (existingErr) {
+          // The whole point of this guard is that it knows whether there is
+          // already a subscription. A failed read does not, and waving the
+          // checkout through on a guess is precisely the double-charge
+          // described above. Refuse; the customer can try again.
+          console.error('Checkout: could not check for an existing subscription:', existingErr.message);
+          res.writeHead(503, { ...cors, 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'Could not start checkout, try again shortly' })); return;
+        }
         if (existing?.stripe_subscription_id) {
           const current = await stripeRequest(`/subscriptions/${existing.stripe_subscription_id}`);
 
@@ -6166,7 +6253,14 @@ const server = http.createServer((req, res) => { (async () => {
         const caller = await authedUser(req);
         if (!caller) { res.writeHead(401, { ...cors, 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'Unauthorized' })); return; }
 
-        const { data: user } = await supabase.from('users').select('stripe_customer_id').eq('id', caller.id).single();
+        const { data: user, error: userErr } = await supabase.from('users').select('stripe_customer_id').eq('id', caller.id).single();
+        // 404 "No billing account" is a statement about the account. A read
+        // that failed is not in a position to make it.
+        if (userErr && userErr.code !== 'PGRST116') {
+          console.error('billing-portal: could not read the account:', userErr.message);
+          res.writeHead(503, { ...cors, 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'Could not open billing, try again shortly' })); return;
+        }
         if (!user?.stripe_customer_id) { res.writeHead(404, { ...cors, 'Content-Type': 'application/json' }); res.end(JSON.stringify({ error: 'No billing account' })); return; }
 
         const session = await stripeRequest('/billing_portal/sessions', 'POST', { customer: user.stripe_customer_id, return_url: `${SITE_URL}/account.html` });
