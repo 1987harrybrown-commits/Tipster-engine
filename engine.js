@@ -5378,7 +5378,16 @@ async function handleStripeWebhook(event) {
     case 'customer.subscription.updated': {
       const sub = event.data.object;
       const mapped = mapSubStatus(sub.status);
-      if (!mapped) break;
+      if (!mapped) {
+        // incomplete and paused, the two statuses the mapper deliberately does
+        // not translate. Leaving the column alone is right — both are transient
+        // and neither is an entitlement change. Saying nothing is not: `paused`
+        // is a documented decision, and a decision nobody can observe is
+        // indistinguishable from an event that went missing.
+        console.log(`Stripe subscription.updated: status '${sub.status}' is not an `
+          + 'entitlement change — the account is left as it is');
+        break;
+      }
       // A subscription cancelled at period end stays 'active' until it lapses,
       // so access correctly continues until subscription.deleted arrives.
       const patch = { subscription_status: mapped };
@@ -6105,6 +6114,23 @@ const server = http.createServer((req, res) => { (async () => {
         // second subscription alongside the first. null means transient —
         // incomplete, paused — and leaves the column alone.
         const mapped = mapSubStatus(sub.status);
+        // An unmapped status — incomplete, paused — means the column is
+        // deliberately left alone twenty lines below. Answering `isPro: false,
+        // verified: true` off it would tell the account page, with the word
+        // verified attached, that the reader is not Pro while the record still
+        // says they are. Report what is on record and decline to confirm, which
+        // is exactly the contract the failed-write branch uses.
+        if (!mapped) {
+          console.log(`/verify-pro: Stripe says '${sub.status}' for ${userId}, which is `
+            + 'not an entitlement — leaving the account as it is');
+          res.writeHead(200, { ...cors, 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({
+            isPro: user.subscription_status === 'pro',
+            verified: false,
+            subscriptionStatus: sub.status,
+          }));
+          return;
+        }
         const isPro = mapped === 'pro';
         // An update Supabase REFUSES returns no error and no rows, so the
         // result has to be read rather than assumed — and this answer is not
