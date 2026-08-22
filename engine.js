@@ -70,6 +70,10 @@ const RAPIDAPI_KEY         = process.env.RAPIDAPI_KEY || '';
 if (!RAPIDAPI_KEY) throw new Error('FATAL: RAPIDAPI_KEY env var is not set');
 const ADMIN_KEY            = process.env.ADMIN_KEY || '';
 if (!ADMIN_KEY) throw new Error('FATAL: ADMIN_KEY env var is not set');
+// Reported by logConfiguration rather than enforced here. A hard floor would
+// refuse to boot on a key that has been working, and taking the service down
+// over a guess about the operator's key is worse than saying so at every start.
+const MIN_ADMIN_KEY_LENGTH = 24;
 // Unsubscribe links are signed so nobody can opt another subscriber out by
 // guessing their UUID. Prefer a dedicated secret; fall back to the Stripe
 // webhook secret so links already sitting in inboxes keep verifying. There is
@@ -4144,6 +4148,15 @@ function logConfiguration() {
     ['Unsub signing', !!UNSUB_SECRET && UNSUB_SECRET !== STRIPE_WEBHOOK_SECRET,
      'UNSUB_SECRET', 'links are signed with the Stripe secret, so rotating it '
      + 'breaks every unsubscribe link already delivered'],
+    // The credential that gates resettling the ledger, sending to the whole
+    // mailing list and changing a user's plan, and the only one this summary
+    // did not mention. Boot already refuses an empty key; it accepts a
+    // one-character one, and the global limiter allows 60 guesses a minute per
+    // address — untouchable for a long key, a few hours for a short one.
+    ['Admin key',     ADMIN_KEY.length >= MIN_ADMIN_KEY_LENGTH,
+     `ADMIN_KEY of at least ${MIN_ADMIN_KEY_LENGTH} characters (this one has ${ADMIN_KEY.length})`,
+     'every admin route is one online guessing run away from resettling the '
+     + 'ledger or mailing the whole list'],
   ];
   console.log('   Configuration:');
   for (const [name, ok, vars, consequence] of rows) {
