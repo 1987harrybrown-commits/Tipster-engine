@@ -4335,6 +4335,14 @@ function esc(v) {
     .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }
 
+// One tip is not "1 tips". A one-tip card is ordinary — the median is four,
+// and with NBA and NHL out of season a football-only day can produce a single
+// bet — so this is reached, not theoretical. The subject line is the worst
+// place for it: that is the first thing a paying subscriber sees.
+function plural(n, one, many) {
+  return Number(n) === 1 ? one : many;
+}
+
 function emailBase(content, userId) {
   // Every email this product sends recommends bets, and none of them carried
   // any of the messaging the website carries on every page: no 18+ notice, no
@@ -4410,7 +4418,7 @@ function buildProEmail({ tip, allTips, userId, firstName }) {
   const content = `
 <p style="font-family:monospace;font-size:10px;text-transform:uppercase;letter-spacing:3px;color:#f0b429;margin:0 0 10px;">Pro Early Access · 07:00</p>
 <h1 style="font-size:20px;font-weight:800;color:#dde6f0;margin:0 0 4px;">Morning, ${g}. Here's your full card.</h1>
-<p style="font-size:12px;color:#6c83a3;margin:0 0 22px;">${allTips.length} tips ready.</p>
+<p style="font-size:12px;color:#6c83a3;margin:0 0 22px;">${allTips.length} ${plural(allTips.length, 'tip', 'tips')} ready.</p>
 <p style="font-family:monospace;font-size:9px;text-transform:uppercase;letter-spacing:2px;color:#18e07a;margin:0 0 8px;">Best Pick · [${esc(tip.tip_ref)}]</p>
 <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#111620;border-radius:7px;margin-bottom:16px;">
 <tr><td style="padding:14px 16px;">
@@ -4429,9 +4437,10 @@ ${extras ? `<table role="presentation" width="100%" cellpadding="0" cellspacing=
 
 function buildFreeEmail({ tip, proTipCount, userId, firstName }) {
   const g    = esc(firstName || 'there');
-  const edge = parseFloat(tip.model_edge != null ? tip.model_edge : 0).toFixed(1);
-  const ec   = parseFloat(edge) >= 0 ? '#18e07a' : '#ff3d5a';
-  const es   = parseFloat(edge) >= 0 ? `+${edge}%` : `${edge}%`;
+  // The value edge is a Pro field. The pricing card marks it as one and the
+  // site card renders "Value Edge - Pro only" to a signed-out reader, so
+  // printing the figure here meant a free subscriber read it in the email and
+  // met a padlock over the same number, on the same tip, one click later.
   const content = `
 <p style="font-family:monospace;font-size:10px;text-transform:uppercase;letter-spacing:3px;color:#18e07a;margin:0 0 10px;">Bet of the Day</p>
 <h1 style="font-size:20px;font-weight:800;color:#dde6f0;margin:0 0 4px;">Morning, ${g}.</h1>
@@ -4444,11 +4453,11 @@ function buildFreeEmail({ tip, proTipCount, userId, firstName }) {
 </td><td style="padding:14px 16px;text-align:right;">
 <p style="font-family:monospace;font-size:26px;font-weight:700;color:#f0b429;margin:0;line-height:1;">${advisedPrice(tip).toFixed(2)}</p>
 ${livePriceNote(tip, { block: true })}
-<p style="font-family:monospace;font-size:10px;color:${ec};margin:4px 0 0;">${es} edge</p>
+<p style="font-family:monospace;font-size:10px;color:#6c83a3;margin:4px 0 0;">Value edge · <span style="color:#f0b429;">Pro only</span></p>
 </td></tr></table>
 <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#0c0f15;border:1px solid rgba(240,180,41,0.25);border-radius:7px;margin-bottom:20px;">
 <tr><td style="padding:16px 18px;">
-<p style="font-family:monospace;font-size:9px;text-transform:uppercase;letter-spacing:2px;color:#f0b429;margin:0 0 8px;">Pro members got ${proTipCount} more tips at 07:00</p>
+<p style="font-family:monospace;font-size:9px;text-transform:uppercase;letter-spacing:2px;color:#f0b429;margin:0 0 8px;">Pro members got ${proTipCount} more ${plural(proTipCount, 'tip', 'tips')} at 07:00</p>
 <a href="${SITE_URL}/#pricing" style="display:inline-block;background:#f0b429;color:#07090d;font-size:12px;font-weight:700;padding:9px 20px;border-radius:4px;text-decoration:none;">Go Pro — £9.99/mo</a>
 </td></tr></table>
 <div style="text-align:center;"><a href="${SITE_URL}/#tips" style="display:inline-block;background:#18e07a;color:#07090d;font-size:13px;font-weight:700;padding:12px 28px;border-radius:5px;text-decoration:none;">View Today's Tips</a></div>${PRICE_FOOTNOTE}`;
@@ -4743,7 +4752,7 @@ async function sendProEmails({ force = false } = {}) {
   const subs = await getSubscribers('daily', 'pro');
   return await dispatchToSubscribers('Pro', subs, (u) => ({
     to: u.email,
-    subject: `${u.first_name ? u.first_name + ', ' : ''}Pro Early Access | ${tips.length} tips ready`,
+    subject: `${u.first_name ? u.first_name + ', ' : ''}Pro Early Access | ${tips.length} ${plural(tips.length, 'tip', 'tips')} ready`,
     html: buildProEmail({ tip: tips[0], allTips: tips, userId: u.id, firstName: u.first_name }),
     type: 'pro_daily',
     userId: u.id,
