@@ -2944,7 +2944,7 @@ async function saveTips(tips) {
           //
           // odds and best_odds still track the live and peak prices, which are
           // display and line-movement inputs rather than advice.
-          await supabase.from('tips').update({
+          const { error: updErr } = await supabase.from('tips').update({
             odds: tip.odds, best_odds: newBest, bookmaker: tip.bookmaker,
             confidence: tip.confidence,
             selection: tip.selection, market: tip.market, notes: tip.notes,
@@ -2954,7 +2954,12 @@ async function saveTips(tips) {
             event_id: tip.event_id,
             ...(existing.tip_ref ? {} : { tip_ref: tip.tip_ref }),
           }).eq(updateKey, updateVal);
-          updated++;
+          // Counted only when it happened, the way `saved` is on the insert
+          // path below. This incremented unconditionally, so the summary line
+          // reported reprices that had failed — and a persistent write failure
+          // read as a healthy run with the old prices quietly still live.
+          if (updErr) console.error(`Tip update error [${tip.tip_ref}]:`, updErr.message);
+          else updated++;
         } else { skipped++; }
         continue;
       }
@@ -3267,7 +3272,13 @@ async function settleResultsInner() {
           pl = tip.status === 'won'
             ? parseFloat(((oddsUsed - 1) * stake).toFixed(2))
             : parseFloat((-stake).toFixed(2));
-          await supabase.from('tips').update({ profit_loss: pl }).eq('tip_ref', tip.tip_ref);
+          // The ledger row below carries this value regardless, so a failure
+          // here costs nothing immediately and the next run recomputes it.
+          // Logged all the same: silent and self-healing looks identical to
+          // silent and permanently stuck.
+          const { error: plErr } = await supabase.from('tips')
+            .update({ profit_loss: pl }).eq('tip_ref', tip.tip_ref);
+          if (plErr) console.error(`Backfill could not store P&L for [${tip.tip_ref}]:`, plErr.message);
         }
         pl = parseFloat(pl);
 
@@ -3348,7 +3359,18 @@ async function settleResultsInner() {
       // asking again every fifteen minutes for the rest of the service's life
       // is the only other option.
       if (hoursOld > SETTLE_ASK_UNTIL_HOURS) {
-        await supabase.from('tips').update({ status: 'void' }).eq('tip_ref', tip.tip_ref);
+        // Say what happened, not what was attempted. The log line below is the
+        // only record that this tip was dealt with, and printing it regardless
+        // of the write meant a failed void read as a completed one — while the
+        // row stayed pending and came back round on every later cycle, for
+        // ever, announcing itself as voided each time.
+        const { error: voidErr } = await supabase.from('tips')
+          .update({ status: 'void' }).eq('tip_ref', tip.tip_ref);
+        if (voidErr) {
+          console.error(`Could not void [${tip.tip_ref}]: ${voidErr.message} `
+            + `— left pending, will be reconsidered next cycle`);
+          continue;
+        }
         console.log(`⚪ VOID (${Math.round(hoursOld / 24)} days old, beyond the window `
           + `the source retains): [${tip.tip_ref}] ${tip.home_team} vs ${tip.away_team}`);
         continue;
@@ -3364,7 +3386,13 @@ async function settleResultsInner() {
             + `unavailable — [${tip.tip_ref}] left pending rather than voided`);
           return;
         }
-        await supabase.from('tips').update({ status: 'void' }).eq('tip_ref', tip.tip_ref);
+        const { error: voidErr } = await supabase.from('tips')
+          .update({ status: 'void' }).eq('tip_ref', tip.tip_ref);
+        if (voidErr) {
+          console.error(`Could not void [${tip.tip_ref}]: ${voidErr.message} `
+            + `— left pending, will be reconsidered next cycle`);
+          return;
+        }
         console.log(`⚪ VOID (asked, no result after ${Math.round(hoursOld)}h): `
           + `[${tip.tip_ref}] ${tip.home_team} vs ${tip.away_team}`);
       };
@@ -3640,7 +3668,16 @@ async function settleResultsInner() {
       if (!allSettled) continue;
       const activeLegs = legTips.filter(t => t.status !== 'void');
       if (!activeLegs.length) {
-        await supabase.from('daily_accas').update({ result: 'VOID', profit_loss: 0 }).eq('id', acca.id);
+        // Through updateChecked, like the WON/LOST write twenty lines below,
+        // and for the same reason given there: an unchecked write leaves the
+        // acca silently pending for ever, and this branch had no log at all to
+        // notice it by.
+        const voidWrote = await updateChecked('daily_accas', { result: 'VOID', profit_loss: 0 },
+                                              q => q.eq('id', acca.id));
+        if (!voidWrote.ok) {
+          console.error(`Acca ${acca.date}: every leg voided, but the write failed `
+            + `(${voidWrote.why}) — left pending, the next run re-settles it`);
+        }
         continue;
       }
       const allWon = activeLegs.every(t => t.status === 'won');
