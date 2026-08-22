@@ -695,6 +695,18 @@ function buildTeamStatsFromStandings(standings, tournamentId) {
   if (!standings) return teams;
 
   const rows = standings[0]?.rows || standings;
+  // The guard above catches null and undefined; it does not catch a shape.
+  // A third-party feed that starts answering with an object, or an error
+  // string, gets this far and throws on the for..of below — the loop's own
+  // per-row guards never run, because there is nothing to iterate. Caught by
+  // the caller either way, but as a stack trace rather than a sentence, and
+  // this file already argues at length that one bad ROW should cost one team;
+  // one bad shape should cost one league, and say so.
+  if (!Array.isArray(rows)) {
+    console.warn(`⚠️ standings for tournament ${tournamentId} arrived as `
+      + `${rows === null ? 'null' : typeof rows} rather than a list — skipping this league`);
+    return teams;
+  }
   const leagueAvg = getLeagueAvg(tournamentId);
   const totalAvg  = leagueAvg.homeGoals + leagueAvg.awayGoals;
   const homeRatio = leagueAvg.homeGoals / totalAvg;
@@ -718,6 +730,24 @@ function buildTeamStatsFromStandings(standings, tournamentId) {
       console.warn(`⚠️ standings row for ${name}: non-numeric ` +
         `(played=${row.matches ?? row.played}, for=${row.scoresFor ?? row.goalsScored}, ` +
         `against=${row.scoresAgainst ?? row.goalsConceded}) — skipping this team`);
+      continue;
+    }
+
+    // Numeric is not the same as possible. The check above rejects text, and
+    // the one below rejects too small a sample, but nothing looked at whether
+    // the figures could describe a football season: a negative goal count gave
+    // the team a NEGATIVE scoring rate, and an absurd one sailed through —
+    // measured, 900 goals in 10 matches becomes 83.8 goals per game, and that
+    // is what the Poisson model would be handed as this team's attack.
+    //
+    // Same reasoning as the row guards around it: drop the team rather than
+    // let one impossible row shape every fixture it appears in. Ten a game is
+    // far above anything a real league produces, so this only ever catches a
+    // feed that has gone wrong.
+    const MAX_GOALS_PER_GAME = 10;
+    if (gf < 0 || ga < 0 || gf > played * MAX_GOALS_PER_GAME || ga > played * MAX_GOALS_PER_GAME) {
+      console.warn(`⚠️ standings row for ${name}: implausible goals `
+        + `(for=${gf}, against=${ga} in ${played} matches) — skipping this team`);
       continue;
     }
 
