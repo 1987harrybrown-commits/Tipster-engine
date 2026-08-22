@@ -1190,6 +1190,30 @@ async function fetchFootballStats() {
       if (!standings) continue;
 
       const teams = buildTeamStatsFromStandings(standings, sport.tournamentId);
+
+      // Drop this tournament's previous entries before writing the new ones.
+      //
+      // Every current team is overwritten each morning, so nothing here goes
+      // stale the way the NHL and NBA caches did. What did accumulate is teams
+      // that have LEFT the tournament: a relegated side keeps its entry for
+      // ever, because nothing writes over a key that is no longer produced.
+      //
+      // That matters because of how the lookup falls back. An exact key miss —
+      // a name variant from the fixture feed — walks the whole cache and
+      // returns the first fuzzy match, and object key order is insertion
+      // order, so last season's teams are tried BEFORE this season's. A
+      // departed team whose name is close enough would hand its old stats to a
+      // current fixture, as the model input for a published tip.
+      //
+      // Scoped to this tournament, and only once its fetch has succeeded, so a
+      // league that failed today keeps yesterday's numbers rather than losing
+      // them — which is the resilience the `continue`s above exist for.
+      if (Object.keys(teams).length) {
+        const suffix = `_${sport.tournamentId}`;
+        for (const k of Object.keys(teamStatsCache)) {
+          if (k.endsWith(suffix)) delete teamStatsCache[k];
+        }
+      }
       for (const [name, stats] of Object.entries(teams)) {
         teamStatsCache[`${name}_${sport.tournamentId}`] = stats;
       }
