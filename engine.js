@@ -4348,7 +4348,24 @@ async function getTodaysTips(limit = 15) {
   //
   // A missing stake counts as staked (defaulting to 1), matching how stakes are
   // read everywhere else; only an explicit 0 is treated as informational.
-  const staked = (data || []).filter(isBet);
+  // A bet nobody can price is not a bet. advisedPrice returns NaN for a row
+  // with neither advised_odds nor odds, and every caller renders it with
+  // .toFixed(2) — which puts the literal string "NaN" where the price goes, in
+  // an email, which cannot be corrected once it has been sent. The four public
+  // tip pages already drop these rows for exactly this reason; the dispatches
+  // did not, and they are the surface where being wrong costs most.
+  //
+  // Not currently reachable — the engine sets a price on write, and no row in
+  // the live table has a null one — so this is a guard rather than a fix for
+  // something observed. It is loud because a tip going missing from a card
+  // should never be silent.
+  const staked = (data || []).filter(isBet).filter((t) => {
+    const price = advisedPrice(t);
+    if (Number.isFinite(price) && price > 1) return true;
+    console.warn(`⚠️ [${t.tip_ref}] has no usable price `
+      + `(advised_odds=${t.advised_odds}, odds=${t.odds}) — left off the card`);
+    return false;
+  });
 
   // A card longer than the limit is silently cut here, and every caller builds
   // an email that presents what it got as the day's card. getBetOfTheDay asks
