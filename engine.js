@@ -1255,7 +1255,21 @@ async function fetchFootballStats() {
         teamStatsCache[`${name}_${sport.tournamentId}`] = stats;
       }
 
-      console.log(`  ⚽ ${sport.league}: ${Object.keys(teams).length} teams loaded`);
+      // Name the season. Both this and fetchTournamentEvents take seasons[0]
+      // and trust it, so a rollover that picks the wrong one, or a new season
+      // whose table is not published yet, is invisible: it reads as a quiet
+      // day. The season label makes it a fact in the log instead.
+      const label = season.year || season.name || season.id;
+      const count = Object.keys(teams).length;
+      if (count) {
+        console.log(`  ⚽ ${sport.league}: ${count} teams loaded (season ${label})`);
+      } else {
+        // Not recoverable further down: analyseFootballFixture returns null
+        // when either side is missing from the cache, so this league publishes
+        // nothing at all until a table appears.
+        console.warn(`  ⚠️ ${sport.league}: standings for season ${label} produced no teams `
+          + `— no ${sport.league} tips can be priced until this returns a table`);
+      }
     } catch(e) {
       console.error(`Stats fetch error (${sport.league}):`, e.message);
     }
