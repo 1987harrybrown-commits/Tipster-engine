@@ -4270,6 +4270,74 @@ const ADVERTISED_PRICES = [
 // Same shape as the prices, and the same answer: the engine holds the secret
 // key, so it can ask. Reported rather than fatal — a Stripe outage at boot must
 // not stop the service, and "could not be checked" is not "is wrong".
+// Is Stripe configured to tell us when somebody pays?
+//
+// The four events below are each the only way the engine learns something it
+// cannot learn any other way. If the endpoint is missing, disabled, or not
+// subscribed to one of them, that event never arrives and nothing reports it:
+// the customer pays, Stripe takes the money, and the account stays free. It is
+// the most expensive silent failure here and the cheapest to notice.
+const WEBHOOK_EVENTS = [
+  ['checkout.session.completed',      'nobody who pays is upgraded'],
+  ['customer.subscription.updated',   'a failed card never shows as past_due'],
+  ['customer.subscription.deleted',   'a cancelled subscriber keeps Pro access'],
+  ['invoice.payment_failed',          'a declined payment is never noticed'],
+  ['invoice.payment_succeeded',       'a delayed payment never grants access, and a '
+                                    + 'past_due subscriber whose retry succeeds stays past_due'],
+];
+
+async function checkStripeWebhook() {
+  if (!STRIPE_SECRET_KEY) { console.log('   Stripe webhook: not checked — no Stripe key'); return; }
+  const answer = await Promise.race([
+    stripeRequest('/webhook_endpoints?limit=20'),
+    new Promise((r) => setTimeout(() => r(null), 8000)),
+  ]);
+  if (!answer || !Array.isArray(answer.data)) {
+    console.log('   Stripe webhook: not checked — Stripe did not answer');
+    return;
+  }
+  const live = answer.data.filter((e) => e && e.status === 'enabled');
+  if (!answer.data.length) {
+    console.error('   🚨 STRIPE WEBHOOK: no endpoint is registered. Nobody who pays '
+      + 'will be upgraded, and Stripe will still take their money');
+    return;
+  }
+  if (!live.length) {
+    console.error(`   🚨 STRIPE WEBHOOK: ${answer.data.length} endpoint(s) registered and `
+      + 'none is enabled. Nobody who pays will be upgraded');
+    return;
+  }
+  // "*" means every event, which covers all four.
+  const covered = new Set();
+  for (const e of live) {
+    for (const name of e.enabled_events || []) {
+      if (name === '*') { WEBHOOK_EVENTS.forEach(([n]) => covered.add(n)); }
+      else covered.add(name);
+    }
+  }
+  const missing = WEBHOOK_EVENTS.filter(([name]) => !covered.has(name));
+  if (missing.length) {
+    console.error('   🚨 STRIPE WEBHOOK: no enabled endpoint is subscribed to:');
+    for (const [name, consequence] of missing) {
+      console.error(`     ${name} — ${consequence}`);
+    }
+    return;
+  }
+  // Where Render tells us our own address, check something points at it. A
+  // webhook aimed at a previous deploy answers nothing and looks like silence.
+  const own = process.env.RENDER_EXTERNAL_URL || '';
+  if (own) {
+    const here = live.some((e) => String(e.url || '').startsWith(own));
+    if (!here) {
+      console.error(`   🚨 STRIPE WEBHOOK: ${live.length} enabled endpoint(s), none pointing `
+        + `at this service (${own}). Events are going somewhere else`);
+      return;
+    }
+  }
+  console.log(`   Stripe webhook: ${live.length} enabled endpoint(s), all ${WEBHOOK_EVENTS.length} events covered`
+    + (own ? ', one pointing here' : ''));
+}
+
 async function checkBillingPortal() {
   if (!STRIPE_SECRET_KEY) { console.log('   Billing portal: not checked — no Stripe key'); return; }
   const answer = await Promise.race([
@@ -6474,6 +6542,7 @@ process.on('uncaughtException', (err) => {
   // not depend on either answer.
   checkStripePrices().catch(e => console.error('Stripe price check error:', e && e.message));
   checkBillingPortal().catch(e => console.error('Billing portal check error:', e && e.message));
+  checkStripeWebhook().catch(e => console.error('Stripe webhook check error:', e && e.message));
   checkUnsubscribeLink().catch(e => console.error('Unsubscribe link check error:', e && e.message));
 
   // Every async call below is guarded. A rejection from any of them would
