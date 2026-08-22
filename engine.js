@@ -4185,6 +4185,25 @@ function logConfiguration() {
 //
 // A read of a column the table does not have is refused with 42703, which is
 // exactly the question being asked and costs one cheap request per column.
+// Does stats_cache have the row every published figure is written into?
+//
+// Separate from checkSchema, which asks about columns. A table can have every
+// column this build names and still be missing the single row it updates by id.
+async function checkStatsRow() {
+  const { data, error } = await Promise.race([
+    supabase.from('stats_cache').select('id').eq('id', 1),
+    new Promise((r) => setTimeout(() => r({ data: null, error: { message: 'timed out' } }), 8000)),
+  ]);
+  if (error) { console.log(`   Stats row: not checked — ${error.message}`); return; }
+  if (!data || !data.length) {
+    console.error('   🚨 STATS ROW: stats_cache has no row with id = 1. The published win '
+      + 'rate and ROI will never update, and /results answers 503. '
+      + 'schema-migration.sql creates it');
+    return;
+  }
+  console.log('   Stats row: present');
+}
+
 async function checkSchema() {
   const required = [
     ['tips', 'advised_odds',
@@ -6578,6 +6597,17 @@ process.on('uncaughtException', (err) => {
   // column, every line after this is going to fail in a way that is much
   // harder to read than one message at the top of the log.
   await checkSchema().catch(e => console.error('Schema check error:', e && e.message));
+
+  // The one row the code updates by id, as opposed to the columns above.
+  // updateStatsCache updates stats_cache where id = 1, and an update matching
+  // no row is not an error in PostgREST — it changes nothing and the published
+  // win rate and ROI stop moving. api/results.js reads the same row with
+  // .single(), which errors when there is none, and answers 503.
+  //
+  // It was reported only by updateStatsCache, which runs after a settlement:
+  // hours after boot on a good day, and not at all on a day with nothing to
+  // settle, which is most days out of season.
+  checkStatsRow().catch(e => console.error('Stats row check error:', e && e.message));
 
   // Not awaited: these report on things outside this process, and startup does
   // not depend on either answer.
