@@ -2923,10 +2923,23 @@ function applyStrictRules(tip, existingBestOdds = null) {
 
 async function generateTips(events, sport) {
   const tips = [];
+  // Why each fixture did not become a tip.
+  //
+  // The log's answer to "why were there no tips today" was one line reading
+  // "-> 0 tips", which says the same thing whether the feed sent no prices,
+  // every fixture was days away, the model could not price any of them, or
+  // they were priced and rejected on merit. Those want different responses
+  // from whoever is reading the log, and this loop is the only place all
+  // four are distinguishable.
+  //
+  // Football is the one that reaches `unpriceable` in bulk: analyseFootballFixture
+  // returns null when either side is missing from teamStatsCache, which is the
+  // state after a restart if that league's standings fetch came back empty.
+  const rejected = { noOdds: 0, outsideWindow: 0, unpriceable: 0, failedRules: 0 };
   for (const event of events) {
-    if (!event.bookmakers || !event.bookmakers.length) continue;
+    if (!event.bookmakers || !event.bookmakers.length) { rejected.noOdds++; continue; }
     const hours = (new Date(event.commence_time) - new Date()) / 3600000;
-    if (hours < 0 || hours > 48) continue;
+    if (hours < 0 || hours > 48) { rejected.outsideWindow++; continue; }
 
     let tip = null;
 
@@ -2938,9 +2951,17 @@ async function generateTips(events, sport) {
       tip = await analyseNHLFixture(event, sport);
     }
 
-    if (!tip) continue;
+    if (!tip) { rejected.unpriceable++; continue; }
     const approved = applyStrictRules(tip);
     if (approved) tips.push(approved);
+    else rejected.failedRules++;
+  }
+  if (!tips.length && events.length) {
+    console.log(`     ${events.length} fixtures, none published — `
+      + `${rejected.noOdds} with no prices, `
+      + `${rejected.outsideWindow} outside the 48h window, `
+      + `${rejected.unpriceable} the model could not price, `
+      + `${rejected.failedRules} rejected on merit`);
   }
   return tips;
 }
