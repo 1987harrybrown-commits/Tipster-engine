@@ -2058,6 +2058,84 @@ function sharpestBook(books, sumImplied) {
   return best;
 }
 
+// De-vig by the power method, replacing proportional normalisation.
+//
+// Proportional de-vigging — p_i = (1/o_i) / Σ(1/o_i) — spreads the bookmaker's
+// margin evenly across outcomes. Bookmakers do not price that way: the margin
+// is loaded onto longshots (the favourite-longshot bias). So proportional
+// leaves longshots with too much implied probability and favourites with too
+// little, and since edge is (modelProb - trueImplied), that error lands in
+// every published edge — understated on longer prices, overstated on short
+// ones. The engine publishes almost entirely between 1.35 and 3.15, which is
+// exactly where the short-price overstatement sits.
+//
+// The power method finds k such that Σ (1/o_i)^k = 1 and takes p_i = (1/o_i)^k.
+// Raising a number below 1 to k > 1 shrinks the small ones proportionally more
+// than the large ones, which is the direction the bias runs.
+//
+// Bisection rather than Newton: k is monotonic in the sum, the bracket is
+// known, and 60 iterations is exact to well past the two decimal places
+// anything downstream keeps. No derivative, no divergence, no special cases.
+//
+// Falls back to proportional if the prices are degenerate or the solve does not
+// converge — a worse estimate is better than no tip, and the caller cannot tell
+// the difference because both return a normalised set.
+function devigPower(impliedProbs) {
+  const ips = impliedProbs.filter(p => Number.isFinite(p) && p > 0);
+  if (ips.length !== impliedProbs.length || ips.length === 0) return null;
+
+  const sum = ips.reduce((a, b) => a + b, 0);
+  const proportional = () => impliedProbs.map(p => p / sum);
+
+  // An overround at or below zero means the prices are not a real book.
+  if (!Number.isFinite(sum) || sum <= 1) return proportional();
+
+  let lo = 1.0, hi = 5.0;
+  const at = (k) => ips.reduce((a, p) => a + Math.pow(p, k), 0);
+
+  // Guard the bracket: if even k = 5 cannot pull the sum to 1, do not
+  // extrapolate past it.
+  if (at(hi) > 1) return proportional();
+
+  for (let i = 0; i < 60; i++) {
+    const mid = (lo + hi) / 2;
+    if (at(mid) > 1) lo = mid; else hi = mid;
+  }
+  const k = (lo + hi) / 2;
+
+  const out = impliedProbs.map(p => Math.pow(p, k));
+  const outSum = out.reduce((a, b) => a + b, 0);
+  if (!Number.isFinite(outSum) || outSum <= 0) return proportional();
+
+  // Normalise the residual. Bisection lands within ~1e-15 of 1, but the
+  // downstream maths assumes these sum to exactly 1.
+  return out.map(p => p / outSum);
+}
+
+// Best available price for one outcome, across every book quoting it.
+//
+// Separate from sharpestBook on purpose, and the two are doing different jobs:
+// the sharpest book is the best estimate of the TRUE probability, so that is
+// what we de-vig; the best price is what the bet is actually placed at, so
+// that is what we publish. Using the sharp book's own price for both means
+// de-vigging a book and then betting into it — taking the tightest price on
+// offer, which is the one least likely to carry value.
+//
+// The totals market already worked this way (bestOver25 takes the highest Over
+// across books while de-vigging against that book's own Under). The 1X2 and
+// 2-way paths did not, so one function held two philosophies.
+function bestPrice(books, key) {
+  let best = null;
+  for (const b of books) {
+    const p = b[key];
+    if (!Number.isFinite(p) || p <= 0) continue;
+    if (!best || p > best.price || (p === best.price && String(b.title) < String(best.title))) {
+      best = { price: p, title: b.title };
+    }
+  }
+  return best;
+}
+
 function extractMarketData(event) {
   const books1x2  = [];
   const books2way = [];
@@ -2118,14 +2196,22 @@ function extractMarketData(event) {
     const b = sharpestBook(books1x2, (x) => (1/x.home) + (1/x.draw) + (1/x.away));
     if (!b) return null;
     const totalIP = (1/b.home) + (1/b.draw) + (1/b.away);
+    // True probabilities from the sharpest book; prices from wherever they are
+    // best. See devigPower and bestPrice above for why these are different
+    // books.
+    const dv = devigPower([(1/b.home), (1/b.draw), (1/b.away)])
+            || [(1/b.home)/totalIP, (1/b.draw)/totalIP, (1/b.away)/totalIP];
+    const bh = bestPrice(books1x2, 'home') || { price: b.home, title: b.title };
+    const bd = bestPrice(books1x2, 'draw') || { price: b.draw, title: b.title };
+    const ba = bestPrice(books1x2, 'away') || { price: b.away, title: b.title };
     return {
-      trueHome:   (1/b.home) / totalIP,
-      trueDraw:   (1/b.draw) / totalIP,
-      trueAway:   (1/b.away) / totalIP,
-      homeOdds:   b.home, drawOdds: b.draw, awayOdds: b.away,
+      trueHome:   dv[0],
+      trueDraw:   dv[1],
+      trueAway:   dv[2],
+      homeOdds:   bh.price, drawOdds: bd.price, awayOdds: ba.price,
       over25Odds: bestOver25,
       over25True: bestOver25True,
-      homeBook:   b.title, drawBook: b.title, awayBook: b.title, over25Book: bestOver25Book,
+      homeBook:   bh.title, drawBook: bd.title, awayBook: ba.title, over25Book: bestOver25Book,
       bookCount:  books1x2.length,
       avgMargin:  parseFloat(((totalIP - 1) * 100).toFixed(2)),
       isTwoWay:   false,
@@ -2137,14 +2223,18 @@ function extractMarketData(event) {
     const b = sharpestBook(books2way, (x) => (1/x.home) + (1/x.away));
     if (!b) return null;
     const totalIP = (1/b.home) + (1/b.away);
+    const dv = devigPower([(1/b.home), (1/b.away)])
+            || [(1/b.home)/totalIP, (1/b.away)/totalIP];
+    const bh = bestPrice(books2way, 'home') || { price: b.home, title: b.title };
+    const ba = bestPrice(books2way, 'away') || { price: b.away, title: b.title };
     return {
-      trueHome:   (1/b.home) / totalIP,
+      trueHome:   dv[0],
       trueDraw:   0,
-      trueAway:   (1/b.away) / totalIP,
-      homeOdds:   b.home, drawOdds: 0, awayOdds: b.away,
+      trueAway:   dv[1],
+      homeOdds:   bh.price, drawOdds: 0, awayOdds: ba.price,
       over25Odds: bestOver25,
       over25True: bestOver25True,
-      homeBook:   b.title, drawBook: '', awayBook: b.title, over25Book: bestOver25Book,
+      homeBook:   bh.title, drawBook: '', awayBook: ba.title, over25Book: bestOver25Book,
       bookCount:  books2way.length,
       avgMargin:  parseFloat(((totalIP - 1) * 100).toFixed(2)),
       isTwoWay:   true,
@@ -2204,32 +2294,52 @@ const CONFIDENCE_CEILING          = 95; // absolute cap, all sports
 //     (a model saying 85% without goalie data is overconfident)
 //
 // Output: integer percentage, e.g. 67 means "67% chance this wins"
-function confidenceFromSignals({ modelProb, dataQualityTier, sport, gamesPlayed }) {
-  // Start with the raw model probability as a percentage
-  let conf = Math.round(modelProb * 100);
+// The probability the model will actually stand behind, after every haircut
+// confidence already applies. This is the number that sizes the bet.
+//
+// It used to be that confidence applied these penalties and caps, and then
+// kellyStake was handed the RAW modelProb — so a Basketball candidate the model
+// priced at 0.90 displayed 80% confidence and was staked as though it were 90%.
+// The cap exists precisely because the model is held to be overconfident
+// without lineup data; applying that judgement to the number subscribers read
+// but not to the number that sizes their bet is the wrong way round. Kelly is
+// acutely sensitive to overstating p — it is the term the whole formula turns
+// on — and systematically staking above your own stated confidence is how a
+// bankroll erodes while every individual bet looks defensible.
+//
+// Downward adjustments only, and deliberately NO floor. CONFIDENCE_FLOOR exists
+// so a published card never shows a number below 50; applying it here would
+// RAISE the staking probability on weak candidates, which is the opposite of
+// the point. The floor stays in confidenceFromSignals, where it belongs.
+//
+// Displayed confidence is unchanged by this. Only staking moves, and only down.
+function stakingProb({ modelProb, dataQualityTier, sport, gamesPlayed }) {
+  if (!Number.isFinite(modelProb)) return 0;
+  let p = modelProb * 100;
 
-  // Data penalty — fewer games means less reliable estimates
   const games = gamesPlayed || 0;
-  if      (games < 4)  conf -= 8;
-  else if (games < 8)  conf -= 4;
-  else if (games < 15) conf -= 2;
-  // 15+ games: no penalty
+  if      (games < 4)  p -= 8;
+  else if (games < 8)  p -= 4;
+  else if (games < 15) p -= 2;
 
-  // Data quality tier penalty (incomplete stats)
-  if (!dataQualityTier || dataQualityTier < 1.0) conf -= 3;
+  if (!dataQualityTier || dataQualityTier < 1.0) p -= 3;
 
-  // Sport caps — NHL cap lifted to 88 when confirmed goalie data is present
-  // Without goalie data (dataQualityTier < 1.0), cap stays at 80
   if (sport === 'Ice Hockey') {
     const cap = (dataQualityTier >= 1.0) ? NHL_CONFIDENCE_CEILING_GOALIE : NHL_CONFIDENCE_CEILING;
-    conf = Math.min(conf, cap);
+    p = Math.min(p, cap);
   }
-  if (sport === 'Basketball') conf = Math.min(conf, NBA_CONFIDENCE_CEILING);
+  if (sport === 'Basketball') p = Math.min(p, NBA_CONFIDENCE_CEILING);
 
-  // Hard floor — don't publish tips below this win probability
-  conf = Math.max(CONFIDENCE_FLOOR, Math.min(CONFIDENCE_CEILING, conf));
+  p = Math.min(CONFIDENCE_CEILING, p);
+  return Math.max(0, p) / 100;
+}
 
-  return conf;
+function confidenceFromSignals(signals) {
+  // Same haircuts as the stake, then the display floor. Sharing stakingProb is
+  // what stops the two drifting apart again: a penalty added in one place now
+  // reaches both by construction.
+  const conf = Math.round(stakingProb(signals) * 100);
+  return Math.max(CONFIDENCE_FLOOR, Math.min(CONFIDENCE_CEILING, conf));
 }
 
 // The tier assumed when a candidate arrives without one. Not 1.0: that is the
@@ -2410,9 +2520,10 @@ async function analyseFootballFixture(event, sport) {
     // Home win
     if (market.homeOdds >= INSIGHT_ODDS_MIN && market.homeOdds <= ODDS_ELITE_MAX && market.trueHome > 0) {
       const edge = calcEdge(homeWin, market.trueHome);
-      const kelly = kellyStake(homeWin, market.homeOdds);
       const games = Math.min(hStats?.homeGames || 0, aStats?.awayGames || 0);
-      const conf  = confidenceFromSignals({ modelProb: homeWin, dataQualityTier: dataQuality, sport: 'Football', gamesPlayed: games });
+      const sig   = { modelProb: homeWin, dataQualityTier: dataQuality, sport: 'Football', gamesPlayed: games };
+      const kelly = kellyStake(stakingProb(sig), market.homeOdds);
+      const conf  = confidenceFromSignals(sig);
       const qs    = scoreCandidate({ edgePct: edge, modelProb: homeWin, dataQualityTier: dataQuality });
       const c = { market: 'home', edge, modelProb: homeWin, trueImplied: market.trueHome, dataQualityTier: dataQuality,
         fairPrice: fairOdds(homeWin), bookOdds: market.homeOdds, bookmaker: market.homeBook,
@@ -2423,9 +2534,10 @@ async function analyseFootballFixture(event, sport) {
     // Away win
     if (market.awayOdds >= INSIGHT_ODDS_MIN && market.awayOdds <= ODDS_ELITE_MAX && market.trueAway > 0) {
       const edge = calcEdge(awayWin, market.trueAway);
-      const kelly = kellyStake(awayWin, market.awayOdds);
       const games = Math.min(aStats?.awayGames || 0, hStats?.homeGames || 0);
-      const conf  = confidenceFromSignals({ modelProb: awayWin, dataQualityTier: dataQuality, sport: 'Football', gamesPlayed: games });
+      const sig   = { modelProb: awayWin, dataQualityTier: dataQuality, sport: 'Football', gamesPlayed: games };
+      const kelly = kellyStake(stakingProb(sig), market.awayOdds);
+      const conf  = confidenceFromSignals(sig);
       const qs    = scoreCandidate({ edgePct: edge, modelProb: awayWin, dataQualityTier: dataQuality });
       const c = { market: 'away', edge, modelProb: awayWin, trueImplied: market.trueAway, dataQualityTier: dataQuality,
         fairPrice: fairOdds(awayWin), bookOdds: market.awayOdds, bookmaker: market.awayBook,
@@ -2453,9 +2565,10 @@ async function analyseFootballFixture(event, sport) {
     // complete and correct apart from the gate it cannot pass.
     if (market.drawOdds >= INSIGHT_ODDS_MIN && draw > 0.20 && market.trueDraw > 0) {
       const edge = calcEdge(draw, market.trueDraw);
-      const kelly = kellyStake(draw, market.drawOdds);
       const games = Math.min(hStats?.homeGames || 0, aStats?.awayGames || 0);
-      const conf  = confidenceFromSignals({ modelProb: draw, dataQualityTier: dataQuality, sport: 'Football', gamesPlayed: games });
+      const sig   = { modelProb: draw, dataQualityTier: dataQuality, sport: 'Football', gamesPlayed: games };
+      const kelly = kellyStake(stakingProb(sig), market.drawOdds);
+      const conf  = confidenceFromSignals(sig);
       const qs    = scoreCandidate({ edgePct: edge, modelProb: draw, dataQualityTier: dataQuality });
       const c = { market: 'draw', edge, modelProb: draw, trueImplied: market.trueDraw, dataQualityTier: dataQuality,
         fairPrice: fairOdds(draw), bookOdds: market.drawOdds, bookmaker: market.drawBook,
@@ -2470,9 +2583,10 @@ async function analyseFootballFixture(event, sport) {
         && market.over25Odds >= INSIGHT_ODDS_MIN && market.over25Odds <= ODDS_ELITE_MAX
         && market.over25True > 0) {
       const edge  = calcEdge(over25, market.over25True);
-      const kelly = kellyStake(over25, market.over25Odds);
       const games = Math.min(hStats?.homeGames || 0, aStats?.awayGames || 0);
-      const conf  = confidenceFromSignals({ modelProb: over25, dataQualityTier: dataQuality, sport: 'Football', gamesPlayed: games });
+      const sig   = { modelProb: over25, dataQualityTier: dataQuality, sport: 'Football', gamesPlayed: games };
+      const kelly = kellyStake(stakingProb(sig), market.over25Odds);
+      const conf  = confidenceFromSignals(sig);
       const qs    = scoreCandidate({ edgePct: edge, modelProb: over25, dataQualityTier: dataQuality });
       const c = { market: 'over25', edge, modelProb: over25, trueImplied: market.over25True, dataQualityTier: dataQuality,
         fairPrice: fairOdds(over25), bookOdds: market.over25Odds, bookmaker: market.over25Book,
@@ -2625,8 +2739,9 @@ async function analyseNHLFixture(event, sport) {
 
     if (market.homeOdds >= INSIGHT_ODDS_MIN && market.homeOdds <= ODDS_ELITE_MAX && market.trueHome > 0) {
       const edge = calcEdge(homeWinML, market.trueHome);
-      const conf  = confidenceFromSignals({ modelProb: homeWinML, dataQualityTier, sport: 'Ice Hockey', gamesPlayed: homeStats.gamesPlayed });
-      const stake = kellyStake(homeWinML, market.homeOdds);
+      const sig   = { modelProb: homeWinML, dataQualityTier, sport: 'Ice Hockey', gamesPlayed: homeStats.gamesPlayed };
+      const conf  = confidenceFromSignals(sig);
+      const stake = kellyStake(stakingProb(sig), market.homeOdds);
       const qs    = scoreCandidate({ edgePct: edge, modelProb: homeWinML, dataQualityTier });
       const c = { selection: `${event.home_team} Win`, market: 'home', edge,
         modelProb: homeWinML, trueImplied: market.trueHome, dataQualityTier,
@@ -2638,8 +2753,9 @@ async function analyseNHLFixture(event, sport) {
 
     if (market.awayOdds >= INSIGHT_ODDS_MIN && market.awayOdds <= ODDS_ELITE_MAX && market.trueAway > 0) {
       const edge = calcEdge(awayWinML, market.trueAway);
-      const conf  = confidenceFromSignals({ modelProb: awayWinML, dataQualityTier, sport: 'Ice Hockey', gamesPlayed: awayStats.gamesPlayed });
-      const stake = kellyStake(awayWinML, market.awayOdds);
+      const sig   = { modelProb: awayWinML, dataQualityTier, sport: 'Ice Hockey', gamesPlayed: awayStats.gamesPlayed };
+      const conf  = confidenceFromSignals(sig);
+      const stake = kellyStake(stakingProb(sig), market.awayOdds);
       const qs    = scoreCandidate({ edgePct: edge, modelProb: awayWinML, dataQualityTier });
       const c = { selection: `${event.away_team} Win`, market: 'away', edge,
         modelProb: awayWinML, trueImplied: market.trueAway, dataQualityTier,
@@ -2660,8 +2776,9 @@ async function analyseNHLFixture(event, sport) {
         && market.over25True > 0) {
       const over55IP = market.over25True;
       const edge = calcEdge(over55, over55IP);
-      const conf  = confidenceFromSignals({ modelProb: over55, dataQualityTier, sport: 'Ice Hockey', gamesPlayed: Math.min(homeStats.gamesPlayed, awayStats.gamesPlayed) });
-      const stake = kellyStake(over55, market.over25Odds);
+      const sig   = { modelProb: over55, dataQualityTier, sport: 'Ice Hockey', gamesPlayed: Math.min(homeStats.gamesPlayed, awayStats.gamesPlayed) };
+      const conf  = confidenceFromSignals(sig);
+      const stake = kellyStake(stakingProb(sig), market.over25Odds);
       const qs    = scoreCandidate({ edgePct: edge, modelProb: over55, dataQualityTier });
       const c = { selection: 'Over 5.5', market: 'over55', edge,
         modelProb: over55, trueImplied: over55IP, dataQualityTier,
@@ -2740,9 +2857,10 @@ async function analyseNBAFixture(event, sport) {
 
     if (market.homeOdds >= INSIGHT_ODDS_MIN && market.homeOdds <= ODDS_ELITE_MAX && market.trueHome > 0) {
       const edge = calcEdge(homeWinP, market.trueHome);
-      const conf  = confidenceFromSignals({ modelProb: homeWinP, dataQualityTier: NBA_DATA_QUALITY_TIER, sport: 'Basketball', gamesPlayed: homeStats.gamesPlayed });
+      const sig   = { modelProb: homeWinP, dataQualityTier: NBA_DATA_QUALITY_TIER, sport: 'Basketball', gamesPlayed: homeStats.gamesPlayed };
+      const conf  = confidenceFromSignals(sig);
       const fec   = falseEdgeCheck({ edge, modelProb: homeWinP, trueImplied: market.trueHome }, market);
-      const stake = kellyStake(homeWinP, market.homeOdds);
+      const stake = kellyStake(stakingProb(sig), market.homeOdds);
       const qs    = scoreCandidate({ edgePct: edge, modelProb: homeWinP, dataQualityTier: NBA_DATA_QUALITY_TIER });
       const c = { selection: `${event.home_team} Win`, market: 'home', edge,
         modelProb: homeWinP, trueImplied: market.trueHome, dataQualityTier: NBA_DATA_QUALITY_TIER,
@@ -2754,9 +2872,10 @@ async function analyseNBAFixture(event, sport) {
 
     if (market.awayOdds >= INSIGHT_ODDS_MIN && market.awayOdds <= ODDS_ELITE_MAX && market.trueAway > 0) {
       const edge = calcEdge(awayWinP, market.trueAway);
-      const conf  = confidenceFromSignals({ modelProb: awayWinP, dataQualityTier: NBA_DATA_QUALITY_TIER, sport: 'Basketball', gamesPlayed: awayStats.gamesPlayed });
+      const sig   = { modelProb: awayWinP, dataQualityTier: NBA_DATA_QUALITY_TIER, sport: 'Basketball', gamesPlayed: awayStats.gamesPlayed };
+      const conf  = confidenceFromSignals(sig);
       const fec   = falseEdgeCheck({ edge, modelProb: awayWinP, trueImplied: market.trueAway }, market);
-      const stake = kellyStake(awayWinP, market.awayOdds);
+      const stake = kellyStake(stakingProb(sig), market.awayOdds);
       const qs    = scoreCandidate({ edgePct: edge, modelProb: awayWinP, dataQualityTier: NBA_DATA_QUALITY_TIER });
       const c = { selection: `${event.away_team} Win`, market: 'away', edge,
         modelProb: awayWinP, trueImplied: market.trueAway, dataQualityTier: NBA_DATA_QUALITY_TIER,
