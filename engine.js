@@ -996,7 +996,23 @@ async function fetchMatchContext(eventId, homeTeamId, awayTeamId, sport) {
 
     // ── HOME FORM + REST DAYS ────────────────────────────────
     await new Promise(r => setTimeout(r, 150));
-    const homeMatches = await sofascoreFetch('/teams/get-last-matches', { id: homeTeamId, page: 0 });
+    // teamId / pageIndex, not id / page.
+    //
+    // sofascoreFetch writes params straight onto the query string, so this was
+    // requesting ?id=43&page=0 against an endpoint that requires
+    // ?teamId=43&pageIndex=0. Sofascore answers an unrecognised parameter set
+    // with an empty body rather than an error, so the engine saw "empty
+    // response", retried three times, gave up, and logged "No form data for
+    // home team 43" — which reads like the team has no fixtures rather than
+    // like the request was malformed.
+    //
+    // Verified against the RapidAPI playground on 20 September 2026: teamId=43
+    // with pageIndex=0 returns 200 OK with 30 events. Same key, same account.
+    //
+    // This is why the card was empty. Every football fixture failed to price,
+    // every cycle logged "0 rejected on merit", and with NBA and NHL out of
+    // season the whole product had nothing to publish.
+    const homeMatches = await sofascoreFetch('/teams/get-last-matches', { teamId: homeTeamId, pageIndex: 0 });
     if (homeMatches?.events?.length) {
       ctx.homeForm = parseTeamForm(homeMatches.events, homeTeamId);
       if (ctx.homeForm) console.log(`  📊 Home [${homeTeamId}]: ${ctx.homeForm.wins}W${ctx.homeForm.draws}D${ctx.homeForm.losses}L rest:${ctx.homeForm.restDays}d`);
@@ -1006,7 +1022,8 @@ async function fetchMatchContext(eventId, homeTeamId, awayTeamId, sport) {
 
     // ── AWAY FORM + REST DAYS ────────────────────────────────
     await new Promise(r => setTimeout(r, 150));
-    const awayMatches = await sofascoreFetch('/teams/get-last-matches', { id: awayTeamId, page: 0 });
+    // Same correction as the home call above.
+    const awayMatches = await sofascoreFetch('/teams/get-last-matches', { teamId: awayTeamId, pageIndex: 0 });
     if (awayMatches?.events?.length) {
       ctx.awayForm = parseTeamForm(awayMatches.events, awayTeamId);
       if (ctx.awayForm) console.log(`  📊 Away [${awayTeamId}]: ${ctx.awayForm.wins}W${ctx.awayForm.draws}D${ctx.awayForm.losses}L rest:${ctx.awayForm.restDays}d`);
@@ -3895,7 +3912,13 @@ async function settleResultsInner() {
                 await new Promise(r => setTimeout(r, 250));
                 let ldEvents = [];
                 for (let pg = 0; pg <= 2; pg++) {
-                  const ld = await sofascoreFetch(`/tournaments/get-last-matches`, { tournamentId: sport2.tournamentId, seasonId: season2.id, page: pg });
+                  // pageIndex, not page — the same fault as the /teams call.
+                  // Verified against the playground: this endpoint takes
+                  // tournamentId, seasonId and pageIndex. With `page` the
+                  // paging argument was simply ignored, so every iteration of
+                  // this loop re-requested page 0 and the `length === 0` break
+                  // below never fired on a second page that existed.
+                  const ld = await sofascoreFetch(`/tournaments/get-last-matches`, { tournamentId: sport2.tournamentId, seasonId: season2.id, pageIndex: pg });
                   ldEvents = ldEvents.concat(ld?.events || []);
                   if ((ld?.events || []).length === 0) break;
                   await new Promise(r => setTimeout(r, 200));
