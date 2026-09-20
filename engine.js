@@ -2190,6 +2190,51 @@ function calcEdge(modelProb, trueImpliedProb) {
   return parseFloat(((modelProb - trueImpliedProb) * 100).toFixed(2));
 }
 
+// How much of the model's own opinion survives contact with the market.
+//
+// 0.0 = publish the market's view (no edge, no bets)
+// 1.0 = publish the model's view unshrunk, which is what v9.9 did
+//
+// This is a RISK CONTROL, not a fix. It cannot create an edge; it bounds how
+// far the model is allowed to disagree with the most tested probability
+// estimate available, and therefore how wrong a single tip can be.
+//
+// Why it is needed. Measured over the 95 staked bets of model 9.9: asserted
+// probability averaged 64.0%, realised frequency 33.7%. Overconfident in all
+// six confidence buckets, worst where the model was most certain (80.8%
+// asserted, 29.4% realised). Brier skill -12.4% against the bookmaker's own
+// price and -40.9% against simply predicting the base rate — a forecast worse
+// than one constant number carries negative information.
+//
+// Why 0.35 and not something derived. It is not fitted, deliberately. The
+// ledger it would be fitted on cannot be trusted: the market in that same
+// sample implied 57.6% and realised 33.7%, a 4.6-sigma miss that bookmakers
+// do not produce, and advised_odds is null on 143 of 144 rows so every
+// historical price came from v8's separate path. Fitting a shrinkage
+// coefficient to labels and prices that do not reconcile would produce a
+// confident wrong answer. 0.35 is a judgement: enough model voice to publish
+// something when it strongly disagrees, little enough that a 30-point error
+// becomes a 10-point one.
+//
+// Raise it only when the v10.0 series — clean prices, version-stamped,
+// closing lines captured — shows positive CLV over a few hundred bets. That
+// is the evidence this constant is waiting on, and the reason the closing
+// line was built first.
+const MODEL_MARKET_WEIGHT = parseFloat(process.env.MODEL_MARKET_WEIGHT || '0.35');
+
+// Shrink a model probability toward the de-vigged market probability.
+//
+// Returns the model's own number unchanged when there is no usable market
+// estimate to shrink toward — a missing market is not evidence of anything,
+// and substituting 0 would silently turn every such candidate into a claimed
+// certainty in the opposite direction.
+function shrinkToMarket(modelProb, marketProb) {
+  if (!Number.isFinite(modelProb)) return modelProb;
+  if (!Number.isFinite(marketProb) || marketProb <= 0 || marketProb >= 1) return modelProb;
+  const w = Math.min(1, Math.max(0, MODEL_MARKET_WEIGHT));
+  return w * modelProb + (1 - w) * marketProb;
+}
+
 // Stake tiers, keyed on the quarter-Kelly fraction.
 //
 // These used to be [0.40, 0.28, 0.18, 0.11, 0.06]. Those are full-Kelly
@@ -2755,28 +2800,36 @@ async function analyseFootballFixture(event, sport) {
 
     // Home win
     if (market.homeOdds >= INSIGHT_ODDS_MIN && market.homeOdds <= ODDS_ELITE_MAX && market.trueHome > 0) {
-      const edge = calcEdge(homeWin, market.trueHome);
+      // Shrunk toward the de-vigged market before anything reads it, so the
+      // edge, the displayed confidence and the stake all inherit the same
+      // bounded number. See MODEL_MARKET_WEIGHT.
+      const homeWinS = shrinkToMarket(homeWin, market.trueHome);
+      const edge = calcEdge(homeWinS, market.trueHome);
       const games = Math.min(hStats?.homeGames || 0, aStats?.awayGames || 0);
-      const sig   = { modelProb: homeWin, dataQualityTier: dataQuality, sport: 'Football', gamesPlayed: games };
+      const sig   = { modelProb: homeWinS, dataQualityTier: dataQuality, sport: 'Football', gamesPlayed: games };
       const kelly = kellyStake(stakingProb(sig), market.homeOdds);
       const conf  = confidenceFromSignals(sig);
-      const qs    = scoreCandidate({ edgePct: edge, modelProb: homeWin, dataQualityTier: dataQuality });
-      const c = { market: 'home', edge, modelProb: homeWin, trueImplied: market.trueHome, dataQualityTier: dataQuality,
-        fairPrice: fairOdds(homeWin), bookOdds: market.homeOdds, bookmaker: market.homeBook,
+      const qs    = scoreCandidate({ edgePct: edge, modelProb: homeWinS, dataQualityTier: dataQuality });
+      const c = { market: 'home', edge, modelProb: homeWinS, trueImplied: market.trueHome, dataQualityTier: dataQuality,
+        fairPrice: fairOdds(homeWinS), bookOdds: market.homeOdds, bookmaker: market.homeBook,
         stake: kelly, conf, qualityScore: qs, selection: `${event.home_team} Win` };
       if (conf >= MIN_CONFIDENCE && falseEdgeCheck(c, market)) candidates.push(c);
     }
 
     // Away win
     if (market.awayOdds >= INSIGHT_ODDS_MIN && market.awayOdds <= ODDS_ELITE_MAX && market.trueAway > 0) {
-      const edge = calcEdge(awayWin, market.trueAway);
+      // Shrunk toward the de-vigged market before anything reads it, so the
+      // edge, the displayed confidence and the stake all inherit the same
+      // bounded number. See MODEL_MARKET_WEIGHT.
+      const awayWinS = shrinkToMarket(awayWin, market.trueAway);
+      const edge = calcEdge(awayWinS, market.trueAway);
       const games = Math.min(aStats?.awayGames || 0, hStats?.homeGames || 0);
-      const sig   = { modelProb: awayWin, dataQualityTier: dataQuality, sport: 'Football', gamesPlayed: games };
+      const sig   = { modelProb: awayWinS, dataQualityTier: dataQuality, sport: 'Football', gamesPlayed: games };
       const kelly = kellyStake(stakingProb(sig), market.awayOdds);
       const conf  = confidenceFromSignals(sig);
-      const qs    = scoreCandidate({ edgePct: edge, modelProb: awayWin, dataQualityTier: dataQuality });
-      const c = { market: 'away', edge, modelProb: awayWin, trueImplied: market.trueAway, dataQualityTier: dataQuality,
-        fairPrice: fairOdds(awayWin), bookOdds: market.awayOdds, bookmaker: market.awayBook,
+      const qs    = scoreCandidate({ edgePct: edge, modelProb: awayWinS, dataQualityTier: dataQuality });
+      const c = { market: 'away', edge, modelProb: awayWinS, trueImplied: market.trueAway, dataQualityTier: dataQuality,
+        fairPrice: fairOdds(awayWinS), bookOdds: market.awayOdds, bookmaker: market.awayBook,
         stake: kelly, conf, qualityScore: qs, selection: `${event.away_team} Win` };
       if (conf >= MIN_CONFIDENCE && falseEdgeCheck(c, market)) candidates.push(c);
     }
@@ -2800,14 +2853,18 @@ async function analyseFootballFixture(event, sport) {
     // what subscribers are advised to bet, not a tidy-up, and the candidate is
     // complete and correct apart from the gate it cannot pass.
     if (market.drawOdds >= INSIGHT_ODDS_MIN && draw > 0.20 && market.trueDraw > 0) {
-      const edge = calcEdge(draw, market.trueDraw);
+      // Shrunk toward the de-vigged market before anything reads it, so the
+      // edge, the displayed confidence and the stake all inherit the same
+      // bounded number. See MODEL_MARKET_WEIGHT.
+      const drawS = shrinkToMarket(draw, market.trueDraw);
+      const edge = calcEdge(drawS, market.trueDraw);
       const games = Math.min(hStats?.homeGames || 0, aStats?.awayGames || 0);
-      const sig   = { modelProb: draw, dataQualityTier: dataQuality, sport: 'Football', gamesPlayed: games };
+      const sig   = { modelProb: drawS, dataQualityTier: dataQuality, sport: 'Football', gamesPlayed: games };
       const kelly = kellyStake(stakingProb(sig), market.drawOdds);
       const conf  = confidenceFromSignals(sig);
-      const qs    = scoreCandidate({ edgePct: edge, modelProb: draw, dataQualityTier: dataQuality });
-      const c = { market: 'draw', edge, modelProb: draw, trueImplied: market.trueDraw, dataQualityTier: dataQuality,
-        fairPrice: fairOdds(draw), bookOdds: market.drawOdds, bookmaker: market.drawBook,
+      const qs    = scoreCandidate({ edgePct: edge, modelProb: drawS, dataQualityTier: dataQuality });
+      const c = { market: 'draw', edge, modelProb: drawS, trueImplied: market.trueDraw, dataQualityTier: dataQuality,
+        fairPrice: fairOdds(drawS), bookOdds: market.drawOdds, bookmaker: market.drawBook,
         stake: kelly, conf, qualityScore: qs, selection: 'Draw' };
       if (conf >= MIN_CONFIDENCE && falseEdgeCheck(c, market)) candidates.push(c);
     }
@@ -2818,14 +2875,18 @@ async function analyseFootballFixture(event, sport) {
     if (PUBLISH_FOOTBALL_OVERS
         && market.over25Odds >= INSIGHT_ODDS_MIN && market.over25Odds <= ODDS_ELITE_MAX
         && market.over25True > 0) {
-      const edge  = calcEdge(over25, market.over25True);
+      // Shrunk toward the de-vigged market before anything reads it, so the
+      // edge, the displayed confidence and the stake all inherit the same
+      // bounded number. See MODEL_MARKET_WEIGHT.
+      const over25S = shrinkToMarket(over25, market.over25True);
+      const edge  = calcEdge(over25S, market.over25True);
       const games = Math.min(hStats?.homeGames || 0, aStats?.awayGames || 0);
-      const sig   = { modelProb: over25, dataQualityTier: dataQuality, sport: 'Football', gamesPlayed: games };
+      const sig   = { modelProb: over25S, dataQualityTier: dataQuality, sport: 'Football', gamesPlayed: games };
       const kelly = kellyStake(stakingProb(sig), market.over25Odds);
       const conf  = confidenceFromSignals(sig);
-      const qs    = scoreCandidate({ edgePct: edge, modelProb: over25, dataQualityTier: dataQuality });
-      const c = { market: 'over25', edge, modelProb: over25, trueImplied: market.over25True, dataQualityTier: dataQuality,
-        fairPrice: fairOdds(over25), bookOdds: market.over25Odds, bookmaker: market.over25Book,
+      const qs    = scoreCandidate({ edgePct: edge, modelProb: over25S, dataQualityTier: dataQuality });
+      const c = { market: 'over25', edge, modelProb: over25S, trueImplied: market.over25True, dataQualityTier: dataQuality,
+        fairPrice: fairOdds(over25S), bookOdds: market.over25Odds, bookmaker: market.over25Book,
         stake: kelly, conf, qualityScore: qs, selection: 'Over 2.5' };
       if (conf >= MIN_CONFIDENCE && falseEdgeCheck(c, market)) candidates.push(c);
     }
@@ -2974,30 +3035,38 @@ async function analyseNHLFixture(event, sport) {
     const candidates = [];
 
     if (market.homeOdds >= INSIGHT_ODDS_MIN && market.homeOdds <= ODDS_ELITE_MAX && market.trueHome > 0) {
-      const edge = calcEdge(homeWinML, market.trueHome);
-      const sig   = { modelProb: homeWinML, dataQualityTier, sport: 'Ice Hockey', gamesPlayed: homeStats.gamesPlayed };
+      // Shrunk toward the de-vigged market before anything reads it, so the
+      // edge, the displayed confidence and the stake all inherit the same
+      // bounded number. See MODEL_MARKET_WEIGHT.
+      const homeWinMLS = shrinkToMarket(homeWinML, market.trueHome);
+      const edge = calcEdge(homeWinMLS, market.trueHome);
+      const sig   = { modelProb: homeWinMLS, dataQualityTier, sport: 'Ice Hockey', gamesPlayed: homeStats.gamesPlayed };
       const conf  = confidenceFromSignals(sig);
       const stake = kellyStake(stakingProb(sig), market.homeOdds);
-      const qs    = scoreCandidate({ edgePct: edge, modelProb: homeWinML, dataQualityTier });
+      const qs    = scoreCandidate({ edgePct: edge, modelProb: homeWinMLS, dataQualityTier });
       const c = { selection: `${event.home_team} Win`, market: 'home', edge,
-        modelProb: homeWinML, trueImplied: market.trueHome, dataQualityTier,
-        fairPrice: fairOdds(homeWinML), bookOdds: market.homeOdds, bookmaker: market.homeBook,
+        modelProb: homeWinMLS, trueImplied: market.trueHome, dataQualityTier,
+        fairPrice: fairOdds(homeWinMLS), bookOdds: market.homeOdds, bookmaker: market.homeBook,
         stake, conf, qualityScore: qs,
-        notes: `GF/GA: ${lH.toFixed(2)}/${lA.toFixed(2)} | ${goalieNote} | Model: ${(homeWinML*100).toFixed(1)}% | Fair: ${fairOdds(homeWinML)} | Edge: ${edge >= 0 ? '+' : ''}${edge.toFixed(1)}%` };
+        notes: `GF/GA: ${lH.toFixed(2)}/${lA.toFixed(2)} | ${goalieNote} | Model: ${(homeWinMLS*100).toFixed(1)}% | Fair: ${fairOdds(homeWinMLS)} | Edge: ${edge >= 0 ? '+' : ''}${edge.toFixed(1)}%` };
       if (conf >= NHL_MIN_CONFIDENCE && falseEdgeCheck(c, market)) candidates.push(c);
     }
 
     if (market.awayOdds >= INSIGHT_ODDS_MIN && market.awayOdds <= ODDS_ELITE_MAX && market.trueAway > 0) {
-      const edge = calcEdge(awayWinML, market.trueAway);
-      const sig   = { modelProb: awayWinML, dataQualityTier, sport: 'Ice Hockey', gamesPlayed: awayStats.gamesPlayed };
+      // Shrunk toward the de-vigged market before anything reads it, so the
+      // edge, the displayed confidence and the stake all inherit the same
+      // bounded number. See MODEL_MARKET_WEIGHT.
+      const awayWinMLS = shrinkToMarket(awayWinML, market.trueAway);
+      const edge = calcEdge(awayWinMLS, market.trueAway);
+      const sig   = { modelProb: awayWinMLS, dataQualityTier, sport: 'Ice Hockey', gamesPlayed: awayStats.gamesPlayed };
       const conf  = confidenceFromSignals(sig);
       const stake = kellyStake(stakingProb(sig), market.awayOdds);
-      const qs    = scoreCandidate({ edgePct: edge, modelProb: awayWinML, dataQualityTier });
+      const qs    = scoreCandidate({ edgePct: edge, modelProb: awayWinMLS, dataQualityTier });
       const c = { selection: `${event.away_team} Win`, market: 'away', edge,
-        modelProb: awayWinML, trueImplied: market.trueAway, dataQualityTier,
-        fairPrice: fairOdds(awayWinML), bookOdds: market.awayOdds, bookmaker: market.awayBook,
+        modelProb: awayWinMLS, trueImplied: market.trueAway, dataQualityTier,
+        fairPrice: fairOdds(awayWinMLS), bookOdds: market.awayOdds, bookmaker: market.awayBook,
         stake, conf, qualityScore: qs,
-        notes: `GF/GA: ${lH.toFixed(2)}/${lA.toFixed(2)} | ${goalieNote} | Model: ${(awayWinML*100).toFixed(1)}% | Fair: ${fairOdds(awayWinML)} | Edge: ${edge >= 0 ? '+' : ''}${edge.toFixed(1)}%` };
+        notes: `GF/GA: ${lH.toFixed(2)}/${lA.toFixed(2)} | ${goalieNote} | Model: ${(awayWinMLS*100).toFixed(1)}% | Fair: ${fairOdds(awayWinMLS)} | Edge: ${edge >= 0 ? '+' : ''}${edge.toFixed(1)}%` };
       if (conf >= NHL_MIN_CONFIDENCE && falseEdgeCheck(c, market)) candidates.push(c);
     }
 
@@ -3011,16 +3080,20 @@ async function analyseNHLFixture(event, sport) {
     if (market.over25Odds >= INSIGHT_ODDS_MIN && market.over25Odds <= ODDS_ELITE_MAX
         && market.over25True > 0) {
       const over55IP = market.over25True;
-      const edge = calcEdge(over55, over55IP);
-      const sig   = { modelProb: over55, dataQualityTier, sport: 'Ice Hockey', gamesPlayed: Math.min(homeStats.gamesPlayed, awayStats.gamesPlayed) };
+      // Shrunk toward the de-vigged market before anything reads it, so the
+      // edge, the displayed confidence and the stake all inherit the same
+      // bounded number. See MODEL_MARKET_WEIGHT.
+      const over55S = shrinkToMarket(over55, over55IP);
+      const edge = calcEdge(over55S, over55IP);
+      const sig   = { modelProb: over55S, dataQualityTier, sport: 'Ice Hockey', gamesPlayed: Math.min(homeStats.gamesPlayed, awayStats.gamesPlayed) };
       const conf  = confidenceFromSignals(sig);
       const stake = kellyStake(stakingProb(sig), market.over25Odds);
-      const qs    = scoreCandidate({ edgePct: edge, modelProb: over55, dataQualityTier });
+      const qs    = scoreCandidate({ edgePct: edge, modelProb: over55S, dataQualityTier });
       const c = { selection: 'Over 5.5', market: 'over55', edge,
-        modelProb: over55, trueImplied: over55IP, dataQualityTier,
-        fairPrice: fairOdds(over55), bookOdds: market.over25Odds, bookmaker: market.over25Book,
+        modelProb: over55S, trueImplied: over55IP, dataQualityTier,
+        fairPrice: fairOdds(over55S), bookOdds: market.over25Odds, bookmaker: market.over25Book,
         stake, conf, qualityScore: qs,
-        notes: `GF/GA: ${lH.toFixed(2)}/${lA.toFixed(2)} | ${goalieNote} | Model: ${(over55*100).toFixed(1)}% over 5.5 | Edge: ${edge >= 0 ? '+' : ''}${edge.toFixed(1)}%` };
+        notes: `GF/GA: ${lH.toFixed(2)}/${lA.toFixed(2)} | ${goalieNote} | Model: ${(over55S*100).toFixed(1)}% over 5.5 | Edge: ${edge >= 0 ? '+' : ''}${edge.toFixed(1)}%` };
       if (conf >= NHL_MIN_CONFIDENCE && falseEdgeCheck(c, market)) candidates.push(c);
     }
 
@@ -3092,32 +3165,40 @@ async function analyseNBAFixture(event, sport) {
     const candidates = [];
 
     if (market.homeOdds >= INSIGHT_ODDS_MIN && market.homeOdds <= ODDS_ELITE_MAX && market.trueHome > 0) {
-      const edge = calcEdge(homeWinP, market.trueHome);
-      const sig   = { modelProb: homeWinP, dataQualityTier: NBA_DATA_QUALITY_TIER, sport: 'Basketball', gamesPlayed: homeStats.gamesPlayed };
+      // Shrunk toward the de-vigged market before anything reads it, so the
+      // edge, the displayed confidence and the stake all inherit the same
+      // bounded number. See MODEL_MARKET_WEIGHT.
+      const homeWinPS = shrinkToMarket(homeWinP, market.trueHome);
+      const edge = calcEdge(homeWinPS, market.trueHome);
+      const sig   = { modelProb: homeWinPS, dataQualityTier: NBA_DATA_QUALITY_TIER, sport: 'Basketball', gamesPlayed: homeStats.gamesPlayed };
       const conf  = confidenceFromSignals(sig);
-      const fec   = falseEdgeCheck({ edge, modelProb: homeWinP, trueImplied: market.trueHome }, market);
+      const fec   = falseEdgeCheck({ edge, modelProb: homeWinPS, trueImplied: market.trueHome }, market);
       const stake = kellyStake(stakingProb(sig), market.homeOdds);
-      const qs    = scoreCandidate({ edgePct: edge, modelProb: homeWinP, dataQualityTier: NBA_DATA_QUALITY_TIER });
+      const qs    = scoreCandidate({ edgePct: edge, modelProb: homeWinPS, dataQualityTier: NBA_DATA_QUALITY_TIER });
       const c = { selection: `${event.home_team} Win`, market: 'home', edge,
-        modelProb: homeWinP, trueImplied: market.trueHome, dataQualityTier: NBA_DATA_QUALITY_TIER,
-        fairPrice: fairOdds(homeWinP), bookOdds: market.homeOdds, bookmaker: market.homeBook,
+        modelProb: homeWinPS, trueImplied: market.trueHome, dataQualityTier: NBA_DATA_QUALITY_TIER,
+        fairPrice: fairOdds(homeWinPS), bookOdds: market.homeOdds, bookmaker: market.homeBook,
         stake, conf, qualityScore: qs,
-        notes: `Expected: ${homeExpected.toFixed(1)}-${awayExpected.toFixed(1)} | Model: ${(homeWinP*100).toFixed(1)}% | Fair: ${fairOdds(homeWinP)} | Edge: ${edge >= 0 ? '+' : ''}${edge.toFixed(1)}%` };
+        notes: `Expected: ${homeExpected.toFixed(1)}-${awayExpected.toFixed(1)} | Model: ${(homeWinPS*100).toFixed(1)}% | Fair: ${fairOdds(homeWinPS)} | Edge: ${edge >= 0 ? '+' : ''}${edge.toFixed(1)}%` };
       if (conf >= NBA_MIN_CONFIDENCE && fec) candidates.push(c);
     }
 
     if (market.awayOdds >= INSIGHT_ODDS_MIN && market.awayOdds <= ODDS_ELITE_MAX && market.trueAway > 0) {
-      const edge = calcEdge(awayWinP, market.trueAway);
-      const sig   = { modelProb: awayWinP, dataQualityTier: NBA_DATA_QUALITY_TIER, sport: 'Basketball', gamesPlayed: awayStats.gamesPlayed };
+      // Shrunk toward the de-vigged market before anything reads it, so the
+      // edge, the displayed confidence and the stake all inherit the same
+      // bounded number. See MODEL_MARKET_WEIGHT.
+      const awayWinPS = shrinkToMarket(awayWinP, market.trueAway);
+      const edge = calcEdge(awayWinPS, market.trueAway);
+      const sig   = { modelProb: awayWinPS, dataQualityTier: NBA_DATA_QUALITY_TIER, sport: 'Basketball', gamesPlayed: awayStats.gamesPlayed };
       const conf  = confidenceFromSignals(sig);
-      const fec   = falseEdgeCheck({ edge, modelProb: awayWinP, trueImplied: market.trueAway }, market);
+      const fec   = falseEdgeCheck({ edge, modelProb: awayWinPS, trueImplied: market.trueAway }, market);
       const stake = kellyStake(stakingProb(sig), market.awayOdds);
-      const qs    = scoreCandidate({ edgePct: edge, modelProb: awayWinP, dataQualityTier: NBA_DATA_QUALITY_TIER });
+      const qs    = scoreCandidate({ edgePct: edge, modelProb: awayWinPS, dataQualityTier: NBA_DATA_QUALITY_TIER });
       const c = { selection: `${event.away_team} Win`, market: 'away', edge,
-        modelProb: awayWinP, trueImplied: market.trueAway, dataQualityTier: NBA_DATA_QUALITY_TIER,
-        fairPrice: fairOdds(awayWinP), bookOdds: market.awayOdds, bookmaker: market.awayBook,
+        modelProb: awayWinPS, trueImplied: market.trueAway, dataQualityTier: NBA_DATA_QUALITY_TIER,
+        fairPrice: fairOdds(awayWinPS), bookOdds: market.awayOdds, bookmaker: market.awayBook,
         stake, conf, qualityScore: qs,
-        notes: `Expected: ${homeExpected.toFixed(1)}-${awayExpected.toFixed(1)} | Model: ${(awayWinP*100).toFixed(1)}% | Fair: ${fairOdds(awayWinP)} | Edge: ${edge >= 0 ? '+' : ''}${edge.toFixed(1)}%` };
+        notes: `Expected: ${homeExpected.toFixed(1)}-${awayExpected.toFixed(1)} | Model: ${(awayWinPS*100).toFixed(1)}% | Fair: ${fairOdds(awayWinPS)} | Edge: ${edge >= 0 ? '+' : ''}${edge.toFixed(1)}%` };
       if (conf >= NBA_MIN_CONFIDENCE && fec) candidates.push(c);
     }
 
