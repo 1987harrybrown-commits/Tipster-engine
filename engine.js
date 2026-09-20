@@ -81,6 +81,32 @@ const MIN_ADMIN_KEY_LENGTH = 24;
 // fallback would make every unsubscribe token forgeable by anyone reading it.
 const UNSUB_SECRET         = process.env.UNSUB_SECRET || process.env.STRIPE_WEBHOOK_SECRET || '';
 if (!UNSUB_SECRET) throw new Error('FATAL: set UNSUB_SECRET (or STRIPE_WEBHOOK_SECRET) — unsubscribe links cannot be signed without it');
+// ─── MODEL VERSION ────────────────────────────────────────────
+//
+// Stamped on every prediction, and the basis on which performance is
+// reported. Bump it on ANY change to probability estimation, de-vigging,
+// staking or selection.
+//
+// The rule it enforces: a change to the maths starts a NEW evidence series
+// and does not inherit the old one's record. Pooling generations is how a
+// platform hides a losing model behind a better one — or, just as bad, buries
+// a working model under the failures of its predecessor. Neither version can
+// be judged if the ledger cannot tell them apart.
+//
+//   9.9  — data integrity and security pass. This is the generation with a
+//          measured record: -39.8% ROI over 95 staked bets, 23 Apr - 14 Jun
+//          2026, 95% CI [-56.8%, -22.9%], t = -4.61. Settlement arithmetic
+//          verified, 0 mismatches. The losses are real.
+//   10.0 — staking moved onto the same probability the card displays;
+//          de-vigging changed from proportional to the power method;
+//          published price changed from the sharpest book's to the best
+//          available across books. All three alter what is advised, so this
+//          is a new series and is reported separately from 9.9.
+//
+// Displayed everywhere the version is shown, so the banner, the HTTP root and
+// the stamp on a tip cannot drift apart — they were six separate string
+// literals before this.
+const MODEL_VERSION        = '10.0';
 const RAPIDAPI_HOST        = 'sofascore.p.rapidapi.com';
 const SOFASCORE_BASE       = `https://${RAPIDAPI_HOST}`;
 
@@ -3222,7 +3248,14 @@ async function saveTips(tips) {
       // best_odds looks like a fourth and is not: nothing displays it, but
       // applyStrictRules reads it back as the peak price for the line-move
       // check, so it is internal rather than dead.
-      const { error } = await supabase.from('tips').insert({ ...tip, best_odds: tip.odds, advised_odds: tip.odds });
+      // model_version is written once, with advised_odds, and is never
+      // updated afterwards — the same rule and the same reason. It records
+      // which generation of the maths produced this advice, so the ledger can
+      // report per version instead of pooling them.
+      const { error } = await supabase.from('tips').insert({
+        ...tip, best_odds: tip.odds, advised_odds: tip.odds,
+        model_version: MODEL_VERSION,
+      });
       if (error) { if (error.code === '23505') skipped++; else console.error('Insert error:', error.message); }
       else saved++;
     } catch(e) { console.error('saveTips error:', e.message); }
@@ -3422,9 +3455,13 @@ async function settleResultsInner() {
   // proportional as the table grows. Deliberately not narrowed by date: this is
   // also what /admin/resettle runs, and bounding it would quietly take away the
   // operator's way of repairing anything older than the window.
+  // model_version belongs here for the same reason advised_odds does: the
+  // backfill writes a ledger row, and a ledger row that cannot name the model
+  // that produced it cannot be reported per version. This select enumerates
+  // its columns, so an omission here writes null silently rather than failing.
   const BACKFILL_COLUMNS = 'id, tip_ref, sport, home_team, away_team, selection, '
     + 'odds, advised_odds, stake, tier, status, confidence, event_time, '
-    + 'result_updated_at, profit_loss, is_free';
+    + 'result_updated_at, profit_loss, is_free, model_version';
   const alreadyGraded = await selectAll('tips', BACKFILL_COLUMNS,
     q => q.in('status', ['won', 'lost']).lt('event_time', nowIso));
 
@@ -3535,6 +3572,10 @@ async function settleResultsInner() {
           selection:   tip.selection,
           odds:        oddsUsed,
           stake:       stake,
+          // As in the live settler: the version that produced the tip, not the
+          // one running the backfill. Backfilled rows are historical by
+          // definition, so this is almost always null.
+          model_version: tip.model_version ?? null,
           tier:        tip.tier || 'pro',
           result:      tip.status === 'won' ? 'WON' : 'LOST',
           profit_loss: pl,
@@ -3875,6 +3916,13 @@ async function settleResultsInner() {
         selection:  tip.selection,
         odds:       settlementOdds,
         stake:      settlementStake,
+        // The version that PRODUCED the advice, read off the tip — not
+        // MODEL_VERSION, which is whatever happens to be deployed now. A tip
+        // published under 10.0 can settle days after 10.1 ships, and crediting
+        // that result to 10.1 would attribute a prediction to a model that
+        // never made it. Null for pre-10.0 rows, which is the honest answer:
+        // those predate version stamping and cannot be attributed.
+        model_version: tip.model_version ?? null,
         tier:       tip.tier || 'pro',
         // VOID is already the value the acca settler uses for a void, and every
         // aggregate counts wins and losses explicitly, so a VOID row is
@@ -4101,7 +4149,7 @@ async function updateStatsCache() {
 // ═══════════════════════════════════════════════════════════════
 
 async function runEngine() {
-  console.log(`\n🚀 Engine v9.9 — ${new Date().toLocaleString('en-GB', { timeZone: 'Europe/London' })}`);
+  console.log(`\n🚀 Engine v${MODEL_VERSION} — ${new Date().toLocaleString('en-GB', { timeZone: 'Europe/London' })}`);
   console.log('═'.repeat(52));
 
   // Safety: if cache is empty (engine just started), don't run until morning fetch completes
@@ -6065,7 +6113,7 @@ const server = http.createServer((req, res) => { (async () => {
 
   if (url.pathname === '/') {
     res.writeHead(200, { ...cors, 'Content-Type': 'text/plain' });
-    res.end(`The Tipster Engine v9.9 | Cache: ${sofascoreCache.fetchedDate || 'not fetched'} | API calls today: ${rapidApiCallCount}`);
+    res.end(`The Tipster Engine v${MODEL_VERSION} | Cache: ${sofascoreCache.fetchedDate || 'not fetched'} | API calls today: ${rapidApiCallCount}`);
     return;
   }
 
@@ -6775,7 +6823,7 @@ process.on('uncaughtException', (err) => {
 });
 
 (async () => {
-  console.log(`\n🟢 The Tipster Engine v9.9 starting...`);
+  console.log(`\n🟢 The Tipster Engine v${MODEL_VERSION} starting...`);
   console.log(`   Season: ${currentSeason()}/${currentSeason()+1}`);
   console.log(`   Data source: Sofascore (RapidAPI Pro)`);
   console.log(`   Schedule: Morning fetch 06:00 | Midday refresh 13:00 | Tips every 15min`);
